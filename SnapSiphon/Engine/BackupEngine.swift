@@ -78,6 +78,8 @@ final class BackupEngine: ObservableObject {
     private let photos = PhotoLibrary()
     private var index: BackupIndex?
     private var runTask: Task<Void, Never>?
+    /// The previous run while its cancelled tasks finish unwinding.
+    private var drainingTask: Task<Void, Never>?
     private var meter = ThroughputMeter()
     private let tempDir: URL
 
@@ -261,7 +263,12 @@ final class BackupEngine: ObservableObject {
         // Fast-scan mark: only enumerate assets created after it (unless deep or
         // incremental scanning is disabled). Assets are enumerated oldest-first
         // so the mark only ever moves forward.
-        let since: Date? = (deep || !settings.incrementalScan) ? nil : scanMark
+        // Re-scan a 48h overlap behind the mark: an iCloud photo taken earlier
+        // on another device can sync in with a creationDate BEHIND the mark and
+        // would otherwise be skipped forever. The known-set dedups the overlap,
+        // so this costs almost nothing. (Imports older than 48h → Deep scan.)
+        let since: Date? = (deep || !settings.incrementalScan)
+            ? nil : scanMark?.addingTimeInterval(-48 * 3600)
         appendLog(deep ? "Deep scan — re-checking the whole library…"
                        : (since == nil ? "Scanning library…" : "Fast scan — checking new photos…"), .info)
 
@@ -513,7 +520,12 @@ final class BackupEngine: ObservableObject {
         let processor = AssetProcessor(photos: photos, client: client, recipients: recipients,
                                        encryptFilenames: settings.encryptFilenames, tempDir: tempDir)
 
+        let draining = drainingTask
+        drainingTask = nil
         runTask = Task { [weak self] in
+            // Let a just-paused run finish unwinding before touching the same
+            // records, so a stale cancellation can't stamp over fresh state.
+            await draining?.value
             await self?.runLoop(processor: processor)
             await MainActor.run { [weak self] in
                 self?.finishRun()
@@ -523,7 +535,8 @@ final class BackupEngine: ObservableObject {
 
     func pause() {
         runTask?.cancel()
-        runTask = nil
+        drainingTask = runTask   // cancellation is cooperative; remember it so a
+        runTask = nil            // quick Resume waits for the old run to unwind
         phase = .paused
         waitingReason = nil
         uploadLanes.removeAll()
@@ -685,13 +698,15 @@ final class BackupEngine: ObservableObject {
                 sessionBytes += result.encryptedBytes
             }
             refreshCounts()
-        } catch is CancellationError {
-            index.markFailed(rid, error: "Cancelled")
-            endSlot(rid)
         } catch {
-            index.markFailed(rid, error: error.localizedDescription)
+            // URLSession surfaces task cancellation as URLError.cancelled, not
+            // CancellationError — treat both as a quiet pause, not a failure.
+            let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
+            index.markFailed(rid, error: cancelled ? "Cancelled" : error.localizedDescription)
             endSlot(rid)
-            appendLog("Failed \(record.filename): \(error.localizedDescription)", .error)
+            if !cancelled {
+                appendLog("Failed \(record.filename): \(error.localizedDescription)", .error)
+            }
         }
     }
 
