@@ -5,7 +5,7 @@ import Security
 /// non-secret `S3Config` (which lives in UserDefaults). Keeping them apart means
 /// the secret never lands in a plist or a settings export.
 enum S3CredentialStore {
-    private static let service = "com.snapsiphon.s3"
+    private static let service = "ca.straybits.snapsiphon.s3"
     private static let accessAccount = "accessKeyID"
     private static let secretAccount = "secretAccessKey"
 

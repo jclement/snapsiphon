@@ -15,7 +15,7 @@ final class ConditionsMonitor: ObservableObject {
     @Published private(set) var isCharging: Bool = false
 
     private let monitor = NWPathMonitor()
-    private let queue = DispatchQueue(label: "com.snapsiphon.conditions")
+    private let queue = DispatchQueue(label: "ca.straybits.snapsiphon.conditions")
 
     init() {
         UIDevice.current.isBatteryMonitoringEnabled = true

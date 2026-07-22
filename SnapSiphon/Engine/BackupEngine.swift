@@ -176,7 +176,7 @@ final class BackupEngine: ObservableObject {
 
     // MARK: Background backup (BGProcessingTask)
 
-    static let bgTaskID = "com.snapsiphon.backup"
+    static let bgTaskID = "ca.straybits.snapsiphon.backup"
 
     /// Must be called before the app finishes launching (we call it from init).
     nonisolated func registerBackgroundTask() {
@@ -228,7 +228,7 @@ final class BackupEngine: ObservableObject {
     /// always measures from the last backup.
     func rescheduleReminder() {
         let center = UNUserNotificationCenter.current()
-        center.removePendingNotificationRequests(withIdentifiers: ["com.snapsiphon.reminder"])
+        center.removePendingNotificationRequests(withIdentifiers: ["ca.straybits.snapsiphon.reminder"])
         let days = settings.reminderDays
         guard days > 0 else { return }
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
@@ -239,7 +239,7 @@ final class BackupEngine: ObservableObject {
             content.sound = .default
             let trigger = UNTimeIntervalNotificationTrigger(
                 timeInterval: TimeInterval(days) * 86_400, repeats: true)
-            center.add(UNNotificationRequest(identifier: "com.snapsiphon.reminder",
+            center.add(UNNotificationRequest(identifier: "ca.straybits.snapsiphon.reminder",
                                              content: content, trigger: trigger))
         }
     }

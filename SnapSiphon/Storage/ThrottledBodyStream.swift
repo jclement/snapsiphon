@@ -43,7 +43,7 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
             output.open()
             RunLoop.current.run()
         }
-        thread.name = "com.snapsiphon.throttle"
+        thread.name = "ca.straybits.snapsiphon.throttle"
         thread.stackSize = 512 * 1024
         self.thread = thread
         thread.start()

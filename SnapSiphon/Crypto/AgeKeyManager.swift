@@ -17,7 +17,7 @@ import Security
 final class AgeKeyManager: ObservableObject {
     static let shared = AgeKeyManager()
 
-    private let service = "com.snapsiphon.age"
+    private let service = "ca.straybits.snapsiphon.age"
     private let recipientsAccount = "recipients"     // newline-joined bech32 list
     private let legacyRecipientAccount = "recipient" // pre-multi-key single value
     private let identityAccount = "identity"

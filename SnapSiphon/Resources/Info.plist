@@ -43,7 +43,7 @@
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>com.snapsiphon.backup</string>
+		<string>ca.straybits.snapsiphon.backup</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict>

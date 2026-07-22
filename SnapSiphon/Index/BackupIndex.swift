@@ -7,7 +7,7 @@ import Foundation
 /// actor/task.
 final class BackupIndex {
     private let db: SQLiteDatabase
-    private let queue = DispatchQueue(label: "com.snapsiphon.index")
+    private let queue = DispatchQueue(label: "ca.straybits.snapsiphon.index")
 
     init(directory: URL) throws {
         let dbURL = directory.appendingPathComponent("index.sqlite")
