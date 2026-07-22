@@ -29,6 +29,7 @@ final class AgeKeyManager: ObservableObject {
     @Published private(set) var hasIdentity: Bool = false
 
     private init() {
+        healIdentityIfNeeded()
         // Migrate a pre-multi-key single recipient into the list.
         if let joined = readString(account: recipientsAccount) {
             recipients = Self.split(joined)
@@ -84,6 +85,33 @@ final class AgeKeyManager: ObservableObject {
         guard let secret = readString(account: identityAccount),
               let identity = try? Age.Identity(bech32: secret) else { return nil }
         return identity.recipient.bech32
+    }
+
+    /// Secrets generated before the Bech32 checksum fix were stored with an
+    /// invalid checksum (computed over the uppercase HRP). The key *bytes* are
+    /// fine — re-encode canonically so both this app and the reference age CLI
+    /// accept the string.
+    private func healIdentityIfNeeded() {
+        guard let stored = readString(account: identityAccount) else { return }
+        if (try? Bech32.decode(stored, expectedHRP: "AGE-SECRET-KEY-")) != nil { return }  // already canonical
+        guard let identity = try? Age.Identity(bech32: stored) else { return }             // unusable — leave it
+        try? write(identity.bech32, account: identityAccount)
+        try? write(identity.recipient.bech32, account: identityMarkerAccount)
+    }
+
+    /// Nuclear option: discard the existing on-device identity (removing its
+    /// recipient row) and mint a fresh pair. Backups encrypted only to the old
+    /// key become unrecoverable — the UI confirms hard before calling this.
+    @discardableResult
+    func replaceIdentity() throws -> (recipient: String, secret: String) {
+        if let old = identityRecipient ?? derivedIdentityRecipient() {
+            recipients.removeAll { $0 == old }
+            try? writeRecipients()
+        }
+        delete(account: identityAccount)
+        delete(account: identityMarkerAccount)
+        hasIdentity = false
+        return try generateIdentity()
     }
 
     var isConfigured: Bool { !recipients.isEmpty }

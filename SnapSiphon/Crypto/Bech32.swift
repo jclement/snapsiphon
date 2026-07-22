@@ -81,6 +81,10 @@ enum Bech32 {
     // MARK: Public API
 
     static func encode(hrp: String, data: [UInt8]) -> String {
+        // Per BIP-173 the checksum is ALWAYS computed over the lowercase HRP —
+        // decode lowercases before verifying, so encoding with an uppercase HRP
+        // (as we once did for AGE-SECRET-KEY-) produces an invalid string.
+        let hrp = hrp.lowercased()
         guard let converted = convertBits(data, from: 8, to: 5, pad: true) else { return "" }
         let checksum = createChecksum(hrp: hrp, data: converted)
         let combined = converted + checksum
@@ -90,6 +94,32 @@ enum Bech32 {
     static func decode(_ string: String, expectedHRP: String) throws -> [UInt8] {
         let (hrp, bytes) = try decode(string)
         guard hrp == expectedHRP.lowercased() else { throw Error.invalidHRP }
+        return bytes
+    }
+
+    /// Decode a string whose checksum was (incorrectly) computed over the
+    /// UPPERCASE HRP — the encoding SnapSiphon produced for AGE-SECRET-KEY-
+    /// before the checksum fix. Lets us heal legacy stored secrets.
+    static func decodeLegacyUppercaseHRP(_ string: String, expectedHRP: String) throws -> [UInt8] {
+        let lower = string.lowercased()
+        let upper = string.uppercased()
+        guard string == lower || string == upper else { throw Error.mixedCase }
+        guard let sep = lower.lastIndex(of: "1") else { throw Error.invalidHRP }
+        let hrp = String(lower[lower.startIndex..<sep])
+        guard hrp == expectedHRP.lowercased() else { throw Error.invalidHRP }
+        let dataPart = lower[lower.index(after: sep)...]
+        guard dataPart.count >= 6 else { throw Error.tooShort }
+        var values: [UInt8] = []
+        for ch in dataPart {
+            guard let idx = charset.firstIndex(of: ch) else { throw Error.invalidCharacter }
+            values.append(UInt8(idx))
+        }
+        // The legacy bug: checksum over the uppercase HRP.
+        guard verifyChecksum(hrp: hrp.uppercased(), data: values) else { throw Error.invalidChecksum }
+        let payload = Array(values.dropLast(6))
+        guard let bytes = convertBits(payload, from: 5, to: 8, pad: false) else {
+            throw Error.invalidChecksum
+        }
         return bytes
     }
 

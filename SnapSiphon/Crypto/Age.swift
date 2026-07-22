@@ -88,8 +88,16 @@ enum Age {
         init(privateKey: Curve25519.KeyAgreement.PrivateKey) { self.privateKey = privateKey }
 
         init(bech32 string: String) throws {
-            let raw = try Bech32.decode(string.trimmingCharacters(in: .whitespacesAndNewlines),
-                                        expectedHRP: "AGE-SECRET-KEY-")
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw: [UInt8]
+            if let strict = try? Bech32.decode(trimmed, expectedHRP: "AGE-SECRET-KEY-") {
+                raw = strict
+            } else {
+                // Secrets generated before the checksum fix carry a checksum
+                // computed over the uppercase HRP; accept them so they can be
+                // healed (re-encoded canonically) rather than lost.
+                raw = try Bech32.decodeLegacyUppercaseHRP(trimmed, expectedHRP: "AGE-SECRET-KEY-")
+            }
             guard raw.count == 32 else { throw Error.badRecipient }
             self.privateKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(raw))
         }

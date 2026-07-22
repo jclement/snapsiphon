@@ -13,6 +13,7 @@ struct KeysView: View {
     @State private var showSecret = false
     @State private var errorText: String?
     @State private var pendingRemoval: String?
+    @State private var confirmReplaceIdentity = false
 
     var body: some View {
         ScrollView {
@@ -49,6 +50,21 @@ struct KeysView: View {
         .alert("Key error", isPresented: Binding(get: { errorText != nil }, set: { if !$0 { errorText = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(errorText ?? "") }
+        .confirmationDialog("Discard this phone's key?", isPresented: $confirmReplaceIdentity,
+                            titleVisibility: .visible) {
+            Button("Discard & generate new", role: .destructive) {
+                do {
+                    let pair = try manager.replaceIdentity()
+                    generatedSecret = pair.secret
+                    showSecret = false
+                } catch {
+                    errorText = error.localizedDescription
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("⚠️ The old secret is deleted permanently. Any backup encrypted ONLY to the old key becomes unrecoverable. A fresh pair is generated and added in its place.")
+        }
         .confirmationDialog("Remove this recipient?",
                             isPresented: Binding(get: { pendingRemoval != nil },
                                                  set: { if !$0 { pendingRemoval = nil } }),
@@ -221,6 +237,10 @@ struct KeysView: View {
                         if !manager.reactivateIdentity() {
                             errorText = "Could not re-add the phone's key."
                         }
+                    }
+                    GhostButton(title: "Discard & generate a new key…", systemImage: "exclamationmark.arrow.circlepath",
+                                tint: .red) {
+                        confirmReplaceIdentity = true
                     }
                 } else {
                     Text("Creates an X25519 identity on-device, adds it to your recipients, and stores the secret in the iOS Keychain. Reveal it any time with Face ID to back it up.")

@@ -5,9 +5,16 @@ struct SettingsView: View {
     // Observe directly so the recipient count refreshes the moment a key is
     // added/removed (SettingsView otherwise only observes `engine`).
     @ObservedObject private var keyManager = AgeKeyManager.shared
+    /// Identifiable wrapper so the viewer sheet is item-driven — presenting via
+    /// a separate Bool raced the @State script and could show an empty sheet
+    /// (grey screen) when the closure evaluated before the script landed.
+    struct ScriptDocument: Identifiable {
+        let id = UUID()
+        let text: String
+    }
+
     @State private var showRestoreScriptWarning = false
-    @State private var restoreScript: String?
-    @State private var showScriptViewer = false
+    @State private var restoreScript: ScriptDocument?
     @State private var writingManifest = false
     @State private var manifestStatus: String?
 
@@ -196,18 +203,15 @@ struct SettingsView: View {
                     Task {
                         // Face ID / passcode prompt happens inside buildRestoreScript.
                         if let script = await engine.buildRestoreScript() {
-                            restoreScript = script
-                            showScriptViewer = true
+                            restoreScript = ScriptDocument(text: script)
                         }
                     }
                 }
             } message: {
                 Text("This builds a single Python file containing your bucket credentials\(keyManager.hasIdentity ? " AND this phone's secret key" : "") in plaintext — enough to rebuild your entire archive on a laptop. After Face ID you can review the script before copying it. Store it like a password.")
             }
-            .sheet(isPresented: $showScriptViewer) {
-                if let restoreScript {
-                    RestoreScriptViewer(script: restoreScript)
-                }
+            .sheet(item: $restoreScript) { doc in
+                RestoreScriptViewer(script: doc.text)
             }
         }
     }
