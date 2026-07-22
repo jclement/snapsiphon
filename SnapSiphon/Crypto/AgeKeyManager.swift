@@ -45,13 +45,45 @@ final class AgeKeyManager: ObservableObject {
         }
     }
 
-    /// First-run default: if no keys are configured at all, mint this phone's
-    /// own identity so backups can start immediately and the restore script is
-    /// fully self-contained. Never touches an already-configured setup.
+    /// True when the on-device identity's public half is actually in the
+    /// recipient list — i.e. a "★ THIS PHONE" row is visible. `hasIdentity`
+    /// alone isn't enough: the row can be removed while the secret survives.
+    var identityIsActive: Bool {
+        guard hasIdentity, let r = identityRecipient ?? derivedIdentityRecipient() else { return false }
+        return recipients.contains(r)
+    }
+
+    /// Re-add the surviving identity's public half to the recipient list.
+    /// Used when the "THIS PHONE" row was removed (or orphaned by an earlier
+    /// version) but the secret still exists — re-adding is always safer than
+    /// minting a fresh key, which would overwrite a secret that may guard
+    /// already-uploaded backups.
+    @discardableResult
+    func reactivateIdentity() -> Bool {
+        guard hasIdentity, let recipient = identityRecipient ?? derivedIdentityRecipient() else { return false }
+        try? write(recipient, account: identityMarkerAccount)   // heal a missing marker
+        if !recipients.contains(recipient) {
+            recipients.append(recipient)
+            try? writeRecipients()
+        }
+        return true
+    }
+
+    /// First-run default: if no keys are configured at all, surface this
+    /// phone's identity — re-adding a surviving one, else minting fresh.
     @discardableResult
     func ensureDefaultIdentity() -> Bool {
-        guard recipients.isEmpty && !hasIdentity else { return false }
+        guard recipients.isEmpty else { return false }
+        if hasIdentity { return reactivateIdentity() }
         return (try? generateIdentity()) != nil
+    }
+
+    /// Fallback derivation of the identity's public half straight from the
+    /// stored secret, for installs that predate the marker.
+    private func derivedIdentityRecipient() -> String? {
+        guard let secret = readString(account: identityAccount),
+              let identity = try? Age.Identity(bech32: secret) else { return nil }
+        return identity.recipient.bech32
     }
 
     var isConfigured: Bool { !recipients.isEmpty }
@@ -83,7 +115,9 @@ final class AgeKeyManager: ObservableObject {
     func removeRecipient(_ string: String) {
         recipients.removeAll { $0 == string }
         try? writeRecipients()
-        if identityRecipient == string {
+        // Use the derived fallback too, so a marker mismatch can't strand an
+        // orphaned secret in the Keychain.
+        if (identityRecipient ?? derivedIdentityRecipient()) == string {
             delete(account: identityAccount)
             delete(account: identityMarkerAccount)
             hasIdentity = false

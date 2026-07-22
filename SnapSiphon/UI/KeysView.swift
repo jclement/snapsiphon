@@ -29,9 +29,9 @@ struct KeysView: View {
                 }
 
                 importCard
-                // Once a local key exists, generating another would be confusing
-                // (and replacing it is dangerous) — hide the card entirely.
-                if !manager.hasIdentity {
+                // Offer a phone key whenever no "★ THIS PHONE" row is visible —
+                // re-adding a surviving secret, or minting a fresh pair.
+                if !manager.identityIsActive {
                     generateCard
                 }
 
@@ -208,17 +208,32 @@ struct KeysView: View {
     private var generateCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Generate a new pair").font(Theme.rounded(16, weight: .semibold))
+                Text("This phone's key").font(Theme.rounded(16, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
-                Text("Creates an X25519 identity on-device, adds it to your recipients, and stores the secret in the iOS Keychain. Shown once for you to back up.")
-                    .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
-                GhostButton(title: "Generate key pair", systemImage: "sparkles", tint: Theme.violet) {
-                    do {
-                        let pair = try manager.generateIdentity()
-                        generatedSecret = pair.secret
-                        showSecret = false
-                    } catch {
-                        errorText = error.localizedDescription
+                if manager.hasIdentity {
+                    // A secret survives in the Keychain but its row was removed.
+                    // Re-adding it keeps old backups decryptable — never mint a
+                    // replacement over it.
+                    Text("This phone still holds its secret key, but it isn't in your recipient list. Re-add it to keep using it (backups already encrypted to it stay recoverable).")
+                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                    GhostButton(title: "Re-add this phone's key", systemImage: "arrow.uturn.backward",
+                                tint: Theme.violet) {
+                        if !manager.reactivateIdentity() {
+                            errorText = "Could not re-add the phone's key."
+                        }
+                    }
+                } else {
+                    Text("Creates an X25519 identity on-device, adds it to your recipients, and stores the secret in the iOS Keychain. Reveal it any time with Face ID to back it up.")
+                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                    GhostButton(title: "Generate & add this phone's key", systemImage: "sparkles",
+                                tint: Theme.violet) {
+                        do {
+                            let pair = try manager.generateIdentity()
+                            generatedSecret = pair.secret
+                            showSecret = false
+                        } catch {
+                            errorText = error.localizedDescription
+                        }
                     }
                 }
             }
