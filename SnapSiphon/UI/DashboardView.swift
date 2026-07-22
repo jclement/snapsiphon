@@ -194,8 +194,10 @@ struct DashboardView: View {
                 GaugePill(systemImage: "clock.badge.checkmark",
                           value: Format.duration(engine.estimatedSecondsRemaining(now: now) ?? .nan),
                           caption: "eta", accent: Theme.violet)
-                GaugePill(systemImage: "square.and.arrow.up",
-                          value: "\(Format.count(engine.sessionUploaded))", caption: "this run", accent: .green)
+                // Live jetsam-relevant footprint — flat means the pipeline streams.
+                GaugePill(systemImage: "memorychip",
+                          value: String(format: "%.0f MB", MemoryFootprint.currentMB),
+                          caption: "memory", accent: .green)
             }
         } else {
             VStack(spacing: 8) {

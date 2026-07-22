@@ -6,6 +6,8 @@ struct SettingsView: View {
     // added/removed (SettingsView otherwise only observes `engine`).
     @ObservedObject private var keyManager = AgeKeyManager.shared
     @State private var showRestoreScriptWarning = false
+    @State private var writingManifest = false
+    @State private var manifestStatus: String?
 
     var body: some View {
         NavigationStack {
@@ -94,16 +96,36 @@ struct SettingsView: View {
                                   isOn: $engine.settings.keepBucketManifest)
                         Divider().overlay(Theme.hairline)
                         Button {
-                            Task { _ = await engine.writeManifest() }
+                            Task {
+                                writingManifest = true
+                                manifestStatus = nil
+                                switch await engine.writeManifest() {
+                                case .success(let r):
+                                    manifestStatus = "✓ Wrote \(Format.count(r.count)) item\(r.count == 1 ? "" : "s") · \(Format.bytes(r.bytes)) encrypted"
+                                case .failure(let error):
+                                    manifestStatus = "✗ \(error.localizedDescription)"
+                                }
+                                writingManifest = false
+                            }
                         } label: {
                             HStack {
-                                Image(systemName: "doc.badge.arrow.up")
-                                Text("Write manifest now").font(Theme.rounded(16, weight: .medium))
+                                if writingManifest {
+                                    ProgressView().tint(Theme.teal)
+                                } else {
+                                    Image(systemName: "doc.badge.arrow.up")
+                                }
+                                Text(writingManifest ? "Writing…" : "Write manifest now")
+                                    .font(Theme.rounded(16, weight: .medium))
                                 Spacer()
                             }
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
-                        .disabled(!engine.isConfigured || engine.phase.isActive)
+                        .disabled(!engine.isConfigured || engine.phase.isActive || writingManifest)
+                        if let manifestStatus {
+                            Text(manifestStatus)
+                                .font(Theme.mono(12))
+                                .foregroundStyle(manifestStatus.hasPrefix("✓") ? .green : .red)
+                        }
                     }
 
                     knobGroup("Disaster recovery") {

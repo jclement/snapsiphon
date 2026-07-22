@@ -18,7 +18,9 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
     private let blockSize = 32 * 1024
     private var pending = Data()
     private var reachedEOF = false
+    private var finished = false
     private var thread: Thread?
+    private var runLoop: CFRunLoop?
 
     init(fileURL: URL, bytesPerSecond: Double) throws {
         var input: InputStream?
@@ -35,6 +37,7 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
     /// Begin producing. Call once, before/while the upload task runs.
     func start() {
         let thread = Thread { [self] in
+            runLoop = CFRunLoopGetCurrent()
             output.delegate = self
             output.schedule(in: .current, forMode: .default)
             output.open()
@@ -44,6 +47,17 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
         thread.stackSize = 512 * 1024
         self.thread = thread
         thread.start()
+    }
+
+    /// Tear down the producer once the upload task has finished. Without this,
+    /// a completed upload whose output stream never fires a terminal event
+    /// leaves the producer thread parked in its run loop forever — one leaked
+    /// thread (plus stream buffers and an open file handle) per throttled
+    /// upload. Idempotent; safe to call from any thread.
+    func cancel() {
+        guard let runLoop else { return }
+        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) { [self] in finish() }
+        CFRunLoopWakeUp(runLoop)
     }
 
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
@@ -82,6 +96,8 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
     }
 
     private func finish() {
+        guard !finished else { return }
+        finished = true
         output.close()
         output.remove(from: .current, forMode: .default)
         try? fileHandle.close()

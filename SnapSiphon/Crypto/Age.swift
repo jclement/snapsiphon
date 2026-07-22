@@ -218,9 +218,14 @@ enum Age {
             }
             buffer.append(data)
             while buffer.count > Age.chunkSize {
-                let chunk = buffer.prefix(Age.chunkSize)
-                buffer.removeFirst(Age.chunkSize)
-                out.append(try seal(Data(chunk), last: false))
+                // subdata(in:) on both sides is deliberate: it forces real copies.
+                // The prefix/removeFirst idiom left `buffer` as a slice view over
+                // its ever-growing backing storage, so the "consumed" bytes were
+                // never freed and one encryptor ended up holding the ENTIRE file
+                // in memory — the jetsam kill on multi-GB videos.
+                let chunk = buffer.subdata(in: 0..<Age.chunkSize)
+                buffer = buffer.subdata(in: Age.chunkSize..<buffer.count)
+                out.append(try seal(chunk, last: false))
             }
             return out
         }

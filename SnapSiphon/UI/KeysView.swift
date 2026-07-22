@@ -29,7 +29,17 @@ struct KeysView: View {
                 }
 
                 importCard
-                generateCard
+                // Once a local key exists, generating another would be confusing
+                // (and replacing it is dangerous) — hide the card entirely.
+                if !manager.hasIdentity {
+                    generateCard
+                }
+
+                if !manager.recipients.isEmpty {
+                    Text("Keys apply to future uploads. Files already backed up stay encrypted to the keys that were configured when they were uploaded.")
+                        .font(.system(size: 12)).foregroundStyle(Theme.textTertiary)
+                        .padding(.horizontal, 4)
+                }
             }
             .padding(16)
         }
@@ -43,13 +53,18 @@ struct KeysView: View {
                             isPresented: Binding(get: { pendingRemoval != nil },
                                                  set: { if !$0 { pendingRemoval = nil } }),
                             titleVisibility: .visible) {
-            Button("Remove", role: .destructive) {
+            Button(pendingRemoval == manager.identityRecipient ? "Delete this phone's key" : "Remove",
+                   role: .destructive) {
                 if let r = pendingRemoval { manager.removeRecipient(r) }
                 pendingRemoval = nil
             }
             Button("Cancel", role: .cancel) { pendingRemoval = nil }
         } message: {
-            Text("Future backups won't be encrypted to this key. Files already uploaded stay decryptable by whichever keys were set when they were backed up.")
+            if pendingRemoval == manager.identityRecipient {
+                Text("⚠️ This is THIS PHONE's key — removing it also deletes its secret from the Keychain. Every backup encrypted to it becomes unrecoverable unless you saved the secret (or another configured key can decrypt). Reveal and save the secret first if in doubt.")
+            } else {
+                Text("Future backups won't be encrypted to this key. Files already uploaded stay decryptable by whichever keys were set when they were backed up.")
+            }
         }
     }
 
@@ -101,8 +116,8 @@ struct KeysView: View {
         return HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
-                    Pill(text: isPair ? "PAIR (on device)" : "PUBLIC-ONLY",
-                         color: isPair ? Theme.violet : Theme.teal)
+                    Pill(text: isPair ? "★ THIS PHONE" : "PUBLIC-ONLY",
+                         color: isPair ? Theme.violet : Theme.teal, filled: isPair)
                     if let kind { Pill(text: kind.label, color: kind.color, filled: true) }
                 }
                 Text(recipient)

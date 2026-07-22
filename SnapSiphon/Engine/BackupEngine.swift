@@ -427,7 +427,7 @@ final class BackupEngine: ObservableObject {
     /// `manifest.age`. Encrypted to the same recipients, so the provider still
     /// sees only ciphertext, but you can `age -d` it to recover every filename.
     @discardableResult
-    func writeManifest() async -> Result<Int, Error> {
+    func writeManifest() async -> Result<(count: Int, bytes: Int64), Error> {
         guard let index, let client = makeClient() else { return .failure(S3Error.badConfig) }
         let recipients = keyManager.recipientObjects
         guard !recipients.isEmpty else { return .failure(Age.Error.badRecipient) }
@@ -461,10 +461,11 @@ final class BackupEngine: ObservableObject {
             // fresh. Restore lists `manifests/` and takes the last one.
             let stamp = Self.manifestStampFormatter.string(from: Date())
             let key = client.fullKey(for: "manifests/manifest-\(stamp).age")
+            let encBytes = (try? FileManager.default.attributesOfItem(atPath: encURL.path)[.size] as? Int64) ?? nil
             try await client.putObject(fileURL: encURL, key: key,
                                        contentType: "application/age", contentMD5: md5)
-            appendLog("Wrote encrypted manifest (\(items.count) item\(items.count == 1 ? "" : "s")) → \(key).", .success)
-            return .success(items.count)
+            appendLog("Wrote encrypted manifest — \(items.count) item\(items.count == 1 ? "" : "s"), \(Format.bytes(encBytes ?? 0)) → \(key).", .success)
+            return .success((items.count, encBytes ?? 0))
         } catch {
             appendLog("Manifest write failed: \(error.localizedDescription)", .error)
             return .failure(error)

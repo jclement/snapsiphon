@@ -128,6 +128,7 @@ final class S3Client {
             let producer = try ThrottledBodyStream(fileURL: fileURL, bytesPerSecond: bytesPerSecond)
             request.httpBodyStream = producer.bodyStream
             producer.start()
+            defer { producer.cancel() }   // reap the producer thread win or lose
             let (data, response) = try await session.data(for: request, delegate: delegate)
             try Self.validate(response: response, data: data)
         } else {
