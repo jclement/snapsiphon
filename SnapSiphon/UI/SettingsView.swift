@@ -2,6 +2,9 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var engine: BackupEngine
+    // Observe directly so the recipient count refreshes the moment a key is
+    // added/removed (SettingsView otherwise only observes `engine`).
+    @ObservedObject private var keyManager = AgeKeyManager.shared
 
     var body: some View {
         NavigationStack {
@@ -150,7 +153,7 @@ struct SettingsView: View {
     }
 
     private var keySubtitle: String {
-        let n = engine.keyManager.recipients.count
+        let n = keyManager.recipients.count
         return n == 0 ? "Not set" : "\(n) recipient\(n == 1 ? "" : "s")"
     }
 
@@ -160,7 +163,7 @@ struct SettingsView: View {
                 setupRow(icon: "key.fill",
                          title: "Encryption key",
                          subtitle: keySubtitle,
-                         ok: engine.keyManager.isConfigured)
+                         ok: keyManager.isConfigured)
             }
             NavigationLink { StorageSetupView() } label: {
                 setupRow(icon: "externaldrive.connected.to.line.below.fill",

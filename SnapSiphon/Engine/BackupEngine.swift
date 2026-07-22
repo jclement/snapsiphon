@@ -29,9 +29,11 @@ final class BackupEngine: ObservableObject {
     // MARK: Published state
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var counts = BackupIndex.Counts()
-    /// One entry per in-flight parallel upload — each gets its own progress row,
-    /// so concurrent streams never fight over a single shared bar.
-    @Published private(set) var activeUploads: [UploadSlot] = []
+    /// Fixed upload "lanes" — one per parallel thread, so the row count stays
+    /// static during a run: a finished file's lane is reused by the next file
+    /// instead of the row disappearing and a new one popping in (which jittered).
+    /// `nil` = that lane is momentarily idle.
+    @Published private(set) var uploadLanes: [UploadSlot?] = []
 
     struct UploadSlot: Identifiable, Equatable {
         let id: String            // localIdentifier
@@ -119,7 +121,7 @@ final class BackupEngine: ObservableObject {
 
         if mode == "uploading" {
             phase = .running
-            activeUploads = [
+            uploadLanes = [
                 UploadSlot(id: "1", filename: "IMG_4821.HEIC", progress: 0.62, byteSize: 4_200_000, isVideo: false),
                 UploadSlot(id: "2", filename: "IMG_4822.MOV", progress: 0.28, byteSize: 214_000_000, isVideo: true),
                 UploadSlot(id: "3", filename: "IMG_4823.HEIC", progress: 0.91, byteSize: 3_900_000, isVideo: false),
@@ -482,6 +484,9 @@ final class BackupEngine: ObservableObject {
         sessionUploaded = 0
         sessionBytes = 0
         sessionStartedAt = Date()
+        // One fixed lane per parallel thread — the row count stays put all run.
+        let concurrency = max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
+        uploadLanes = Array(repeating: nil, count: concurrency)
         meter.reset()
         appendLog("Backup started.", .info)
 
@@ -501,7 +506,7 @@ final class BackupEngine: ObservableObject {
         runTask = nil
         phase = .paused
         waitingReason = nil
-        activeUploads.removeAll()
+        uploadLanes.removeAll()
         UIApplication.shared.isIdleTimerDisabled = false
         appendLog("Paused.", .warning)
     }
@@ -512,7 +517,7 @@ final class BackupEngine: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
         refreshCounts()
         index?.persistBloom()
-        activeUploads.removeAll()
+        uploadLanes.removeAll()
         bytesPerSecond = 0
         if phase == .running {
             phase = .finished
@@ -532,22 +537,24 @@ final class BackupEngine: ObservableObject {
                               progress: 0,
                               byteSize: record.byteSize,
                               isVideo: record.mediaType == .video)
-        if let i = activeUploads.firstIndex(where: { $0.id == slot.id }) {
-            activeUploads[i] = slot
+        // Claim the first idle lane; grow only if somehow all are busy.
+        if let i = uploadLanes.firstIndex(where: { $0 == nil }) {
+            uploadLanes[i] = slot
         } else {
-            activeUploads.append(slot)
+            uploadLanes.append(slot)
         }
     }
 
     private func updateSlot(_ id: String, filename: String? = nil, byteSize: Int64? = nil, progress: Double? = nil) {
-        guard let i = activeUploads.firstIndex(where: { $0.id == id }) else { return }
-        if let filename { activeUploads[i].filename = filename }
-        if let byteSize { activeUploads[i].byteSize = byteSize }
-        if let progress { activeUploads[i].progress = progress }
+        guard let i = uploadLanes.firstIndex(where: { $0?.id == id }) else { return }
+        if let filename { uploadLanes[i]?.filename = filename }
+        if let byteSize { uploadLanes[i]?.byteSize = byteSize }
+        if let progress { uploadLanes[i]?.progress = progress }
     }
 
     private func endSlot(_ id: String) {
-        activeUploads.removeAll { $0.id == id }
+        // Free the lane (keep the row) so the next file reuses this position.
+        if let i = uploadLanes.firstIndex(where: { $0?.id == id }) { uploadLanes[i] = nil }
     }
 
     private func runLoop(processor: AssetProcessor) async {

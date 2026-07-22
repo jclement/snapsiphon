@@ -139,7 +139,7 @@ struct DashboardView: View {
                 infoPanel(icon: "pause.circle.fill", color: .orange, spinning: true,
                           title: "Waiting", subtitle: reason)
                 gaugeRow(now: now)
-            } else if isRunning || !engine.activeUploads.isEmpty {
+            } else if isRunning || engine.uploadLanes.contains(where: { $0 != nil }) {
                 uploadStreams
                 gaugeRow(now: now)
             } else if engine.counts.failed > 0 {
@@ -156,26 +156,33 @@ struct DashboardView: View {
         }
     }
 
-    // Dense per-stream upload rows: one bar per parallel upload.
+    // Dense per-thread upload rows — a FIXED number of lanes (one per parallel
+    // thread) so rows never appear/disappear between files; an idle lane just
+    // shows a faded placeholder until its next file starts.
     private var uploadStreams: some View {
-        VStack(spacing: 5) {
+        let lanes = engine.uploadLanes.isEmpty ? [UploadSlot?.none] : engine.uploadLanes
+        return VStack(spacing: 5) {
             HStack {
-                Text("UPLOADING \(engine.activeUploads.count) STREAM\(engine.activeUploads.count == 1 ? "" : "S")")
+                Text("\(lanes.count) UPLOAD LANE\(lanes.count == 1 ? "" : "S")")
                     .font(Theme.mono(9, weight: .medium)).tracking(1.5).foregroundStyle(Theme.teal)
                 Spacer()
                 Text("\(Format.count(engine.sessionUploaded)) done · \(Format.bytes(engine.sessionBytes))")
                     .font(Theme.mono(9)).foregroundStyle(Theme.textTertiary)
             }
             .padding(.horizontal, 2)
-            ForEach(engine.activeUploads.prefix(5)) { slot in
-                UploadRow(filename: slot.filename, byteSize: slot.byteSize,
-                          progress: slot.progress, isVideo: slot.isVideo)
-            }
-            if engine.activeUploads.isEmpty {
-                UploadRow(filename: "Preparing…", byteSize: 0, progress: 0.02, isVideo: false)
+            ForEach(Array(lanes.enumerated()), id: \.offset) { _, slot in
+                if let slot {
+                    UploadRow(filename: slot.filename, byteSize: slot.byteSize,
+                              progress: slot.progress, isVideo: slot.isVideo)
+                } else {
+                    UploadRow(filename: "idle", byteSize: 0, progress: 0, isVideo: false)
+                        .opacity(0.35)
+                }
             }
         }
     }
+
+    private typealias UploadSlot = BackupEngine.UploadSlot
 
     private var isRunning: Bool { engine.phase == .running }
 
