@@ -568,7 +568,17 @@ final class BackupEngine: ObservableObject {
         guard let i = uploadLanes.firstIndex(where: { $0?.id == id }) else { return }
         if let filename { uploadLanes[i]?.filename = filename }
         if let byteSize { uploadLanes[i]?.byteSize = byteSize }
-        if let progress { uploadLanes[i]?.progress = progress }
+        if let progress, let slot = uploadLanes[i] {
+            // Feed the throughput meter from byte-level progress, not file
+            // completions — a single long video used to starve the 5s window
+            // for minutes and the speed gauge read "—".
+            let delta = (progress - slot.progress) * Double(slot.byteSize)
+            if delta > 0 {
+                meter.record(bytes: Int64(delta))
+                bytesPerSecond = meter.bytesPerSecond()
+            }
+            uploadLanes[i]?.progress = progress
+        }
     }
 
     private func endSlot(_ id: String) {
@@ -578,45 +588,46 @@ final class BackupEngine: ObservableObject {
 
     private func runLoop(processor: AssetProcessor) async {
         guard let index else { return }
-        let batchSize = 200
         // Convert the MB/s knob to bytes/s once per run (0 = unlimited).
         let bytesPerSecond = settings.speedLimitMBps * 1_000_000
         let verifyFirst = settings.verifyRemoteBeforeUpload
+        let concurrency = max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
 
-        while !Task.isCancelled {
-            // Park here while a condition gate (Wi-Fi / battery / offline) is closed.
-            if await !waitForFavorableConditions() { break }
+        if await !waitForFavorableConditions() { return }
 
-            let pending = index.pendingRecords(limit: batchSize)
-            if pending.isEmpty { break }
+        // Continuous refill — one new file starts the moment any lane frees up.
+        // The old design processed fixed batches of 200 with a barrier at the
+        // end of each: a multi-GB video in flight at a batch boundary idled
+        // every other lane until it finished. No batches, no barrier, no stall.
+        var inFlight = Set<String>()
+        var attempted = Set<String>()   // one try per record per run; failures wait for the next run
 
-            let concurrency = max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
-
-            await withTaskGroup(of: Void.self) { group in
-                var iterator = pending.makeIterator()
-                var inFlight = 0
-
-                @Sendable func spawn(_ record: AssetRecord) {
-                    group.addTask { [weak self] in
-                        await self?.processOne(record, processor: processor,
-                                               verifyFirst: verifyFirst, bytesPerSecond: bytesPerSecond)
-                    }
+        await withTaskGroup(of: String.self) { group in
+            @discardableResult
+            func spawnNext() -> Bool {
+                let candidates = index.pendingRecords(limit: concurrency * 2 + attempted.count)
+                guard let record = candidates.first(where: {
+                    !inFlight.contains($0.localIdentifier) && !attempted.contains($0.localIdentifier)
+                }) else { return false }
+                inFlight.insert(record.localIdentifier)
+                attempted.insert(record.localIdentifier)
+                group.addTask { [weak self] in
+                    await self?.processOne(record, processor: processor,
+                                           verifyFirst: verifyFirst, bytesPerSecond: bytesPerSecond)
+                    return record.localIdentifier
                 }
-
-                // Prime the group up to the concurrency limit.
-                while inFlight < concurrency, let next = iterator.next() {
-                    spawn(next); inFlight += 1
-                }
-                // As each finishes, start the next.
-                while await group.next() != nil {
-                    inFlight -= 1
-                    if Task.isCancelled { break }
-                    if let next = iterator.next() { spawn(next); inFlight += 1 }
-                }
+                return true
             }
-            refreshCounts()
-            if Task.isCancelled { break }
+
+            for _ in 0..<concurrency { if !spawnNext() { break } }
+            while let finished = await group.next() {
+                inFlight.remove(finished)
+                if Task.isCancelled { continue }                      // drain without refilling
+                if await !waitForFavorableConditions() { continue }   // park refills; in-flight uploads run on
+                spawnNext()
+            }
         }
+        refreshCounts()
     }
 
     /// Blocks until the user's network/battery gates all open, or the task is
@@ -669,9 +680,9 @@ final class BackupEngine: ObservableObject {
             endSlot(rid)
             sessionUploaded += 1
             if !result.alreadyPresent {
+                // Session totals only — the speed meter is fed by byte-level
+                // progress in updateSlot, so recording here would double-count.
                 sessionBytes += result.encryptedBytes
-                meter.record(bytes: result.encryptedBytes)
-                self.bytesPerSecond = meter.bytesPerSecond()
             }
             refreshCounts()
         } catch is CancellationError {
