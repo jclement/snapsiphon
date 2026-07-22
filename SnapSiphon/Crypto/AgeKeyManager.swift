@@ -21,6 +21,9 @@ final class AgeKeyManager: ObservableObject {
     private let recipientsAccount = "recipients"     // newline-joined bech32 list
     private let legacyRecipientAccount = "recipient" // pre-multi-key single value
     private let identityAccount = "identity"
+    /// The identity's *public* half, stored separately so UI checks (badging the
+    /// PAIR row, `hasIdentity`) never have to read the secret itself.
+    private let identityMarkerAccount = "identityRecipient"
 
     @Published private(set) var recipients: [String] = []
     @Published private(set) var hasIdentity: Bool = false
@@ -34,6 +37,21 @@ final class AgeKeyManager: ObservableObject {
             try? writeRecipients()
         }
         hasIdentity = readString(account: identityAccount) != nil
+        // Legacy migration: derive + store the public marker once.
+        if hasIdentity, readString(account: identityMarkerAccount) == nil,
+           let secret = readString(account: identityAccount),
+           let identity = try? Age.Identity(bech32: secret) {
+            try? write(identity.recipient.bech32, account: identityMarkerAccount)
+        }
+    }
+
+    /// First-run default: if no keys are configured at all, mint this phone's
+    /// own identity so backups can start immediately and the restore script is
+    /// fully self-contained. Never touches an already-configured setup.
+    @discardableResult
+    func ensureDefaultIdentity() -> Bool {
+        guard recipients.isEmpty && !hasIdentity else { return false }
+        return (try? generateIdentity()) != nil
     }
 
     var isConfigured: Bool { !recipients.isEmpty }
@@ -44,12 +62,9 @@ final class AgeKeyManager: ObservableObject {
     }
 
     /// The recipient string that corresponds to the on-device identity (if any),
-    /// so the UI can badge which entry we hold the secret for.
-    var identityRecipient: String? {
-        guard let secret = readString(account: identityAccount),
-              let identity = try? Age.Identity(bech32: secret) else { return nil }
-        return identity.recipient.bech32
-    }
+    /// so the UI can badge which entry we hold the secret for. Reads the public
+    /// marker, never the secret.
+    var identityRecipient: String? { readString(account: identityMarkerAccount) }
 
     // MARK: Mutations
 
@@ -70,6 +85,7 @@ final class AgeKeyManager: ObservableObject {
         try? writeRecipients()
         if identityRecipient == string {
             delete(account: identityAccount)
+            delete(account: identityMarkerAccount)
             hasIdentity = false
         }
     }
@@ -81,6 +97,7 @@ final class AgeKeyManager: ObservableObject {
         let identity = Age.Identity()
         let recipient = identity.recipient.bech32
         try write(identity.bech32, account: identityAccount)
+        try write(recipient, account: identityMarkerAccount)
         if !recipients.contains(recipient) {
             recipients.append(recipient)
             try writeRecipients()
@@ -89,13 +106,15 @@ final class AgeKeyManager: ObservableObject {
         return (recipient, identity.bech32)
     }
 
-    /// Retrieve the stored secret (for re-display / export). Nil if none held.
+    /// Retrieve the stored secret. ⚠️ Returns it raw — call ONLY from behind a
+    /// `DeviceAuth.authenticate` gate (secret reveal, restore-script export).
     func exportSecret() -> String? { readString(account: identityAccount) }
 
     func reset() {
         delete(account: recipientsAccount)
         delete(account: legacyRecipientAccount)
         delete(account: identityAccount)
+        delete(account: identityMarkerAccount)
         recipients = []
         hasIdentity = false
     }

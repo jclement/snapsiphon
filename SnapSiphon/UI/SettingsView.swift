@@ -169,8 +169,11 @@ struct SettingsView: View {
             .confirmationDialog("Copy restore script?", isPresented: $showRestoreScriptWarning,
                                 titleVisibility: .visible) {
                 Button("Copy to clipboard", role: .destructive) {
-                    if let script = engine.buildRestoreScript() {
-                        UIPasteboard.general.string = script
+                    Task {
+                        // Face ID / passcode prompt happens inside.
+                        if let script = await engine.buildRestoreScript() {
+                            UIPasteboard.general.string = script
+                        }
                     }
                 }
                 Button("Cancel", role: .cancel) {}

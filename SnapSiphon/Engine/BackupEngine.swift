@@ -99,6 +99,12 @@ final class BackupEngine: ObservableObject {
         #if DEBUG
         if let mode = ProcessInfo.processInfo.environment["SNAPSIPHON_DEMO"] { seedDemoState(mode) }
         #endif
+        // First run: mint this phone's own key by default so backups can start
+        // right away and the restore script is turnkey. Never touches an
+        // already-configured key set.
+        if !demoMode, keyManager.ensureDefaultIdentity() {
+            appendLog("Generated this phone's encryption key. Reveal & back it up in Settings → Encryption key (requires Face ID).", .info)
+        }
     }
 
     #if DEBUG
@@ -465,11 +471,16 @@ final class BackupEngine: ObservableObject {
         }
     }
 
-    /// Build the break-glass restore script (bucket creds + age secret baked in).
-    /// Nil until storage is configured. If no on-device identity exists, the
-    /// script carries a placeholder the user must fill with their secret key.
-    func buildRestoreScript() -> String? {
+    /// Build the break-glass restore script (bucket creds + age secret baked in),
+    /// gated behind Face ID / passcode. Nil if storage isn't configured or auth
+    /// fails. Without an on-device identity, the script carries a placeholder
+    /// the user must fill with a secret key.
+    func buildRestoreScript() async -> String? {
         guard s3Config.isComplete, let creds = S3CredentialStore.load() else { return nil }
+        let what = keyManager.hasIdentity ? "bucket credentials and encryption secret key" : "bucket credentials"
+        guard await DeviceAuth.authenticate(reason: "Export a restore script containing your \(what)") else {
+            return nil
+        }
         return RestoreScript.build(config: s3Config, credentials: creds,
                                    ageSecret: keyManager.exportSecret())
     }

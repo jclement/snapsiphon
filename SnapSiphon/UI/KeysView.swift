@@ -115,6 +115,20 @@ struct KeysView: View {
                 Button { UIPasteboard.general.string = recipient } label: {
                     Image(systemName: "doc.on.doc").font(.system(size: 14)).foregroundStyle(Theme.teal)
                 }
+                if isPair {
+                    // Reveal the secret for backup — gated behind Face ID/passcode.
+                    Button {
+                        Task {
+                            if await DeviceAuth.authenticate(reason: "Reveal your age secret key"),
+                               let secret = manager.exportSecret() {
+                                generatedSecret = secret
+                                showSecret = false
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "eye").font(.system(size: 14)).foregroundStyle(Theme.violet)
+                    }
+                }
                 Button { pendingRemoval = recipient } label: {
                     Image(systemName: "trash").font(.system(size: 14)).foregroundStyle(.red)
                 }

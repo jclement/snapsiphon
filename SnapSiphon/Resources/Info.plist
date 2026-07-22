@@ -49,6 +49,8 @@
 	<string>SnapSiphon reads your photos and videos so it can encrypt them and back them up to your own S3-compatible storage. Nothing leaves your device unencrypted.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>SnapSiphon needs limited access to verify backups against your library.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>SnapSiphon uses Face ID to protect access to your encryption secret key and restore script.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>processing</string>
