@@ -6,6 +6,8 @@ struct SettingsView: View {
     // added/removed (SettingsView otherwise only observes `engine`).
     @ObservedObject private var keyManager = AgeKeyManager.shared
     @State private var showRestoreScriptWarning = false
+    @State private var restoreScript: String?
+    @State private var showScriptViewer = false
     @State private var writingManifest = false
     @State private var manifestStatus: String?
 
@@ -133,8 +135,8 @@ struct SettingsView: View {
                             HStack {
                                 Image(systemName: "cross.case.fill")
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Copy restore script").font(Theme.rounded(16, weight: .medium))
-                                    Text("A single Python file with your bucket credentials\(keyManager.hasIdentity ? " and age secret" : "") baked in — run it on a laptop to rebuild the whole archive. Store it like a password.")
+                                    Text("Restore script").font(Theme.rounded(16, weight: .medium))
+                                    Text("A single Python file with your bucket credentials\(keyManager.hasIdentity ? " and age secret" : "") baked in — run it on a laptop to rebuild the whole archive. Face ID, then review & copy.")
                                         .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                                 }
                                 Spacer()
@@ -188,19 +190,24 @@ struct SettingsView: View {
             }
             .background(Theme.canvas.ignoresSafeArea())
             .navigationBarHidden(true)
-            .confirmationDialog("Copy restore script?", isPresented: $showRestoreScriptWarning,
-                                titleVisibility: .visible) {
-                Button("Copy to clipboard", role: .destructive) {
+            .alert("Restore script", isPresented: $showRestoreScriptWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("Continue") {
                     Task {
-                        // Face ID / passcode prompt happens inside.
+                        // Face ID / passcode prompt happens inside buildRestoreScript.
                         if let script = await engine.buildRestoreScript() {
-                            UIPasteboard.general.string = script
+                            restoreScript = script
+                            showScriptViewer = true
                         }
                     }
                 }
-                Button("Cancel", role: .cancel) {}
             } message: {
-                Text("The script contains your bucket credentials\(keyManager.hasIdentity ? " AND your age secret key" : "") in plaintext. Anyone holding it can read your entire archive. Paste it straight into a password manager or an encrypted note.")
+                Text("This builds a single Python file containing your bucket credentials\(keyManager.hasIdentity ? " AND this phone's secret key" : "") in plaintext — enough to rebuild your entire archive on a laptop. After Face ID you can review the script before copying it. Store it like a password.")
+            }
+            .sheet(isPresented: $showScriptViewer) {
+                if let restoreScript {
+                    RestoreScriptViewer(script: restoreScript)
+                }
             }
         }
     }
