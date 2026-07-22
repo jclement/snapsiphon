@@ -118,7 +118,7 @@ struct SettingsView: View {
 
                     knobGroup("Deletions") {
                         ToggleRow(title: "Mirror deletions",
-                                  subtitle: "Off = pure archive (phone deletes never touch the bucket). On = deleted photos are tombstoned, then freed after a grace period.",
+                                  subtitle: "Off = pure archive; deleting here never touches the bucket. On = a deleted photo is marked deleted in the encrypted manifest immediately (restores skip it), and its blob is physically freed only after the grace period below.",
                                   isOn: $engine.settings.propagateDeletes)
                         if engine.settings.propagateDeletes {
                             Divider().overlay(Theme.hairline)
@@ -223,6 +223,10 @@ struct SettingsView: View {
                     }
 
                     knobGroup("Scanning") {
+                        ToggleRow(title: "Auto back up on open",
+                                  subtitle: "Start a backup when the app opens, if the last run finished more than 30 minutes ago.",
+                                  isOn: $engine.settings.autoStartOnLaunch)
+                        Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Fast scan",
                                   subtitle: "Only check photos newer than the last scan. Much faster on big libraries.",
                                   isOn: $engine.settings.incrementalScan)

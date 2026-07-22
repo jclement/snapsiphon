@@ -125,7 +125,7 @@ final class BackupEngine: ObservableObject {
         c.total = 12_843
         c.uploaded = 8_642
         c.pending = 4_197
-        c.failed = 4
+        c.failed = mode == "ready" ? 0 : 4
         c.uploadedBytes = 71_400_000_000     // ~71 GB
         c.totalBytes = c.uploadedBytes
         counts = c
@@ -162,6 +162,28 @@ final class BackupEngine: ObservableObject {
     /// The clamped parallel-upload setting (read live by the run loop).
     var workerTarget: Int {
         max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
+    }
+
+    /// Not-yet-uploaded counts per type (library total minus uploaded) — covers
+    /// both indexed-pending items AND new photos no scan has seen yet, which is
+    /// what the "ready to back up" banner needs at launch.
+    var toBackupPhotos: Int { settings.includePhotos ? max(0, libraryPhotos - uploadedPhotos) : 0 }
+    var toBackupVideos: Int { settings.includeVideos ? max(0, libraryVideos - uploadedVideos) : 0 }
+
+    // MARK: Auto backup
+
+    private static let lastRunKey = "SnapSiphon.lastRunCompletedAt"
+
+    /// If enabled, kick off a backup when the app opens/foregrounds — but only
+    /// when the last completed run is more than 30 minutes old, so quick app
+    /// switches don't thrash scans.
+    func autoBackupIfDue() {
+        guard settings.autoStartOnLaunch, isConfigured, runTask == nil,
+              phase != .scanning, !verifying else { return }
+        let last = UserDefaults.standard.double(forKey: Self.lastRunKey)
+        if last > 0, Date().timeIntervalSince1970 - last < 30 * 60 { return }
+        appendLog("Auto backup — last run more than 30 minutes ago.", .info)
+        backUpNow()
     }
 
     /// Rough estimate of seconds remaining for the current run, from the average
@@ -657,6 +679,7 @@ final class BackupEngine: ObservableObject {
             phase = .finished
             appendLog("Backup finished — \(sessionUploaded) uploaded this session.", .success)
         }
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRunKey)
         // Refresh the bucket manifest whenever the archive has changed since the
         // last successful write — covering uploads from THIS run, but also a
         // previous run whose manifest write failed or was cut short.

@@ -147,13 +147,52 @@ struct DashboardView: View {
                           title: "\(Format.count(engine.counts.failed)) failed to upload",
                           subtitle: "See the Activity tab for details, then Back Up Now to retry.")
                 gaugeRow(now: now)
+            } else if engine.toBackupPhotos + engine.toBackupVideos > 0 {
+                // Counts library-vs-uploaded, so brand-new photos show here
+                // immediately at launch — before any scan has indexed them.
+                backupReadyBanner
+                gaugeRow(now: now)
             } else {
-                infoPanel(icon: engine.counts.pending > 0 ? "tray.full.fill" : "checkmark.seal.fill",
-                          color: engine.counts.pending > 0 ? .orange : .green, spinning: false,
+                infoPanel(icon: "checkmark.seal.fill", color: .green, spinning: false,
                           title: idleTitle, subtitle: idleSubtitle)
                 gaugeRow(now: now)
             }
         }
+    }
+
+    private var backupReadyBanner: some View {
+        Button { engine.backUpNow() } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 20, weight: .semibold)).foregroundStyle(.black)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(readyLine)
+                        .font(Theme.rounded(15, weight: .bold)).foregroundStyle(.black)
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                    Text("Tap to back them up now")
+                        .font(.system(size: 12)).foregroundStyle(.black.opacity(0.65))
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 24)).foregroundStyle(.black.opacity(0.8))
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(LinearGradient(colors: [.orange, Theme.violet],
+                                         startPoint: .leading, endPoint: .trailing)))
+        }
+    }
+
+    private var readyLine: String {
+        var parts: [String] = []
+        if engine.toBackupPhotos > 0 {
+            parts.append("\(Format.count(engine.toBackupPhotos)) photo\(engine.toBackupPhotos == 1 ? "" : "s")")
+        }
+        if engine.toBackupVideos > 0 {
+            parts.append("\(Format.count(engine.toBackupVideos)) video\(engine.toBackupVideos == 1 ? "" : "s")")
+        }
+        return parts.joined(separator: " · ") + " to back up"
     }
 
     // Dense per-thread upload rows — a FIXED number of lanes (one per parallel
