@@ -14,6 +14,10 @@ struct RootView: View {
                     .tabItem { Label("Activity", systemImage: "waveform.path.ecg") }
                 SettingsView()
                     .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
+                // Deliberately OUTSIDE the Face-ID-gated Settings tab: restore
+                // documentation must be readable by anyone holding the phone.
+                NavigationStack { AboutView() }
+                    .tabItem { Label("Help", systemImage: "book.closed.fill") }
             }
         }
         .task {

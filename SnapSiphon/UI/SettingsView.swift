@@ -315,25 +315,6 @@ struct SettingsView: View {
                         }
                     }
 
-                    NavigationLink { AboutView() } label: {
-                        Card {
-                            HStack(spacing: 14) {
-                                Image(systemName: "questionmark.circle.fill")
-                                    .font(.system(size: 18)).foregroundStyle(Theme.brandGradient)
-                                    .frame(width: 28)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("About & Help").font(Theme.rounded(16, weight: .semibold))
-                                        .foregroundStyle(Theme.textPrimary)
-                                    Text("How storage works, encryption details, restore paths, credits.")
-                                        .font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right").font(.system(size: 13))
-                                    .foregroundStyle(Theme.textTertiary)
-                            }
-                        }
-                    }
-
                     Text(Self.versionFooter)
                         .font(Theme.mono(10)).foregroundStyle(Theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)

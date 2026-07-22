@@ -65,8 +65,7 @@ struct AboutView: View {
             .containerRelativeFrame(.horizontal)
         }
         .background(Theme.canvas.ignoresSafeArea())
-        .navigationTitle("About")
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarHidden(true)   // it's a tab now — the custom header carries it
     }
 
     private var header: some View {
