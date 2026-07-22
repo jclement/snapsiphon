@@ -293,7 +293,7 @@ struct SettingsView: View {
                         }
                     }
 
-                    Text("SnapSiphon v1.0 · age + S3 · your keys, your bucket")
+                    Text(Self.versionFooter)
                         .font(Theme.mono(10)).foregroundStyle(Theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.top, 8)
@@ -320,6 +320,16 @@ struct SettingsView: View {
                 RestoreScriptViewer(script: doc.text)
             }
     }
+
+    /// "SnapSiphon v0.2.1 (202607221530 · abc1234) · …" — version/build/hash are
+    /// injected by scripts/release.sh; dev builds show v0.0.0 (1 · dev).
+    static let versionFooter: String = {
+        let info = Bundle.main
+        let v = info.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let b = info.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let h = info.object(forInfoDictionaryKey: "SnapSiphonGitCommit") as? String ?? ""
+        return "SnapSiphon v\(v) (\(b)\(h.isEmpty ? "" : " · \(h)")) · age + S3 · your keys, your bucket"
+    }()
 
     private var keySubtitle: String {
         let n = keyManager.recipients.count

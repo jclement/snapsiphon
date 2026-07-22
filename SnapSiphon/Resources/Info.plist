@@ -22,6 +22,10 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.photography</string>
+	<key>SnapSiphonGitCommit</key>
+	<string>$(GIT_COMMIT_HASH)</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>SnapSiphon uses Face ID to protect access to your encryption secret key and restore script.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

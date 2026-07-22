@@ -8,8 +8,12 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "1.0"
+    # Dev defaults — real releases override these at build time via
+    # scripts/release.sh (mise run release -- X.Y.Z), which injects the semver,
+    # a timestamp build id, and the git hash without dirtying the tree.
+    MARKETING_VERSION: "0.0.0"
     CURRENT_PROJECT_VERSION: "1"
+    GIT_COMMIT_HASH: "dev"
     SWIFT_VERSION: "5.0"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     GENERATE_INFOPLIST_FILE: NO
