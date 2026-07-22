@@ -128,14 +128,19 @@ struct AssetProcessor {
                           mediaType: AssetRecord.MediaType, encryptFilenames: Bool) -> String {
         let ext = fileExtension(filename: filename, mediaType: mediaType)
         if encryptFilenames {
-            let digest = SHA256.hash(data: Data(localIdentifier.utf8))
-            let hex = digest.map { String(format: "%02x", $0) }.joined()
+            let hex = identifierHash(localIdentifier)
             return "\(hex.prefix(2))/\(hex).\(ext).age"
         } else {
             let stamp = Self.folderFormatter.string(from: createdAt ?? Date(timeIntervalSince1970: 0))
             let safe = filename.replacingOccurrences(of: "/", with: "_")
             return "\(stamp)/\(safe).age"
         }
+    }
+
+    /// The stable hash used as an asset's object name — exposed so the adopt
+    /// feature can match bucket objects back to library assets.
+    static func identifierHash(_ localIdentifier: String) -> String {
+        SHA256.hash(data: Data(localIdentifier.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Lowercased extension from the filename, falling back to a media-type guess.

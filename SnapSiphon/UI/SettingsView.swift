@@ -207,6 +207,28 @@ struct SettingsView: View {
                                 .foregroundStyle(status.hasPrefix("✓") ? .green
                                                  : status.hasPrefix("✗") ? .red : Theme.textSecondary)
                         }
+                        Divider().overlay(Theme.hairline)
+                        Button {
+                            Task { await engine.adoptExistingBackups() }
+                        } label: {
+                            HStack {
+                                Image(systemName: "square.and.arrow.down.on.square")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Adopt existing backups").font(Theme.rounded(16, weight: .medium))
+                                    Text("Fresh install, existing bucket? Match this library against objects already uploaded and index them — no downloads, no re-uploads. (Runs automatically on the first Back Up Now.)")
+                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                                }
+                                Spacer()
+                            }
+                            .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
+                        }
+                        .disabled(!engine.isConfigured || engine.phase.isActive || engine.verifying)
+                        if let status = engine.adoptStatus {
+                            Text(status)
+                                .font(Theme.mono(12))
+                                .foregroundStyle(status.hasPrefix("✓") ? .green
+                                                 : status.hasPrefix("✗") ? .red : Theme.textSecondary)
+                        }
                     }
 
                     knobGroup("Disaster recovery") {
@@ -290,6 +312,25 @@ struct SettingsView: View {
                                 Spacer()
                             }
                             .foregroundStyle(.red)
+                        }
+                    }
+
+                    NavigationLink { AboutView() } label: {
+                        Card {
+                            HStack(spacing: 14) {
+                                Image(systemName: "questionmark.circle.fill")
+                                    .font(.system(size: 18)).foregroundStyle(Theme.brandGradient)
+                                    .frame(width: 28)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("About & Help").font(Theme.rounded(16, weight: .semibold))
+                                        .foregroundStyle(Theme.textPrimary)
+                                    Text("How storage works, encryption details, restore paths, credits.")
+                                        .font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.system(size: 13))
+                                    .foregroundStyle(Theme.textTertiary)
+                            }
                         }
                     }
 

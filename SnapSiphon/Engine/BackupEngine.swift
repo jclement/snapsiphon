@@ -688,12 +688,116 @@ final class BackupEngine: ObservableObject {
         }
     }
 
+    // MARK: Adopt existing backups
+
+    @Published private(set) var adoptStatus: String?
+
+    /// Re-index an archive this install has never seen: one bucket LIST plus the
+    /// decrypted manifest, then match library assets by recomputing each one's
+    /// key hash. Matches are adopted as uploaded — real size from the listing,
+    /// MD5 from the ETag, filename/date from the manifest — with zero downloads
+    /// and zero re-uploads. `auto` runs silently inside Back Up Now whenever the
+    /// index has no uploads yet (fresh install pointed at an existing folder).
+    func adoptExistingBackups(auto: Bool = false) async {
+        guard let index, let client = makeClient() else { return }
+        if auto, index.counts().uploaded > 0 { return }   // nothing to migrate
+        if !auto { adoptStatus = "Listing bucket…" }
+        do {
+            var objects: [S3Client.RemoteObject] = []
+            var token: String? = nil
+            repeat {
+                let page = try await client.listObjects(continuationToken: token)
+                objects += page.objects
+                token = page.next
+            } while token != nil
+
+            let manifestPrefix = client.fullKey(for: "manifests/")
+            let dataObjects = objects.filter { !$0.key.hasPrefix(manifestPrefix) }
+            guard !dataObjects.isEmpty else {
+                if !auto { adoptStatus = "Bucket has no existing backups under this prefix." }
+                return
+            }
+
+            // hash → object (keys look like <prefix>/ab/<64-hex>.<ext>.age)
+            let pfx = client.fullKey(for: "")
+            var byHash: [String: S3Client.RemoteObject] = [:]
+            for o in dataObjects {
+                let rel = o.key.hasPrefix(pfx) ? String(o.key.dropFirst(pfx.count)) : o.key
+                guard let last = rel.split(separator: "/").last,
+                      let hash = last.split(separator: ".").first, hash.count == 64 else { continue }
+                byHash[String(hash)] = o
+            }
+
+            // Best-effort metadata from the newest manifest (needs our identity).
+            var manifestItems: [String: Manifest.Item] = [:]
+            if let latest = objects.map(\.key).filter({ $0.hasPrefix(manifestPrefix) }).sorted().last,
+               let secret = keyManager.exportSecret(),
+               let identity = try? Age.Identity(bech32: secret) {
+                let enc = tempDir.appendingPathComponent("adopt-manifest.age")
+                let dec = tempDir.appendingPathComponent("adopt-manifest.json")
+                defer {
+                    try? FileManager.default.removeItem(at: enc)
+                    try? FileManager.default.removeItem(at: dec)
+                }
+                try? await client.getObject(key: latest, to: enc)
+                if (try? Age.decryptFile(at: enc, to: dec, identity: identity)) != nil,
+                   let data = try? Data(contentsOf: dec),
+                   let m = try? JSONDecoder().decode(Manifest.self, from: data) {
+                    for item in m.items { manifestItems[item.key] = item }
+                }
+            }
+
+            if !auto { adoptStatus = "Matching \(Format.count(byHash.count)) objects against the library…" }
+            let photos = self.photos
+            let infos = await Task.detached(priority: .utility) {
+                photos.enumerate(includePhotos: true, includeVideos: true, since: nil)
+            }.value
+
+            let alreadyUploaded = Set(index.uploadedKeyPairs().map(\.id))
+            let iso = ISO8601DateFormatter()
+            var adopted = 0
+            for info in infos {
+                guard !alreadyUploaded.contains(info.localIdentifier),
+                      let obj = byHash[AssetProcessor.identifierHash(info.localIdentifier)] else { continue }
+                let item = manifestItems[obj.key]
+                index.upsert(AssetRecord(
+                    localIdentifier: info.localIdentifier,
+                    remoteKey: obj.key,
+                    state: .uploaded,
+                    mediaType: info.mediaType,
+                    filename: item?.filename ?? "",
+                    byteSize: obj.size,
+                    createdAt: info.creationDate,
+                    uploadedAt: item?.uploadedAt.flatMap { iso.date(from: $0) } ?? Date(),
+                    lastError: nil,
+                    md5: obj.etag.count == 32 ? obj.etag : nil))
+                adopted += 1
+            }
+            refreshCounts()
+            if adopted > 0 {
+                appendLog("Adopted \(Format.count(adopted)) existing backup\(adopted == 1 ? "" : "s") from the bucket — no re-upload needed.", .success)
+                adoptStatus = "✓ Adopted \(Format.count(adopted)) existing backups"
+            } else if !auto {
+                adoptStatus = "No bucket objects match this library (different device, or plain-filename mode?)."
+            }
+        } catch {
+            if !auto { adoptStatus = "✗ \(error.localizedDescription)" }
+            appendLog("Adopt existing backups failed: \(error.localizedDescription)", .error)
+        }
+    }
+
     // MARK: Backup run
 
     /// One-tap entry point for the dashboard: scan for new photos, then upload.
+    /// On a fresh index pointed at a bucket that already has content, existing
+    /// objects are adopted first, so only genuinely-new photos upload.
     func backUpNow() {
         guard runTask == nil, phase != .scanning else { return }
-        Task { await scan(); start() }
+        Task {
+            await scan()
+            await adoptExistingBackups(auto: true)
+            start()
+        }
     }
 
     func start() {
