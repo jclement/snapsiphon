@@ -1,0 +1,236 @@
+import Foundation
+
+/// The local source of truth for what has been backed up. Wraps a SQLite table
+/// of `AssetRecord`s and keeps a `BloomFilter` of uploaded identifiers in front
+/// of it for fast "definitely new?" scans. All access is serialized on a private
+/// queue so callers can hit it from any actor/task.
+final class BackupIndex {
+    private let db: SQLiteDatabase
+    private let queue = DispatchQueue(label: "com.snapsiphon.index")
+    private var bloom: BloomFilter
+    private let bloomURL: URL
+
+    init(directory: URL) throws {
+        let dbURL = directory.appendingPathComponent("index.sqlite")
+        self.bloomURL = directory.appendingPathComponent("bloom.filter")
+        self.db = try SQLiteDatabase(path: dbURL.path)
+        db.exec("""
+            CREATE TABLE IF NOT EXISTS assets (
+                localIdentifier TEXT PRIMARY KEY,
+                remoteKey TEXT NOT NULL,
+                state TEXT NOT NULL,
+                mediaType TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                byteSize INTEGER NOT NULL,
+                createdAt REAL,
+                uploadedAt REAL,
+                lastError TEXT
+            );
+        """)
+        db.exec("CREATE INDEX IF NOT EXISTS idx_state ON assets(state);")
+
+        // Load or seed the Bloom filter.
+        if let data = try? Data(contentsOf: bloomURL),
+           let loaded = try? JSONDecoder().decode(BloomFilter.self, from: data) {
+            self.bloom = loaded
+        } else {
+            self.bloom = BloomFilter(expectedItems: 50_000)
+        }
+    }
+
+    // MARK: Fast membership
+
+    /// Fast path: if the Bloom filter says "definitely not present", the asset is
+    /// new and we can skip the DB entirely. On a maybe-hit we confirm.
+    func isDefinitelyNew(_ localIdentifier: String) -> Bool {
+        queue.sync { !bloom.mightContain(localIdentifier) }
+    }
+
+    func isUploaded(_ localIdentifier: String) -> Bool {
+        queue.sync {
+            guard bloom.mightContain(localIdentifier) else { return false }
+            let n = db.scalarInt(
+                "SELECT COUNT(*) FROM assets WHERE localIdentifier = ? AND state = 'uploaded';",
+                [.text(localIdentifier)])
+            return n > 0
+        }
+    }
+
+    var bloomSnapshot: BloomFilter { queue.sync { bloom } }
+
+    // MARK: Upserts
+
+    func upsert(_ record: AssetRecord) {
+        queue.sync {
+            db.exec("""
+                INSERT INTO assets
+                    (localIdentifier, remoteKey, state, mediaType, filename, byteSize, createdAt, uploadedAt, lastError)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(localIdentifier) DO UPDATE SET
+                    remoteKey=excluded.remoteKey, state=excluded.state, mediaType=excluded.mediaType,
+                    filename=excluded.filename, byteSize=excluded.byteSize, createdAt=excluded.createdAt,
+                    uploadedAt=excluded.uploadedAt, lastError=excluded.lastError;
+                """,
+                [
+                    .text(record.localIdentifier),
+                    .text(record.remoteKey),
+                    .text(record.state.rawValue),
+                    .text(record.mediaType.rawValue),
+                    .text(record.filename),
+                    .int(record.byteSize),
+                    .date(record.createdAt),
+                    .date(record.uploadedAt),
+                    .optText(record.lastError),
+                ])
+            if record.state == .uploaded {
+                bloom.insert(record.localIdentifier)
+            }
+        }
+    }
+
+    func markUploaded(_ localIdentifier: String, uploadedAt: Date) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='uploaded', uploadedAt=?, lastError=NULL WHERE localIdentifier=?;",
+                    [.date(uploadedAt), .text(localIdentifier)])
+            bloom.insert(localIdentifier)
+        }
+    }
+
+    func markFailed(_ localIdentifier: String, error: String) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='failed', lastError=? WHERE localIdentifier=?;",
+                    [.text(error), .text(localIdentifier)])
+        }
+    }
+
+    func record(for localIdentifier: String) -> AssetRecord? {
+        queue.sync {
+            (try? db.query("SELECT * FROM assets WHERE localIdentifier = ?;", [.text(localIdentifier)], Self.mapRow))?.first
+        }
+    }
+
+    // MARK: Aggregate stats
+
+    struct Counts {
+        var total = 0
+        var uploaded = 0
+        var pending = 0
+        var failed = 0
+        var uploadedBytes: Int64 = 0
+        var totalBytes: Int64 = 0
+    }
+
+    func counts() -> Counts {
+        queue.sync {
+            var c = Counts()
+            c.total = Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state != 'deleted';"))
+            c.uploaded = Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='uploaded';"))
+            c.pending = Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state IN ('pending','uploading');"))
+            c.failed = Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='failed';"))
+            c.uploadedBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded';")
+            c.totalBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state != 'deleted';")
+            return c
+        }
+    }
+
+    /// Uploaded counts and stored bytes split by media type, for the ring.
+    func uploadedByType() -> (photos: Int, videos: Int, photoBytes: Int64, videoBytes: Int64) {
+        queue.sync {
+            let p = db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='uploaded' AND mediaType='photo';")
+            let v = db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='uploaded' AND mediaType='video';")
+            let pb = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='photo';")
+            let vb = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='video';")
+            return (Int(p), Int(v), pb, vb)
+        }
+    }
+
+    func pendingRecords(limit: Int) -> [AssetRecord] {
+        queue.sync {
+            (try? db.query(
+                "SELECT * FROM assets WHERE state IN ('pending','failed') ORDER BY createdAt DESC LIMIT ?;",
+                [.int(Int64(limit))], Self.mapRow)) ?? []
+        }
+    }
+
+    /// Every uploaded record, for building the restore manifest.
+    func allUploaded() -> [AssetRecord] {
+        queue.sync {
+            (try? db.query("SELECT * FROM assets WHERE state='uploaded' ORDER BY uploadedAt;", [], Self.mapRow)) ?? []
+        }
+    }
+
+    func recentUploads(limit: Int) -> [AssetRecord] {
+        queue.sync {
+            (try? db.query(
+                "SELECT * FROM assets WHERE state='uploaded' ORDER BY uploadedAt DESC LIMIT ?;",
+                [.int(Int64(limit))], Self.mapRow)) ?? []
+        }
+    }
+
+    /// Every indexed local identifier, loaded in one query. The scan holds this
+    /// in memory so it can skip already-known assets without a per-asset DB hit.
+    func allIdentifiers() -> Set<String> {
+        queue.sync {
+            let rows = (try? db.query("SELECT localIdentifier FROM assets;", []) { $0.text(0) }) ?? []
+            return Set(rows)
+        }
+    }
+
+    /// (id, remoteKey) for every uploaded object — used to reconcile against the
+    /// live library when propagating deletes.
+    func uploadedKeyPairs() -> [(id: String, remoteKey: String)] {
+        queue.sync {
+            (try? db.query("SELECT localIdentifier, remoteKey FROM assets WHERE state='uploaded';", []) {
+                (id: $0.text(0), remoteKey: $0.text(1))
+            }) ?? []
+        }
+    }
+
+    /// Logically delete: keep the row as a tombstone (state='deleted') so the
+    /// manifest can record it. The object may still physically exist in the
+    /// bucket under Object Lock until the lifecycle rule expires it.
+    func markDeleted(_ localIdentifier: String) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='deleted' WHERE localIdentifier=?;", [.text(localIdentifier)])
+        }
+    }
+
+    /// Object keys of everything logically deleted — the manifest's tombstone list.
+    func deletedKeys() -> [String] {
+        queue.sync {
+            (try? db.query("SELECT remoteKey FROM assets WHERE state='deleted';", []) { $0.text(0) }) ?? []
+        }
+    }
+
+    func reset() {
+        queue.sync {
+            db.exec("DELETE FROM assets;")
+            bloom = BloomFilter(expectedItems: 50_000)
+            try? FileManager.default.removeItem(at: bloomURL)
+        }
+    }
+
+    /// Persist the Bloom filter to disk (call periodically / on background).
+    func persistBloom() {
+        queue.sync {
+            if let data = try? JSONEncoder().encode(bloom) {
+                try? data.write(to: bloomURL, options: .atomic)
+            }
+        }
+    }
+
+    // MARK: Row mapping
+
+    private static func mapRow(_ r: SQLiteDatabase.Row) -> AssetRecord {
+        AssetRecord(
+            localIdentifier: r.text(0),
+            remoteKey: r.text(1),
+            state: AssetState(rawValue: r.text(2)) ?? .pending,
+            mediaType: AssetRecord.MediaType(rawValue: r.text(3)) ?? .other,
+            filename: r.text(4),
+            byteSize: r.int64(5),
+            createdAt: r.dateOrNil(6),
+            uploadedAt: r.dateOrNil(7),
+            lastError: r.textOrNil(8))
+    }
+}

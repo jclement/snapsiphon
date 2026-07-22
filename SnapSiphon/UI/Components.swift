@@ -1,0 +1,294 @@
+import SwiftUI
+
+/// A compact stat tile: big number, small label, optional icon + accent.
+struct StatTile: View {
+    let value: String
+    let label: String
+    var systemImage: String? = nil
+    var accent: Color = Theme.teal
+
+    var body: some View {
+        Card(padding: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                if let systemImage {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(accent)
+                }
+                Text(value)
+                    .font(Theme.rounded(24, weight: .bold))
+                    .foregroundStyle(Theme.textPrimary)
+                    .minimumScaleFactor(0.6)
+                    .lineLimit(1)
+                Text(label.uppercased())
+                    .font(Theme.mono(10, weight: .medium))
+                    .tracking(1)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+        }
+    }
+}
+
+/// A compact gauge: icon + big value + small caption, in a pill. Used in rows
+/// on the dashboard to nerd out on live metrics.
+struct GaugePill: View {
+    let systemImage: String
+    let value: String
+    let caption: String
+    var accent: Color = Theme.teal
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(accent)
+            Text(value)
+                .font(Theme.mono(15, weight: .bold))
+                .foregroundStyle(Theme.textPrimary)
+                .minimumScaleFactor(0.5).lineLimit(1)
+            Text(caption.uppercased())
+                .font(Theme.mono(8, weight: .medium)).tracking(0.8)
+                .foregroundStyle(Theme.textSecondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 11)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Theme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.hairline, lineWidth: 1))
+    }
+}
+
+/// The dashboard hero. Two concentric layers:
+/// - **Outer ring:** overall file-count progress (uploaded / total files).
+/// - **Inner donut:** how the stored bytes split between photos and videos.
+/// Centre shows the overall backed-up percentage.
+struct MediaBackupRing: View {
+    let fileProgress: Double     // 0…1, outer ring
+    let photoBytes: Int64        // inner donut segment
+    let videoBytes: Int64
+    let centerTitle: String
+
+    var outerWidth: CGFloat = 12
+    var innerWidth: CGFloat = 20
+
+    var body: some View {
+        GeometryReader { geo in
+            let side = min(geo.size.width, geo.size.height)
+            let rOuter = (side - outerWidth) / 2
+            let rInner = rOuter - outerWidth / 2 - 11 - innerWidth / 2
+            let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
+            ZStack {
+                Canvas { ctx, _ in
+                    drawInner(ctx, center: center, radius: rInner)
+                    drawOuter(ctx, center: center, radius: rOuter)
+                }
+                VStack(spacing: 1) {
+                    Text(centerTitle)
+                        .font(Theme.rounded(42, weight: .bold))
+                        .foregroundStyle(Theme.textPrimary)
+                        .contentTransition(.numericText())
+                    Text("BACKED UP")
+                        .font(Theme.mono(10, weight: .medium)).tracking(1.5)
+                        .foregroundStyle(Theme.textSecondary)
+                }
+            }
+        }
+    }
+
+    private let top = -Double.pi / 2
+
+    /// Inner donut: solid segments sized by stored bytes per type.
+    private func drawInner(_ ctx: GraphicsContext, center: CGPoint, radius: CGFloat) {
+        let total = photoBytes + videoBytes
+        guard total > 0 else {
+            arc(ctx, center, radius, from: top, to: top + 2 * .pi, .color(Theme.surfaceHi), innerWidth)
+            return
+        }
+        let both = photoBytes > 0 && videoBytes > 0
+        let gap = both ? 0.09 : 0.0
+        let available = 2 * .pi - (both ? 2 * gap : 0)
+        let photoSweep = available * Double(photoBytes) / Double(total)
+        if photoBytes > 0 {
+            arc(ctx, center, radius, from: top, to: top + photoSweep, .color(Theme.teal), innerWidth)
+        }
+        if videoBytes > 0 {
+            let b0 = top + (photoBytes > 0 ? photoSweep + gap : 0)
+            arc(ctx, center, radius, from: b0, to: b0 + (available - photoSweep), .color(Theme.violet), innerWidth)
+        }
+    }
+
+    /// Outer ring: file-count progress over a faint track.
+    private func drawOuter(_ ctx: GraphicsContext, center: CGPoint, radius: CGFloat) {
+        arc(ctx, center, radius, from: top, to: top + 2 * .pi, .color(Theme.surfaceHi), outerWidth)
+        let p = max(0, min(fileProgress, 1))
+        guard p > 0 else { return }
+        let shading = GraphicsContext.Shading.linearGradient(
+            Gradient(colors: [Theme.teal, Theme.violet]),
+            startPoint: CGPoint(x: center.x - radius, y: center.y - radius),
+            endPoint: CGPoint(x: center.x + radius, y: center.y + radius))
+        arc(ctx, center, radius, from: top, to: top + 2 * .pi * p, shading, outerWidth)
+    }
+
+    private func arc(_ ctx: GraphicsContext, _ center: CGPoint, _ radius: CGFloat,
+                     from: Double, to: Double, _ shading: GraphicsContext.Shading, _ width: CGFloat) {
+        var path = Path()
+        path.addArc(center: center, radius: radius,
+                    startAngle: .radians(from), endAngle: .radians(to), clockwise: false)
+        ctx.stroke(path, with: shading, style: StrokeStyle(lineWidth: width, lineCap: .round))
+    }
+}
+
+/// A dense one-line upload row: media icon, filename (left), size (right), with
+/// the row background itself filling left-to-right as the upload progresses.
+struct UploadRow: View {
+    let filename: String
+    let byteSize: Int64
+    let progress: Double
+    let isVideo: Bool
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            GeometryReader { geo in
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(isVideo ? Theme.violet.opacity(0.28) : Theme.teal.opacity(0.28))
+                    .frame(width: max(6, geo.size.width * max(0, min(progress, 1))))
+                    .animation(.linear(duration: 0.25), value: progress)
+            }
+            HStack(spacing: 8) {
+                Image(systemName: isVideo ? "video.fill" : "photo.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(isVideo ? Theme.violet : Theme.teal)
+                Text(filename)
+                    .font(Theme.mono(12)).foregroundStyle(Theme.textPrimary)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 6)
+                Text(byteSize > 0 ? Format.bytes(byteSize) : "—")
+                    .font(Theme.mono(11)).foregroundStyle(Theme.textSecondary)
+            }
+            .padding(.horizontal, 11)
+        }
+        .frame(height: 32)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Theme.surfaceHi))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Theme.hairline, lineWidth: 1))
+    }
+}
+
+/// A circular progress ring with a centred label — the dashboard hero.
+struct ProgressRing: View {
+    let progress: Double        // 0…1
+    let centerTitle: String
+    let centerSubtitle: String
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Theme.surfaceHi, lineWidth: 16)
+            Circle()
+                .trim(from: 0, to: max(0.001, min(progress, 1)))
+                .stroke(Theme.brandGradient,
+                        style: StrokeStyle(lineWidth: 16, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: 0.5), value: progress)
+            VStack(spacing: 2) {
+                Text(centerTitle)
+                    .font(Theme.rounded(40, weight: .bold))
+                    .foregroundStyle(Theme.textPrimary)
+                    .contentTransition(.numericText())
+                Text(centerSubtitle.uppercased())
+                    .font(Theme.mono(11, weight: .medium))
+                    .tracking(1.5)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+        }
+    }
+}
+
+/// A labelled slider row used across settings.
+struct SliderRow: View {
+    let title: String
+    let subtitle: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var step: Double = 1
+    let valueLabel: (Double) -> String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(Theme.rounded(16, weight: .medium)).foregroundStyle(Theme.textPrimary)
+                    Text(subtitle).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                }
+                Spacer()
+                Text(valueLabel(value))
+                    .font(Theme.mono(14, weight: .semibold))
+                    .foregroundStyle(Theme.teal)
+            }
+            Slider(value: $value, in: range, step: step)
+                .tint(Theme.teal)
+        }
+    }
+}
+
+/// A toggle row with title + explanation.
+struct ToggleRow: View {
+    let title: String
+    let subtitle: String
+    @Binding var isOn: Bool
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(Theme.rounded(16, weight: .medium)).foregroundStyle(Theme.textPrimary)
+                Text(subtitle).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+            }
+        }
+        .tint(Theme.teal)
+    }
+}
+
+/// A pill badge (status chips).
+struct Pill: View {
+    let text: String
+    var color: Color = Theme.teal
+    var filled: Bool = false
+    var body: some View {
+        Text(text)
+            .font(Theme.mono(11, weight: .semibold))
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .foregroundStyle(filled ? .black : color)
+            .background(
+                Capsule().fill(filled ? AnyShapeStyle(color) : AnyShapeStyle(color.opacity(0.15))))
+    }
+}
+
+/// A labelled text field styled for the app.
+struct FieldRow: View {
+    let label: String
+    var placeholder: String = ""
+    @Binding var text: String
+    var mono: Bool = false
+    var secure: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label.uppercased())
+                .font(Theme.mono(10, weight: .medium)).tracking(1)
+                .foregroundStyle(Theme.textSecondary)
+            Group {
+                if secure {
+                    SecureField(placeholder, text: $text)
+                } else {
+                    TextField(placeholder, text: $text)
+                }
+            }
+            .font(mono ? Theme.mono(14) : .system(size: 15))
+            .foregroundStyle(Theme.textPrimary)
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Theme.surfaceHi))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.hairline, lineWidth: 1))
+        }
+    }
+}
