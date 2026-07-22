@@ -99,6 +99,27 @@ final class AgeKeyManager: ObservableObject {
         try? write(identity.recipient.bech32, account: identityMarkerAccount)
     }
 
+    /// Adopt an existing identity: the pasted secret becomes THIS PHONE's key
+    /// and its public half joins the recipient list. Used to carry one key
+    /// across installs/devices instead of minting a new one. Any previous
+    /// phone secret is overwritten — callers confirm first; the old key's
+    /// recipient row survives as public-only so files encrypted to it stay
+    /// tracked. Legacy (pre-checksum-fix) secrets are accepted and re-encoded
+    /// canonically on the way in.
+    @discardableResult
+    func importIdentity(_ secretString: String) throws -> String {
+        let identity = try Age.Identity(bech32: secretString)
+        let recipient = identity.recipient.bech32
+        try write(identity.bech32, account: identityAccount)    // canonical form
+        try write(recipient, account: identityMarkerAccount)
+        if !recipients.contains(recipient) {
+            recipients.append(recipient)
+            try writeRecipients()
+        }
+        hasIdentity = true
+        return recipient
+    }
+
     /// Nuclear option: discard the existing on-device identity (removing its
     /// recipient row) and mint a fresh pair. Backups encrypted only to the old
     /// key become unrecoverable — the UI confirms hard before calling this.

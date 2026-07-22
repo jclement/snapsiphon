@@ -14,6 +14,7 @@ struct KeysView: View {
     @State private var errorText: String?
     @State private var pendingRemoval: String?
     @State private var confirmReplaceIdentity = false
+    @State private var pendingIdentityImport: String?
 
     var body: some View {
         ScrollView {
@@ -51,6 +52,18 @@ struct KeysView: View {
         .alert("Key error", isPresented: Binding(get: { errorText != nil }, set: { if !$0 { errorText = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(errorText ?? "") }
+        .confirmationDialog("Replace this phone's secret key?",
+                            isPresented: Binding(get: { pendingIdentityImport != nil },
+                                                 set: { if !$0 { pendingIdentityImport = nil } }),
+                            titleVisibility: .visible) {
+            Button("Import & replace", role: .destructive) {
+                if let secret = pendingIdentityImport { performIdentityImport(secret) }
+                pendingIdentityImport = nil
+            }
+            Button("Cancel", role: .cancel) { pendingIdentityImport = nil }
+        } message: {
+            Text("⚠️ This phone already holds a secret key, and importing overwrites it — reveal & save the current secret first if you haven't. The old key stays listed (public-only), so files encrypted to it remain tracked, but this phone can no longer decrypt them.")
+        }
         .confirmationDialog("Discard this phone's key?", isPresented: $confirmReplaceIdentity,
                             titleVisibility: .visible) {
             Button("Discard & generate new", role: .destructive) {
@@ -202,23 +215,61 @@ struct KeysView: View {
         }
     }
 
+    private var pastedIsSecret: Bool {
+        pastedRecipient.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased().hasPrefix("age-secret-key-1")
+    }
+
     private var importCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Add a public key").font(Theme.rounded(16, weight: .semibold))
+                Text("Add a key").font(Theme.rounded(16, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
-                FieldRow(label: "age recipient", placeholder: "age1… / age1se1… / age1yubikey1…",
+                Text("Paste a public key (age1… / age1se1… / age1yubikey1…) to encrypt to it — or a secret key (AGE-SECRET-KEY-…) to make it THIS PHONE's identity, e.g. when migrating an install.")
+                    .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                FieldRow(label: pastedIsSecret ? "age identity (secret)" : "age recipient",
+                         placeholder: "age1… / AGE-SECRET-KEY-…",
                          text: $pastedRecipient, mono: true)
-                PrimaryButton(title: "Add key", systemImage: "plus",
+                PrimaryButton(title: pastedIsSecret ? "Import as this phone's key" : "Add key",
+                              systemImage: pastedIsSecret ? "key.horizontal.fill" : "plus",
                               enabled: !pastedRecipient.isEmpty) {
-                    do {
-                        try manager.addRecipient(pastedRecipient)
-                        pastedRecipient = ""
-                    } catch {
-                        errorText = error.localizedDescription
+                    if pastedIsSecret {
+                        requestIdentityImport()
+                    } else {
+                        do {
+                            try manager.addRecipient(pastedRecipient)
+                            pastedRecipient = ""
+                        } catch {
+                            errorText = error.localizedDescription
+                        }
                     }
                 }
             }
+        }
+    }
+
+    // MARK: Identity import
+
+    private func requestIdentityImport() {
+        let trimmed = pastedRecipient.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let identity = try? Age.Identity(bech32: trimmed) else {
+            errorText = "That doesn't parse as an age secret key."
+            return
+        }
+        // Replacing a DIFFERENT existing phone secret is destructive — confirm.
+        if manager.hasIdentity, manager.identityRecipient != identity.recipient.bech32 {
+            pendingIdentityImport = trimmed
+        } else {
+            performIdentityImport(trimmed)
+        }
+    }
+
+    private func performIdentityImport(_ secret: String) {
+        do {
+            try manager.importIdentity(secret)
+            pastedRecipient = ""
+        } catch {
+            errorText = error.localizedDescription
         }
     }
 
