@@ -7,12 +7,8 @@ struct StorageSetupView: View {
     @State private var secretKey = ""
     @State private var testing = false
     @State private var testResult: TestResult?
-    @State private var applyingLifecycle = false
-    @State private var lifecycleMessage: String?
 
     enum TestResult { case ok, fail(String) }
-
-    private let retentionOptions: [Int] = [0, 30, 90, 180, 365, 730]
 
     var body: some View {
         ScrollView {
@@ -42,8 +38,6 @@ struct StorageSetupView: View {
                         FieldRow(label: "Secret access key", text: $secretKey, mono: true, secure: true)
                     }
                 }
-
-                retentionCard
 
                 if let result = testResult {
                     testBanner(result)
@@ -93,59 +87,6 @@ struct StorageSetupView: View {
         case .backblazeB2: return "s3.us-west-004.backblazeb2.com"
         case .cloudflareR2: return "<account>.r2.cloudflarestorage.com"
         case .custom: return "s3.example.com"
-        }
-    }
-
-    private var retentionCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(Theme.violet)
-                    Text("Server-side retention").font(Theme.rounded(16, weight: .semibold))
-                        .foregroundStyle(Theme.textPrimary)
-                }
-                Text("Push a bucket lifecycle rule so the provider auto-deletes old objects — enforced even if this app is gone. Best-effort: honoured by R2 and AWS; partial on B2.")
-                    .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(retentionOptions, id: \.self) { days in
-                            let selected = engine.settings.lifecycleExpirationDays == days
-                            Button {
-                                engine.settings.lifecycleExpirationDays = days
-                            } label: {
-                                Text(days == 0 ? "Keep forever" : "\(days) days")
-                                    .font(Theme.rounded(14, weight: .semibold))
-                                    .fixedSize()
-                                    .padding(.horizontal, 14).padding(.vertical, 9)
-                                    .foregroundStyle(selected ? .black : Theme.textSecondary)
-                                    .background(
-                                        Capsule().fill(selected
-                                                       ? AnyShapeStyle(Theme.brandGradient)
-                                                       : AnyShapeStyle(Theme.surfaceHi)))
-                            }
-                        }
-                    }
-                    .padding(.vertical, 2)
-                }
-
-                GhostButton(title: applyingLifecycle ? "Applying…" : "Apply to bucket",
-                            systemImage: "arrow.up.doc", tint: Theme.violet) {
-                    Task {
-                        applyingLifecycle = true
-                        lifecycleMessage = nil
-                        let result = await engine.applyLifecyclePolicy()
-                        applyingLifecycle = false
-                        switch result {
-                        case .success: lifecycleMessage = "Applied."
-                        case .failure(let e): lifecycleMessage = e.localizedDescription
-                        }
-                    }
-                }
-                if let msg = lifecycleMessage {
-                    Text(msg).font(Theme.mono(11)).foregroundStyle(Theme.textSecondary)
-                }
-            }
         }
     }
 

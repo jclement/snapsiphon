@@ -88,6 +88,15 @@ enum Bech32 {
     }
 
     static func decode(_ string: String, expectedHRP: String) throws -> [UInt8] {
+        let (hrp, bytes) = try decode(string)
+        guard hrp == expectedHRP.lowercased() else { throw Error.invalidHRP }
+        return bytes
+    }
+
+    /// Decode returning the human-readable prefix too, so callers can dispatch on
+    /// it (e.g. `age` vs `age1se` vs `age1yubikey`). The separator is the *last*
+    /// "1", so multi-token HRPs like `age1se` decode correctly.
+    static func decode(_ string: String) throws -> (hrp: String, data: [UInt8]) {
         let lower = string.lowercased()
         let upper = string.uppercased()
         guard string == lower || string == upper else { throw Error.mixedCase }
@@ -95,7 +104,6 @@ enum Bech32 {
         guard let sep = normalized.lastIndex(of: "1") else { throw Error.invalidHRP }
         let hrp = String(normalized[normalized.startIndex..<sep])
         let dataPart = normalized[normalized.index(after: sep)...]
-        guard hrp == expectedHRP.lowercased() else { throw Error.invalidHRP }
         guard dataPart.count >= 6 else { throw Error.tooShort }
 
         var values: [UInt8] = []
@@ -108,6 +116,6 @@ enum Bech32 {
         guard let bytes = convertBits(payload, from: 5, to: 8, pad: false) else {
             throw Error.invalidChecksum
         }
-        return bytes
+        return (hrp, bytes)
     }
 }

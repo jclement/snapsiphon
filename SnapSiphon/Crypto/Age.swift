@@ -32,23 +32,51 @@ enum Age {
 
     // MARK: Recipient / Identity
 
-    /// An age recipient (public key). Encode is `age1…`.
+    /// An age recipient (public key). Native X25519 (`age1…`) plus the P-256
+    /// plugin recipients we can encrypt to without any plugin binary or hardware:
+    /// `age1se1…` (Apple Secure Enclave) and `age1yubikey1…` (YubiKey PIV). Both
+    /// use the `piv-p256` stanza; only *decryption* needs the hardware.
     struct Recipient {
-        let publicKey: Curve25519.KeyAgreement.PublicKey
+        enum Material {
+            case x25519(Curve25519.KeyAgreement.PublicKey)
+            case p256(compressed: Data)   // 33-byte compressed P-256 point
+        }
+        let material: Material
+        /// Canonical Bech32 encoding (round-trips the original HRP).
+        let bech32: String
 
         init(publicKey: Curve25519.KeyAgreement.PublicKey) {
-            self.publicKey = publicKey
+            self.material = .x25519(publicKey)
+            self.bech32 = Bech32.encode(hrp: "age", data: Array(publicKey.rawRepresentation))
         }
 
         init(bech32 string: String) throws {
-            let raw = try Bech32.decode(string.trimmingCharacters(in: .whitespacesAndNewlines),
-                                        expectedHRP: "age")
-            guard raw.count == 32 else { throw Error.badRecipient }
-            self.publicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(raw))
+            let (hrp, data) = try Bech32.decode(string.trimmingCharacters(in: .whitespacesAndNewlines))
+            switch hrp {
+            case "age":
+                guard data.count == 32 else { throw Error.badRecipient }
+                let pk = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(data))
+                self.material = .x25519(pk)
+                self.bech32 = Bech32.encode(hrp: "age", data: Array(pk.rawRepresentation))
+            case "age1se", "age1yubikey":
+                guard data.count == 33 else { throw Error.badRecipient }
+                _ = try P256.KeyAgreement.PublicKey(compressedRepresentation: Data(data)) // validate point
+                self.material = .p256(compressed: Data(data))
+                self.bech32 = Bech32.encode(hrp: hrp, data: data)
+            default:
+                throw Error.badRecipient
+            }
         }
 
-        var bech32: String {
-            Bech32.encode(hrp: "age", data: Array(publicKey.rawRepresentation))
+        /// Short human label for the kind of key (for the UI).
+        var kindLabel: String {
+            switch material {
+            case .x25519: return "age"
+            case .p256:
+                if bech32.hasPrefix("age1se1") { return "Secure Enclave" }
+                if bech32.hasPrefix("age1yubikey1") { return "YubiKey" }
+                return "P-256"
+            }
         }
     }
 
@@ -81,27 +109,12 @@ enum Age {
     private static func makeHeader(fileKey: SymmetricKey, recipients: [Recipient]) throws -> Data {
         var stanzas = ""
         for recipient in recipients {
-            let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-            let ephemeralShare = ephemeral.publicKey.rawRepresentation
-            let shared = try ephemeral.sharedSecretFromKeyAgreement(with: recipient.publicKey)
-
-            var salt = Data()
-            salt.append(ephemeralShare)
-            salt.append(recipient.publicKey.rawRepresentation)
-
-            let wrapKey = shared.hkdfDerivedSymmetricKey(
-                using: SHA256.self,
-                salt: salt,
-                sharedInfo: Data(x25519Info.utf8),
-                outputByteCount: 32)
-
-            // Wrap the file key: ChaCha20-Poly1305 with a 12-byte zero nonce.
-            let nonce = try ChaChaPoly.Nonce(data: Data(repeating: 0, count: 12))
-            let sealed = try ChaChaPoly.seal(fileKey.rawData, using: wrapKey, nonce: nonce)
-            let body = sealed.ciphertext + sealed.tag  // 16 + 16 = 32 bytes
-
-            stanzas += "-> \(x25519Label) \(b64(ephemeralShare))\n"
-            stanzas += wrapBase64(body) + "\n"
+            switch recipient.material {
+            case .x25519(let publicKey):
+                stanzas += try x25519Stanza(fileKey: fileKey, publicKey: publicKey)
+            case .p256(let compressed):
+                stanzas += try pivP256Stanza(fileKey: fileKey, recipientCompressed: compressed)
+            }
         }
 
         let headerNoMac = "\(version)\n\(stanzas)---"
@@ -114,6 +127,55 @@ enum Age {
         let mac = HMAC<SHA256>.authenticationCode(for: Data(headerNoMac.utf8), using: macKey)
         let header = "\(headerNoMac) \(b64(Data(mac)))\n"
         return Data(header.utf8)
+    }
+
+    /// `-> X25519 <ephemeral>` stanza.
+    private static func x25519Stanza(fileKey: SymmetricKey,
+                                     publicKey: Curve25519.KeyAgreement.PublicKey) throws -> String {
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let ephemeralShare = ephemeral.publicKey.rawRepresentation
+        let shared = try ephemeral.sharedSecretFromKeyAgreement(with: publicKey)
+
+        var salt = Data()
+        salt.append(ephemeralShare)
+        salt.append(publicKey.rawRepresentation)
+
+        let wrapKey = shared.hkdfDerivedSymmetricKey(
+            using: SHA256.self, salt: salt,
+            sharedInfo: Data(x25519Info.utf8), outputByteCount: 32)
+
+        let nonce = try ChaChaPoly.Nonce(data: Data(repeating: 0, count: 12))
+        let sealed = try ChaChaPoly.seal(fileKey.rawData, using: wrapKey, nonce: nonce)
+        let body = sealed.ciphertext + sealed.tag
+        return "-> \(x25519Label) \(b64(ephemeralShare))\n" + wrapBase64(body) + "\n"
+    }
+
+    /// `-> piv-p256 <tag> <ephemeral>` stanza, used by both age-plugin-se and
+    /// age-plugin-yubikey. Encryption is plain P-256 ECDH — no hardware needed.
+    /// Derivation matches the plugins: HKDF-SHA256(ikm = ECDH X-coord,
+    /// salt = ephemeralShare‖recipient, info = "piv-p256"); the recipient tag is
+    /// SHA-256(recipient)[0..4] so the plugin can pick the right hardware slot.
+    private static func pivP256Stanza(fileKey: SymmetricKey,
+                                      recipientCompressed: Data) throws -> String {
+        let recipientPK = try P256.KeyAgreement.PublicKey(compressedRepresentation: recipientCompressed)
+        let ephemeral = P256.KeyAgreement.PrivateKey()
+        let ephemeralShare = ephemeral.publicKey.compressedRepresentation   // 33 bytes
+        let shared = try ephemeral.sharedSecretFromKeyAgreement(with: recipientPK)
+
+        var salt = Data()
+        salt.append(ephemeralShare)
+        salt.append(recipientCompressed)
+
+        let wrapKey = shared.hkdfDerivedSymmetricKey(
+            using: SHA256.self, salt: salt,
+            sharedInfo: Data("piv-p256".utf8), outputByteCount: 32)
+
+        let nonce = try ChaChaPoly.Nonce(data: Data(repeating: 0, count: 12))
+        let sealed = try ChaChaPoly.seal(fileKey.rawData, using: wrapKey, nonce: nonce)
+        let body = sealed.ciphertext + sealed.tag
+
+        let tag = Data(SHA256.hash(data: recipientCompressed).prefix(4))
+        return "-> piv-p256 \(b64(tag)) \(b64(ephemeralShare))\n" + wrapBase64(body) + "\n"
     }
 
     // MARK: Streaming encryptor

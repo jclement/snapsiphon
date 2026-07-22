@@ -136,11 +136,40 @@ final class S3Client {
         }
     }
 
-    // MARK: DELETE
+    // MARK: DELETE (version-aware, for freeing bytes on versioned/locked buckets)
 
-    /// Delete an object. A 404 is treated as success (already gone).
-    func deleteObject(key: String, now: Date = Date()) async throws {
-        let url = try objectURL(key: key)
+    struct ObjectVersion { let versionId: String; let isDeleteMarker: Bool }
+
+    /// List all versions and delete-markers for a specific object key. On a
+    /// versioned bucket (which Object Lock requires) freeing bytes means deleting
+    /// each version, not just adding a hide-marker.
+    func listVersions(forKey key: String, now: Date = Date()) async throws -> [ObjectVersion] {
+        var components: URLComponents
+        if config.provider.usesPathStyle {
+            components = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
+        } else {
+            components = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!
+        }
+        components.queryItems = [URLQueryItem(name: "versions", value: ""),
+                                 URLQueryItem(name: "prefix", value: key)]
+        guard let url = components.url else { throw S3Error.badConfig }
+        let signed = signer.sign(method: "GET", url: url, now: now)
+        var request = URLRequest(url: url)
+        for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
+        let (data, response) = try await session.data(for: request)
+        try Self.validate(response: response, data: data)
+        return ListVersionsParser(matchKey: key).parse(data)
+    }
+
+    /// Delete one specific version. On an Object-Lock bucket this **fails** until
+    /// the version's retention expires — that's the safety window; callers keep
+    /// the tombstone and retry later. A 404 counts as already gone.
+    func deleteObjectVersion(key: String, versionId: String, now: Date = Date()) async throws {
+        guard var comps = URLComponents(url: try objectURL(key: key), resolvingAgainstBaseURL: false) else {
+            throw S3Error.badConfig
+        }
+        comps.queryItems = [URLQueryItem(name: "versionId", value: versionId)]
+        guard let url = comps.url else { throw S3Error.badConfig }
         let signed = signer.sign(method: "DELETE", url: url, now: now)
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
@@ -151,65 +180,6 @@ final class S3Client {
         guard (200..<300).contains(http.statusCode) else {
             throw S3Error.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
-    }
-
-    // MARK: Bucket lifecycle (server-side retention)
-
-    /// Push a lifecycle rule so the bucket expires SnapSiphon objects after
-    /// `expirationDays` (0 removes the rule). Enforced by the provider, so it
-    /// keeps working even if the app is deleted. Best-effort: S3 lifecycle
-    /// support varies by provider (R2/AWS honour it; B2 support is partial).
-    func putBucketLifecycle(expirationDays: Int, now: Date = Date()) async throws {
-        let bodyData = Data(Self.lifecycleXML(prefix: config.prefix,
-                                              expirationDays: expirationDays,
-                                              provider: config.provider).utf8)
-
-        var base: URLComponents
-        if config.provider.usesPathStyle {
-            base = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
-        } else {
-            base = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!
-        }
-        base.queryItems = [URLQueryItem(name: "lifecycle", value: "")]
-        guard let url = base.url else { throw S3Error.badConfig }
-
-        // This API is signed with a real payload hash + Content-MD5.
-        let contentSHA = SigV4.hexSHA256(bodyData)
-        let md5 = Data(Insecure.MD5.hash(data: bodyData)).base64EncodedString()
-        let headers = ["content-md5": md5, "content-type": "application/xml"]
-        let signed = signer.sign(method: "PUT", url: url, headers: headers, contentSHA256: contentSHA, now: now)
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "PUT"
-        request.httpBody = bodyData
-        for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
-        let (data, response) = try await session.data(for: request)
-        try Self.validate(response: response, data: data)
-    }
-
-    /// Build the lifecycle XML. On versioned providers (Backblaze B2) an
-    /// `Expiration/Days` rule is rejected unless it's paired with an
-    /// `ExpiredObjectDeleteMarker` rule sharing the exact same prefix — B2's
-    /// error: "has an Expiration rule but there is no ExpiredObjectDeleteMarker
-    /// rule with the exact same prefix." So for B2 we emit two rules; other
-    /// providers take the single-rule form.
-    static func lifecycleXML(prefix: String, expirationDays: Int, provider: S3Config.Provider) -> String {
-        let ns = "http://s3.amazonaws.com/doc/2006-03-01/"
-        guard expirationDays > 0 else {
-            return "<LifecycleConfiguration xmlns=\"\(ns)\"></LifecycleConfiguration>"
-        }
-        let filter = "<Filter><Prefix>\(prefix)</Prefix></Filter>"
-        var rules = """
-        <Rule><ID>snapsiphon-retention</ID>\(filter)<Status>Enabled</Status>\
-        <Expiration><Days>\(expirationDays)</Days></Expiration></Rule>
-        """
-        if provider == .backblazeB2 {
-            rules += """
-            <Rule><ID>snapsiphon-cleanup-markers</ID>\(filter)<Status>Enabled</Status>\
-            <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>
-            """
-        }
-        return "<LifecycleConfiguration xmlns=\"\(ns)\">\(rules)</LifecycleConfiguration>"
     }
 
     // MARK: HEAD (existence check)
@@ -321,6 +291,51 @@ private final class ListBucketParser: NSObject, XMLParserDelegate {
             next = current.trimmingCharacters(in: .whitespacesAndNewlines)
         default:
             break
+        }
+    }
+}
+
+/// Parses ListVersionsResult for the versions + delete-markers of one exact key.
+private final class ListVersionsParser: NSObject, XMLParserDelegate {
+    private let matchKey: String
+    private var results: [S3Client.ObjectVersion] = []
+    private var current = ""
+    private var key = ""
+    private var versionId = ""
+    private var isMarker = false
+    private var inEntry = false
+
+    init(matchKey: String) { self.matchKey = matchKey }
+
+    func parse(_ data: Data) -> [S3Client.ObjectVersion] {
+        let parser = XMLParser(data: data)
+        parser.delegate = self
+        parser.parse()
+        return results
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String] = [:]) {
+        current = ""
+        if elementName == "Version" || elementName == "DeleteMarker" {
+            inEntry = true; key = ""; versionId = ""
+            isMarker = elementName == "DeleteMarker"
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) { current += string }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?) {
+        switch elementName {
+        case "Key" where inEntry: key = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        case "VersionId" where inEntry: versionId = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        case "Version", "DeleteMarker":
+            if key == matchKey && !versionId.isEmpty {
+                results.append(.init(versionId: versionId, isDeleteMarker: isMarker))
+            }
+            inEntry = false
+        default: break
         }
     }
 }

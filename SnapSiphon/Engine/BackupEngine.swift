@@ -335,38 +335,78 @@ final class BackupEngine: ObservableObject {
         }
     }
 
-    /// Reconcile on-device deletions. Any object we uploaded whose asset is no
-    /// longer anywhere in the library becomes a **logical tombstone** — recorded
-    /// in the index and the next manifest, so a restore knows it's gone. We also
-    /// attempt a real `DeleteObject` to reclaim space, but that's best-effort:
-    /// Object-Lock buckets reject it, and that's fine — the lifecycle rule expires
-    /// the bytes later while the manifest tombstone marks it deleted immediately.
+    /// Reconcile on-device deletions (only when "Mirror deletions" is on).
+    ///
+    /// - Photos removed on-device become **tombstones**, stamped with the time so
+    ///   the grace period can run. They're immediately recorded in the manifest.
+    /// - Tombstoned photos that have **reappeared** in the library are resurrected
+    ///   — this is the accidental-erase recovery: restore iCloud within the grace
+    ///   window and nothing is lost.
+    /// - Then `purgeTombstones` physically frees any that are past the grace
+    ///   period (Object Lock permitting).
     private func reconcileDeletes() async {
-        guard let index, let client = makeClient() else { return }
+        guard let index else { return }
         let photos = self.photos
         let liveIDs = await Task.detached(priority: .utility) { photos.allLocalIdentifiers() }.value
-        let uploaded = index.uploadedKeyPairs()
-        let orphans = uploaded.filter { !liveIDs.contains($0.id) }
-        guard !orphans.isEmpty else { return }
 
-        appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device — recording tombstone\(orphans.count == 1 ? "" : "s")…", .warning)
-        var purged = 0
-        for orphan in orphans {
+        // Resurrect tombstones whose asset is back in the library.
+        var resurrected = 0
+        for id in index.tombstonedIdentifiers() where liveIDs.contains(id) {
+            index.resurrect(id); resurrected += 1
+        }
+        if resurrected > 0 {
+            appendLog("\(resurrected) previously-deleted photo\(resurrected == 1 ? "" : "s") reappeared — kept.", .success)
+        }
+
+        // Tombstone assets we uploaded that are no longer anywhere in the library.
+        let orphans = index.uploadedKeyPairs().filter { !liveIDs.contains($0.id) }
+        let now = Date()
+        for orphan in orphans { index.markDeleted(orphan.id, at: now) }
+        if !orphans.isEmpty {
+            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device — tombstoned (grace \(settings.deleteGraceDays)d).", .warning)
+        }
+
+        if resurrected > 0 || !orphans.isEmpty {
+            refreshCounts()
+            if settings.keepBucketManifest { await writeManifest() }
+        }
+
+        await purgeTombstones()
+    }
+
+    /// Physically remove tombstones past the grace period, freeing bucket bytes.
+    /// Each is version-deleted; Object Lock rejects any still under retention, so
+    /// those stay tombstoned and are retried on a later scan — nothing recent can
+    /// be wiped by a bulk mistake.
+    private func purgeTombstones() async {
+        guard let index, let client = makeClient() else { return }
+        let cutoff = Calendar.current.date(byAdding: .day, value: -settings.deleteGraceDays, to: Date()) ?? Date()
+        let keys = index.purgeableKeys(before: cutoff)
+        guard !keys.isEmpty else { return }
+
+        var freed = 0, blocked = 0
+        for key in keys {
             if Task.isCancelled { break }
-            index.markDeleted(orphan.id)                    // logical delete — always
-            do {                                            // best-effort physical delete
-                try await client.deleteObject(key: orphan.remoteKey)
-                purged += 1
+            do {
+                let versions = try await client.listVersions(forKey: key)
+                var allGone = true
+                for v in versions {
+                    do { try await client.deleteObjectVersion(key: key, versionId: v.versionId) }
+                    catch { allGone = false }          // locked / retention — retry later
+                }
+                if allGone { index.hardDelete(remoteKey: key); freed += 1 } else { blocked += 1 }
             } catch {
-                // Expected on Object-Lock buckets; the tombstone + lifecycle handle it.
+                blocked += 1                            // listing failed — retry later
             }
         }
-        refreshCounts()
-        if purged > 0 {
-            appendLog("Purged \(purged) object\(purged == 1 ? "" : "s"); any locked ones expire via the lifecycle rule.", .info)
+        if freed > 0 {
+            appendLog("Freed \(freed) deleted backup\(freed == 1 ? "" : "s") from the bucket.", .info)
+            if settings.keepBucketManifest { await writeManifest() }
         }
-        // The manifest is now the source of truth for what's deleted.
-        if settings.keepBucketManifest { await writeManifest() }
+        if blocked > 0 {
+            appendLog("\(blocked) deletion\(blocked == 1 ? "" : "s") still locked — will retry once Object Lock retention expires.", .info)
+        }
+        refreshCounts()
     }
 
     /// Build the encrypted restore manifest and upload it to the bucket as
@@ -413,22 +453,6 @@ final class BackupEngine: ObservableObject {
             return .success(items.count)
         } catch {
             appendLog("Manifest write failed: \(error.localizedDescription)", .error)
-            return .failure(error)
-        }
-    }
-
-    /// Push (or clear) the server-side retention lifecycle rule.
-    func applyLifecyclePolicy() async -> Result<Void, Error> {
-        guard let client = makeClient() else { return .failure(S3Error.badConfig) }
-        do {
-            try await client.putBucketLifecycle(expirationDays: settings.lifecycleExpirationDays)
-            let msg = settings.lifecycleExpirationDays > 0
-                ? "Bucket set to auto-expire objects after \(settings.lifecycleExpirationDays) days."
-                : "Bucket retention rule cleared — objects kept indefinitely."
-            appendLog(msg, .success)
-            return .success(())
-        } catch {
-            appendLog("Lifecycle update failed: \(error.localizedDescription)", .error)
             return .failure(error)
         }
     }

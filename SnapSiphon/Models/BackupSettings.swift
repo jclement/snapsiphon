@@ -38,14 +38,16 @@ struct BackupSettings: Codable, Equatable {
     /// each run that uploads something.
     var keepBucketManifest: Bool = true
 
-    /// Mirror on-device deletions to the bucket. OFF by default: turning a backup
-    /// into a mirror means deleting a photo from your phone deletes the only
-    /// copy. Guarded in the UI with a clear warning.
+    /// Mirror on-device deletions to the bucket. OFF by default = pure
+    /// append-only archive (phone deletes never touch the bucket). When ON,
+    /// deletes are tombstoned in the manifest immediately, then physically
+    /// purged only after `deleteGraceDays` (and only when Object Lock allows).
     var propagateDeletes: Bool = false
 
-    /// Server-side retention in days pushed as a bucket lifecycle rule.
-    /// 0 = keep forever (no rule).
-    var lifecycleExpirationDays: Int = 0
+    /// How long a deleted photo must stay tombstoned before the app tries to
+    /// physically remove it. This is the accident window: if you erase iCloud by
+    /// mistake and the photos come back within this many days, nothing is purged.
+    var deleteGraceDays: Int = 30
 
     static let parallelRange = 1...8
     static let speedRange = 0.0...50.0

@@ -60,7 +60,7 @@ struct KeysView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Label("Encrypted on-device, to every key", systemImage: "lock.shield.fill")
                     .font(Theme.rounded(15, weight: .semibold)).foregroundStyle(Theme.textPrimary)
-                Text("SnapSiphon encrypts each photo with [age](https://age-encryption.org) to **all** the recipients below — any one of the matching secret keys can restore it. Add your laptop's key, a backup key, a friend's key… Your provider only ever sees ciphertext.")
+                Text("SnapSiphon encrypts each photo with [age](https://age-encryption.org) to **all** the recipients below — any one of the matching secret keys can restore it. Add a software key, your laptop's key, an offline backup key, or a hardware key: **Secure Enclave** (`age1se1…`) and **YubiKey** (`age1yubikey1…`) recipients work here, and only the hardware can decrypt. Your provider only ever sees ciphertext.")
                     .font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
                     .tint(Theme.teal)
             }
@@ -89,12 +89,22 @@ struct KeysView: View {
         }
     }
 
+    private func recipientKind(_ r: String) -> (label: String, color: Color)? {
+        if r.hasPrefix("age1se1") { return ("SECURE ENCLAVE", .cyan) }
+        if r.hasPrefix("age1yubikey1") { return ("YUBIKEY", .green) }
+        return nil
+    }
+
     private func recipientRow(_ recipient: String) -> some View {
         let isPair = manager.identityRecipient == recipient
+        let kind = recipientKind(recipient)
         return HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 5) {
-                Pill(text: isPair ? "PAIR (on device)" : "PUBLIC-ONLY",
-                     color: isPair ? Theme.violet : Theme.teal)
+                HStack(spacing: 6) {
+                    Pill(text: isPair ? "PAIR (on device)" : "PUBLIC-ONLY",
+                         color: isPair ? Theme.violet : Theme.teal)
+                    if let kind { Pill(text: kind.label, color: kind.color, filled: true) }
+                }
                 Text(recipient)
                     .font(Theme.mono(11)).foregroundStyle(Theme.textPrimary)
                     .textSelection(.enabled)
@@ -151,7 +161,8 @@ struct KeysView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Add a public key").font(Theme.rounded(16, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
-                FieldRow(label: "age recipient", placeholder: "age1…", text: $pastedRecipient, mono: true)
+                FieldRow(label: "age recipient", placeholder: "age1… / age1se1… / age1yubikey1…",
+                         text: $pastedRecipient, mono: true)
                 PrimaryButton(title: "Add key", systemImage: "plus",
                               enabled: !pastedRecipient.isEmpty) {
                     do {

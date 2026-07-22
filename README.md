@@ -29,12 +29,23 @@ byte — or even a real filename, if you leave filename-hashing on.
   (the run loop parks on a closed gate and resumes automatically), keep-screen-on,
   filename encryption, and **verify-before-upload** (HEAD-skip objects already in
   the bucket).
-- **Optional delete propagation + retention.** Off by default: mirror on-device
-  deletions to the bucket (with a blunt "this is now a mirror" warning), and/or
-  push a server-side **bucket lifecycle** rule so the provider expires old
-  objects even if the app is gone.
-- **Detailed progress & stats.** A live dashboard: percentage ring, per-file
-  progress, throughput, session counters, and a running activity log.
+- **Multiple recipients, incl. hardware keys.** Encrypts to every recipient at
+  once (any one decrypts). Native X25519 (`age1…`) plus **Secure Enclave**
+  (`age1se1…`) and **YubiKey** (`age1yubikey1…`) plugin recipients via the
+  `piv-p256` stanza — implemented in CryptoKit, so no plugin binary or hardware
+  is needed to *encrypt*; only the hardware can decrypt.
+- **Forever archive with safe deletes.** No retention/expiry — backups are kept
+  indefinitely. Delete mirroring is off by default (pure append-only). When on,
+  a photo deleted on-device is **tombstoned** in the encrypted manifest, then
+  physically freed only after a **grace period** (and once Object Lock retention
+  expires). Photos that reappear within the window are **resurrected** — an
+  accidental iCloud wipe can't cascade into the bucket.
+- **Encrypted restore manifest.** Timestamped, write-once `manifests/*.age`
+  (Object-Lock safe) mapping opaque `<hash>.<ext>.age` keys back to filenames;
+  restore with `age -d | jq`.
+- **Detailed progress & stats.** A live dashboard: dual-ring (file-count
+  progress + stored-bytes-by-type), per-stream upload bars, live gauges
+  (speed / ETA / last-backup), and a running activity log.
 
 ## Architecture
 
@@ -96,14 +107,15 @@ age -d -i key.txt photo.age > photo   # decrypts byte-for-byte
 
 ## Status
 
-v1 — core pipeline implemented; builds for the iOS Simulator SDK. The age output
-is verified byte-for-byte against the reference `age` tool, and the speed-limit
-throttle is verified to hold its cap (±3%).
+v1 — core pipeline implemented; builds for the iOS Simulator SDK. Crypto is
+verified against the reference toolchain: age output decrypts byte-for-byte with
+`age`; multi-recipient files decrypt with any key; and the `piv-p256` output
+decrypts on a real **Secure Enclave** via `age-plugin-se` (YubiKey uses the
+identical stanza — the user's exact recipient produces the correct tag). The
+speed-limit throttle holds its cap (±3%), and the Content-MD5 matches `openssl`.
 
-Verified in isolation but **not yet exercised against a live bucket** (I have no
-test credentials here): SigV4 signing, upload/delete/list, and the
-`PutBucketLifecycleConfiguration` push. Lifecycle support is provider-dependent
-(R2/AWS honour S3 lifecycle; B2's S3 lifecycle is partial — it has its own rules).
+Verified in isolation but **not yet exercised against a live bucket**: SigV4
+signing, upload/HEAD/list-versions/versioned-delete.
 
 Natural next steps: background-task scheduling (`BGProcessingTask`), multipart
 uploads for videos over the ~5 GB single-PUT ceiling (and resumable large

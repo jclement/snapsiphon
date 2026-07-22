@@ -28,6 +28,9 @@ final class BackupIndex {
             );
         """)
         db.exec("CREATE INDEX IF NOT EXISTS idx_state ON assets(state);")
+        // Migration: tombstone timestamp for delete grace-period logic. Harmless
+        // duplicate-column error on already-migrated DBs (exec ignores it).
+        db.exec("ALTER TABLE assets ADD COLUMN deletedAt REAL;")
 
         // Load or seed the Bloom filter.
         if let data = try? Data(contentsOf: bloomURL),
@@ -186,12 +189,30 @@ final class BackupIndex {
         }
     }
 
-    /// Logically delete: keep the row as a tombstone (state='deleted') so the
-    /// manifest can record it. The object may still physically exist in the
-    /// bucket under Object Lock until the lifecycle rule expires it.
-    func markDeleted(_ localIdentifier: String) {
+    /// Logically delete: keep the row as a tombstone (state='deleted') stamped
+    /// with the deletion time, so the manifest records it and the grace period
+    /// can be enforced before any physical purge.
+    func markDeleted(_ localIdentifier: String, at date: Date) {
         queue.sync {
-            db.exec("UPDATE assets SET state='deleted' WHERE localIdentifier=?;", [.text(localIdentifier)])
+            db.exec("UPDATE assets SET state='deleted', deletedAt=? WHERE localIdentifier=? AND state != 'deleted';",
+                    [.date(date), .text(localIdentifier)])
+        }
+    }
+
+    /// Bring a tombstoned asset back to life — used when a deleted photo
+    /// reappears in the library (e.g. iCloud restored after an accidental erase).
+    func resurrect(_ localIdentifier: String) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='uploaded', deletedAt=NULL WHERE localIdentifier=? AND state='deleted';",
+                    [.text(localIdentifier)])
+        }
+    }
+
+    /// Local identifiers currently tombstoned (to detect resurrections).
+    func tombstonedIdentifiers() -> Set<String> {
+        queue.sync {
+            let rows = (try? db.query("SELECT localIdentifier FROM assets WHERE state='deleted';", []) { $0.text(0) }) ?? []
+            return Set(rows)
         }
     }
 
@@ -199,6 +220,23 @@ final class BackupIndex {
     func deletedKeys() -> [String] {
         queue.sync {
             (try? db.query("SELECT remoteKey FROM assets WHERE state='deleted';", []) { $0.text(0) }) ?? []
+        }
+    }
+
+    /// Tombstones whose grace period has elapsed and are eligible for physical
+    /// purge (returns their object keys).
+    func purgeableKeys(before cutoff: Date) -> [String] {
+        queue.sync {
+            (try? db.query(
+                "SELECT remoteKey FROM assets WHERE state='deleted' AND deletedAt IS NOT NULL AND deletedAt <= ?;",
+                [.date(cutoff)]) { $0.text(0) }) ?? []
+        }
+    }
+
+    /// Permanently drop a tombstone once its object is confirmed gone from the bucket.
+    func hardDelete(remoteKey: String) {
+        queue.sync {
+            db.exec("DELETE FROM assets WHERE remoteKey=? AND state='deleted';", [.text(remoteKey)])
         }
     }
 

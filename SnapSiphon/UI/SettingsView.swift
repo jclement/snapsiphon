@@ -63,17 +63,24 @@ struct SettingsView: View {
 
                     knobGroup("Deletions") {
                         ToggleRow(title: "Mirror deletions",
-                                  subtitle: "When you delete a photo on-device, tombstone it in the manifest on the next scan (and purge the object if the bucket allows).",
+                                  subtitle: "Off = pure archive (phone deletes never touch the bucket). On = deleted photos are tombstoned, then freed after a grace period.",
                                   isOn: $engine.settings.propagateDeletes)
                         if engine.settings.propagateDeletes {
+                            Divider().overlay(Theme.hairline)
+                            SliderRow(title: "Delete grace period",
+                                      subtitle: "Accident window: erase iCloud by mistake and get it back within this many days → nothing is purged.",
+                                      value: Binding(
+                                        get: { Double(engine.settings.deleteGraceDays) },
+                                        set: { engine.settings.deleteGraceDays = Int($0) }),
+                                      range: 7...180, step: 1) { "\(Int($0))d" }
                             HStack(alignment: .top, spacing: 8) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.orange).font(.system(size: 13))
-                                Text("This turns your backup into a mirror. Deletes are recorded in the encrypted manifest so a restore skips them. On Object-Lock buckets the bytes can't be removed early — they expire via your retention rule.")
-                                    .font(.system(size: 12)).foregroundStyle(.orange)
+                                Image(systemName: "info.circle.fill")
+                                    .foregroundStyle(Theme.teal).font(.system(size: 13))
+                                Text("Photos are freed only after the grace period AND once Object Lock retention expires, whichever is longer. A bulk mistake can't wipe recent backups.")
+                                    .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                             }
                             .padding(10)
-                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.teal.opacity(0.10)))
                         }
                     }
 
