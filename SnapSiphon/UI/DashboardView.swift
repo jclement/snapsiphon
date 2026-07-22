@@ -213,10 +213,11 @@ struct DashboardView: View {
                 HStack(spacing: 8) {
                     GaugePill(systemImage: "photo.stack",
                               value: Format.count(engine.counts.total), caption: "in library")
-                    GaugePill(systemImage: "cube.transparent",
-                              value: Format.percent(engine.bloomFillRatio), caption: "bloom fill", accent: Theme.violet)
-                    GaugePill(systemImage: "scope",
-                              value: Format.percent(engine.bloomFalsePositiveRate), caption: "false-pos", accent: .green)
+                    GaugePill(systemImage: "tray.and.arrow.up",
+                              value: Format.count(engine.counts.pending), caption: "queued", accent: Theme.violet)
+                    GaugePill(systemImage: "exclamationmark.triangle",
+                              value: Format.count(engine.counts.failed), caption: "failed",
+                              accent: engine.counts.failed > 0 ? .red : .green)
                 }
             }
         }

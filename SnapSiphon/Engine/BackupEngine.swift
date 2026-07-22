@@ -45,8 +45,6 @@ final class BackupEngine: ObservableObject {
     @Published private(set) var bytesPerSecond: Double = 0
     @Published private(set) var sessionUploaded: Int = 0
     @Published private(set) var sessionBytes: Int64 = 0
-    @Published private(set) var bloomFillRatio: Double = 0
-    @Published private(set) var bloomFalsePositiveRate: Double = 0
     @Published private(set) var photoAuth: PhotoLibrary.AuthState = PhotoLibrary.currentAuthState()
     @Published private(set) var log: [LogEntry] = []
     /// Number of library assets examined so far during a scan (for live feedback).
@@ -127,8 +125,6 @@ final class BackupEngine: ObservableObject {
         uploadedVideos = 656
         storedPhotoBytes = 27_800_000_000    // ~28 GB photos
         storedVideoBytes = 43_600_000_000    // ~44 GB videos
-        bloomFillRatio = 0.34
-        bloomFalsePositiveRate = 0.0008
         lastBackupDate = Date().addingTimeInterval(-42)
 
         if mode == "uploading" {
@@ -194,9 +190,6 @@ final class BackupEngine: ObservableObject {
         storedPhotoBytes = byType.photoBytes
         storedVideoBytes = byType.videoBytes
         lastBackupDate = index.recentUploads(limit: 1).first?.uploadedAt
-        let bloom = index.bloomSnapshot
-        bloomFillRatio = bloom.fillRatio
-        bloomFalsePositiveRate = bloom.estimatedFalsePositiveRate
     }
 
     /// Refresh the library totals by type (cheap PhotoKit counts). Runs off-main
@@ -543,7 +536,6 @@ final class BackupEngine: ObservableObject {
         waitingReason = nil
         UIApplication.shared.isIdleTimerDisabled = false
         refreshCounts()
-        index?.persistBloom()
         uploadLanes.removeAll()
         bytesPerSecond = 0
         if phase == .running {

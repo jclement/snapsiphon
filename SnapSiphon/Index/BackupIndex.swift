@@ -1,19 +1,19 @@
 import Foundation
 
-/// The local source of truth for what has been backed up. Wraps a SQLite table
-/// of `AssetRecord`s and keeps a `BloomFilter` of uploaded identifiers in front
-/// of it for fast "definitely new?" scans. All access is serialized on a private
-/// queue so callers can hit it from any actor/task.
+/// The local source of truth for what has been backed up: a SQLite table of
+/// `AssetRecord`s. Scans load the full identifier set into memory in one query
+/// (cheap even at 100k assets), so no probabilistic pre-filter is needed. All
+/// access is serialized on a private queue so callers can hit it from any
+/// actor/task.
 final class BackupIndex {
     private let db: SQLiteDatabase
     private let queue = DispatchQueue(label: "com.snapsiphon.index")
-    private var bloom: BloomFilter
-    private let bloomURL: URL
 
     init(directory: URL) throws {
         let dbURL = directory.appendingPathComponent("index.sqlite")
-        self.bloomURL = directory.appendingPathComponent("bloom.filter")
         self.db = try SQLiteDatabase(path: dbURL.path)
+        // Clean up the bloom filter file from earlier versions.
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("bloom.filter"))
         db.exec("""
             CREATE TABLE IF NOT EXISTS assets (
                 localIdentifier TEXT PRIMARY KEY,
@@ -35,35 +35,7 @@ final class BackupIndex {
         // pending, so the next run retries it (deterministic keys mean a re-upload
         // just overwrites the same object — no duplicates).
         db.exec("UPDATE assets SET state='pending' WHERE state='uploading';")
-
-        // Load or seed the Bloom filter.
-        if let data = try? Data(contentsOf: bloomURL),
-           let loaded = try? JSONDecoder().decode(BloomFilter.self, from: data) {
-            self.bloom = loaded
-        } else {
-            self.bloom = BloomFilter(expectedItems: 50_000)
-        }
     }
-
-    // MARK: Fast membership
-
-    /// Fast path: if the Bloom filter says "definitely not present", the asset is
-    /// new and we can skip the DB entirely. On a maybe-hit we confirm.
-    func isDefinitelyNew(_ localIdentifier: String) -> Bool {
-        queue.sync { !bloom.mightContain(localIdentifier) }
-    }
-
-    func isUploaded(_ localIdentifier: String) -> Bool {
-        queue.sync {
-            guard bloom.mightContain(localIdentifier) else { return false }
-            let n = db.scalarInt(
-                "SELECT COUNT(*) FROM assets WHERE localIdentifier = ? AND state = 'uploaded';",
-                [.text(localIdentifier)])
-            return n > 0
-        }
-    }
-
-    var bloomSnapshot: BloomFilter { queue.sync { bloom } }
 
     // MARK: Upserts
 
@@ -89,9 +61,6 @@ final class BackupIndex {
                     .date(record.uploadedAt),
                     .optText(record.lastError),
                 ])
-            if record.state == .uploaded {
-                bloom.insert(record.localIdentifier)
-            }
         }
     }
 
@@ -99,7 +68,6 @@ final class BackupIndex {
         queue.sync {
             db.exec("UPDATE assets SET state='uploaded', uploadedAt=?, lastError=NULL WHERE localIdentifier=?;",
                     [.date(uploadedAt), .text(localIdentifier)])
-            bloom.insert(localIdentifier)
         }
     }
 
@@ -247,17 +215,6 @@ final class BackupIndex {
     func reset() {
         queue.sync {
             db.exec("DELETE FROM assets;")
-            bloom = BloomFilter(expectedItems: 50_000)
-            try? FileManager.default.removeItem(at: bloomURL)
-        }
-    }
-
-    /// Persist the Bloom filter to disk (call periodically / on background).
-    func persistBloom() {
-        queue.sync {
-            if let data = try? JSONEncoder().encode(bloom) {
-                try? data.write(to: bloomURL, options: .atomic)
-            }
         }
     }
 

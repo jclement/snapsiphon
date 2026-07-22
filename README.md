@@ -20,9 +20,10 @@ byte — or even a real filename, if you leave filename-hashing on.
 - **Bring your own bucket.** First-class presets for **Backblaze B2** and
   **Cloudflare R2**, plus a custom endpoint. Requests are signed with
   AWS Signature V4; credentials live only in the iOS Keychain.
-- **A light remote index.** A SQLite table is the source of truth for what's
-  been uploaded, fronted by a **Bloom filter** so re-scans of 50k+ photos skip
-  the network without a per-asset DB hit.
+- **A light local index.** A SQLite table is the source of truth for what's
+  been uploaded; scans load the known-identifier set in a single query and do
+  in-memory membership checks, plus an oldest-first high-water mark so re-scans
+  of 50k+ photos only look at what's new.
 - **Lots of knobs — all enforced.** Photos/videos/favorites filters,
   parallel-upload count, **mid-stream speed limit** (a throttled bound-stream
   body, not just a per-file average), **Wi-Fi-only** and **pause-on-low-battery**
@@ -53,7 +54,7 @@ byte — or even a real filename, if you leave filename-hashing on.
 |------|-------|-------|
 | Crypto | `Crypto/Age.swift`, `Bech32.swift`, `AgeKeyManager.swift` | Native age v1 (X25519 + ChaCha20-Poly1305 STREAM), Keychain-backed keys |
 | Storage | `Storage/SigV4.swift`, `S3Client.swift`, `S3CredentialStore.swift` | SigV4 signing, streaming `URLSession` uploads, `UNSIGNED-PAYLOAD` |
-| Index | `Index/BloomFilter.swift`, `SQLiteDatabase.swift`, `BackupIndex.swift` | Bloom filter + libsqlite3, serialized |
+| Index | `Index/SQLiteDatabase.swift`, `BackupIndex.swift` | libsqlite3 (WAL), serialized |
 | Photos | `Photos/PhotoLibrary.swift` | PhotoKit auth + original-resource export |
 | Engine | `Engine/BackupEngine.swift`, `AssetProcessor.swift`, `RateLimiter.swift`, `ThroughputMeter.swift` | Orchestration, bounded concurrency, throttling |
 | UI | `UI/*`, `App/*` | SwiftUI, dark "polished and nerdy" theme |
@@ -65,7 +66,7 @@ PhotoKit original ──▶ temp file ──▶ age.Encryptor (streaming) ──
                                                                      │
                                               SigV4 PUT ◀────────────┘
                                                    │
-                                        BackupIndex (SQLite + Bloom)
+                                        BackupIndex (SQLite, WAL)
 ```
 
 Everything streams through temp files in 64 KiB chunks, so a 4K video never sits

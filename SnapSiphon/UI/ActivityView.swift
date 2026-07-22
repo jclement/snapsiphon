@@ -21,8 +21,6 @@ struct ActivityView: View {
                         }
                     }
 
-                    bloomCard
-
                     if engine.log.isEmpty {
                         emptyState
                     } else {
@@ -41,24 +39,6 @@ struct ActivityView: View {
             Text(value).font(Theme.rounded(18, weight: .bold)).foregroundStyle(Theme.textPrimary)
                 .minimumScaleFactor(0.6).lineLimit(1)
             Text(label.uppercased()).font(Theme.mono(9)).tracking(1).foregroundStyle(Theme.textSecondary)
-        }
-    }
-
-    private var bloomCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Image(systemName: "cube.transparent").foregroundStyle(Theme.violet)
-                    Text("Bloom index").font(Theme.rounded(15, weight: .semibold))
-                        .foregroundStyle(Theme.textPrimary)
-                    Spacer()
-                    Text("fp ≈ \(Format.percent(engine.bloomFalsePositiveRate))")
-                        .font(Theme.mono(11)).foregroundStyle(Theme.textSecondary)
-                }
-                ProgressView(value: min(engine.bloomFillRatio, 1)).tint(Theme.violet)
-                Text("A probabilistic set of everything already uploaded — checked before touching the network, so re-scans stay fast even at 50k+ photos.")
-                    .font(.system(size: 12)).foregroundStyle(Theme.textTertiary)
-            }
         }
     }
 
