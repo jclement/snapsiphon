@@ -299,6 +299,7 @@ struct SettingsView: View {
                         .padding(.top, 8)
                 }
                 .padding(16)
+                .containerRelativeFrame(.horizontal)
             }
             .background(Theme.canvas.ignoresSafeArea())
             .navigationBarHidden(true)

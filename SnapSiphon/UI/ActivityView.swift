@@ -28,6 +28,7 @@ struct ActivityView: View {
                     }
                 }
                 .padding(16)
+                .containerRelativeFrame(.horizontal)
             }
             .background(Theme.canvas.ignoresSafeArea())
             .navigationBarHidden(true)

@@ -43,6 +43,7 @@ struct KeysView: View {
                 }
             }
             .padding(16)
+            .containerRelativeFrame(.horizontal)
         }
         .background(Theme.canvas.ignoresSafeArea())
         .navigationTitle("Encryption")
