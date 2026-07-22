@@ -41,6 +41,19 @@
 	<array>
 		<string>processing</string>
 	</array>
+	<key>UIApplicationShortcutItems</key>
+	<array>
+		<dict>
+			<key>UIApplicationShortcutItemType</key>
+			<string>ca.straybits.snapsiphon.backupNow</string>
+			<key>UIApplicationShortcutItemTitle</key>
+			<string>Back Up Now</string>
+			<key>UIApplicationShortcutItemSubtitle</key>
+			<string>Scan &amp; upload new photos</string>
+			<key>UIApplicationShortcutItemIconSymbolName</key>
+			<string>arrow.up.circle.fill</string>
+		</dict>
+	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>ca.straybits.snapsiphon.backup</string>

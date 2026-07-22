@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct SnapSiphonApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var engine = BackupEngine()
 
     init() {

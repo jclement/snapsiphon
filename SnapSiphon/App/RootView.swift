@@ -21,7 +21,11 @@ struct RootView: View {
             }
         }
         .task {
-            engine.autoBackupIfDue()
+            if QuickActions.takeBackupRequest() {
+                engine.backUpNow()          // icon quick action, cold launch
+            } else {
+                engine.autoBackupIfDue()
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             // Re-lock the settings gate whenever the app leaves the foreground.
@@ -34,7 +38,11 @@ struct RootView: View {
             if phase == .active {
                 Task {
                     await engine.refreshLibraryCounts()
-                    engine.autoBackupIfDue()
+                    if QuickActions.takeBackupRequest() {
+                        engine.backUpNow()  // icon quick action, warm resume
+                    } else {
+                        engine.autoBackupIfDue()
+                    }
                 }
             }
         }
