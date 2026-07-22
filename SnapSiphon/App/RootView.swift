@@ -21,7 +21,10 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             // Re-lock the settings gate whenever the app leaves the foreground.
-            if phase == .background { engine.settingsUnlocked = false }
+            if phase == .background {
+                engine.settingsUnlocked = false
+                engine.scheduleBackgroundBackup()   // request the next overnight window
+            }
             // Coming back to the foreground: refresh the "to back up" numbers
             // and kick an auto backup if one is due.
             if phase == .active {

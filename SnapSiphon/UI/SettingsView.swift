@@ -225,6 +225,22 @@ struct SettingsView: View {
                         .disabled(!engine.isConfigured)
                     }
 
+                    knobGroup("Automation") {
+                        ToggleRow(title: "Back up in the background",
+                                  subtitle: "iOS grants short windows (usually overnight, charging, on Wi-Fi) to upload new photos while the app is closed. Best-effort by design.",
+                                  isOn: $engine.settings.backgroundBackup)
+                        Divider().overlay(Theme.hairline)
+                        SliderRow(title: "Remind me",
+                                  subtitle: "Notify if no backup has run for this many days. Tapping the notification opens the app (pairs well with auto back up).",
+                                  value: Binding(
+                                    get: { Double(engine.settings.reminderDays) },
+                                    set: { engine.settings.reminderDays = Int($0) }),
+                                  range: 0...14, step: 1) { $0 == 0 ? "Off" : "\(Int($0))d" }
+                            .onChange(of: engine.settings.reminderDays) { _, _ in
+                                engine.rescheduleReminder()
+                            }
+                    }
+
                     knobGroup("Scanning") {
                         ToggleRow(title: "Auto back up on open",
                                   subtitle: "Start a backup when the app opens, if the last run finished more than 30 minutes ago.",

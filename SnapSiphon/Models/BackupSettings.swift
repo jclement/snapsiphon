@@ -33,6 +33,13 @@ struct BackupSettings: Codable, Equatable {
     /// Turn off (or run a Deep scan) to always re-check the whole library.
     var incrementalScan: Bool = true
 
+    /// Opportunistic background backups via BGProcessingTask — iOS grants short
+    /// windows (typically overnight, charging, on Wi-Fi). Best-effort by design.
+    var backgroundBackup: Bool = true
+
+    /// Local-notification reminder when no backup has run for N days (0 = off).
+    var reminderDays: Int = 0
+
     /// Keep an encrypted `manifest.age` in the bucket (key → original filename
     /// map) so a bucket-only restore can rename everything back. Refreshed after
     /// each run that uploads something.

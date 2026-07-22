@@ -1,6 +1,8 @@
 import Foundation
 import SwiftUI
 import UIKit
+import BackgroundTasks
+import UserNotifications
 
 /// The brain. Owns configuration, the index, and the run loop; publishes live
 /// state for the UI. Everything the dashboard shows flows from here.
@@ -112,6 +114,8 @@ final class BackupEngine: ObservableObject {
         if !demoMode, keyManager.ensureDefaultIdentity() {
             appendLog("Generated this phone's encryption key. Reveal & back it up in Settings → Encryption key (requires Face ID).", .info)
         }
+        registerBackgroundTask()
+        rescheduleReminder()
     }
 
     #if DEBUG
@@ -169,6 +173,76 @@ final class BackupEngine: ObservableObject {
     /// what the "ready to back up" banner needs at launch.
     var toBackupPhotos: Int { settings.includePhotos ? max(0, libraryPhotos - uploadedPhotos) : 0 }
     var toBackupVideos: Int { settings.includeVideos ? max(0, libraryVideos - uploadedVideos) : 0 }
+
+    // MARK: Background backup (BGProcessingTask)
+
+    static let bgTaskID = "com.snapsiphon.backup"
+
+    /// Must be called before the app finishes launching (we call it from init).
+    nonisolated func registerBackgroundTask() {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.bgTaskID, using: nil) { [weak self] task in
+            guard let self, let task = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            self.handleBackgroundTask(task)
+        }
+    }
+
+    nonisolated private func handleBackgroundTask(_ task: BGProcessingTask) {
+        Task { @MainActor in
+            self.scheduleBackgroundBackup()   // chain the next window first
+            guard self.settings.backgroundBackup, self.isConfigured, self.runTask == nil else {
+                task.setTaskCompleted(success: true)
+                return
+            }
+            // On expiry, pause gracefully — the index checkpoints per file, so
+            // whatever uploaded stays uploaded and the rest resumes next window.
+            task.expirationHandler = { [weak self] in
+                Task { @MainActor in self?.pause() }
+            }
+            self.appendLog("Background window granted — backing up…", .info)
+            await self.scan()
+            self.start()
+            await self.runTask?.value
+            self.rescheduleReminder()
+            task.setTaskCompleted(success: true)
+        }
+    }
+
+    /// Ask iOS for a future processing window (requires power + network, at
+    /// least 30 min out). iOS decides when — typically overnight on charge.
+    func scheduleBackgroundBackup() {
+        guard settings.backgroundBackup, isConfigured else { return }
+        let request = BGProcessingTaskRequest(identifier: Self.bgTaskID)
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = true
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    // MARK: Reminder notifications
+
+    /// (Re)schedule the "no backup for N days" local notification. Called after
+    /// every completed run and whenever the setting changes, so the countdown
+    /// always measures from the last backup.
+    func rescheduleReminder() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: ["com.snapsiphon.reminder"])
+        let days = settings.reminderDays
+        guard days > 0 else { return }
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Photos waiting to be backed up"
+            content.body = "It's been \(days) day\(days == 1 ? "" : "s") since your last SnapSiphon backup. Tap to protect what's new."
+            content.sound = .default
+            let trigger = UNTimeIntervalNotificationTrigger(
+                timeInterval: TimeInterval(days) * 86_400, repeats: true)
+            center.add(UNNotificationRequest(identifier: "com.snapsiphon.reminder",
+                                             content: content, trigger: trigger))
+        }
+    }
 
     // MARK: Auto backup
 
@@ -684,6 +758,7 @@ final class BackupEngine: ObservableObject {
             appendLog("Backup finished — \(sessionUploaded) uploaded this session.", .success)
         }
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRunKey)
+        rescheduleReminder()   // reset the "no backup for N days" countdown
         // Refresh the bucket manifest whenever the archive has changed since the
         // last successful write — covering uploads from THIS run, but also a
         // previous run whose manifest write failed or was cut short.
