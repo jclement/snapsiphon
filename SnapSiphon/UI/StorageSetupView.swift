@@ -3,6 +3,12 @@ import SwiftUI
 struct StorageSetupView: View {
     @EnvironmentObject var engine: BackupEngine
 
+    /// Edits happen on a local draft, committed only by Save. The config used
+    /// to bind straight to engine.s3Config, which persisted on every keystroke —
+    /// meaning the destination could be silently redirected without ever
+    /// pressing Save. Nothing sticks until an explicit, gated commit now.
+    @State private var draft = S3Config()
+    @State private var loaded = false
     @State private var accessKeyID = ""
     @State private var secretKey = ""
     @State private var testing = false
@@ -20,12 +26,12 @@ struct StorageSetupView: View {
                 Card {
                     VStack(alignment: .leading, spacing: 14) {
                         FieldRow(label: "Endpoint host", placeholder: endpointPlaceholder,
-                                 text: $engine.s3Config.endpoint, mono: true)
-                        FieldRow(label: "Region", placeholder: engine.s3Config.provider.defaultRegion,
-                                 text: $engine.s3Config.region, mono: true)
-                        FieldRow(label: "Bucket", placeholder: "my-photos", text: $engine.s3Config.bucket, mono: true)
+                                 text: $draft.endpoint, mono: true)
+                        FieldRow(label: "Region", placeholder: draft.provider.defaultRegion,
+                                 text: $draft.region, mono: true)
+                        FieldRow(label: "Bucket", placeholder: "my-photos", text: $draft.bucket, mono: true)
                         FieldRow(label: "Key prefix (folder)", placeholder: "SnapSiphon",
-                                 text: $engine.s3Config.prefix, mono: true)
+                                 text: $draft.prefix, mono: true)
                     }
                 }
 
@@ -45,12 +51,12 @@ struct StorageSetupView: View {
 
                 VStack(spacing: 12) {
                     PrimaryButton(title: "Save", systemImage: "checkmark",
-                                  enabled: engine.s3Config.isComplete) {
-                        persistCredentials()
+                                  enabled: draft.isComplete) {
+                        commit()
                     }
                     GhostButton(title: testing ? "Testing…" : "Save & test connection",
                                 systemImage: "antenna.radiowaves.left.and.right", tint: Theme.teal) {
-                        persistCredentials()
+                        commit()
                         Task { await runTest() }
                     }
                 }
@@ -67,23 +73,23 @@ struct StorageSetupView: View {
         HStack(spacing: 10) {
             ForEach(S3Config.Provider.allCases) { provider in
                 Button {
-                    engine.s3Config.provider = provider
-                    if engine.s3Config.region.isEmpty { engine.s3Config.region = provider.defaultRegion }
+                    draft.provider = provider
+                    if draft.region.isEmpty { draft.region = provider.defaultRegion }
                 } label: {
                     Text(provider.title)
                         .font(Theme.rounded(13, weight: .semibold))
                         .frame(maxWidth: .infinity).padding(.vertical, 12)
-                        .foregroundStyle(engine.s3Config.provider == provider ? .black : Theme.textSecondary)
+                        .foregroundStyle(draft.provider == provider ? .black : Theme.textSecondary)
                         .background(
                             RoundedRectangle(cornerRadius: 12)
-                                .fill(engine.s3Config.provider == provider ? AnyShapeStyle(Theme.brandGradient) : AnyShapeStyle(Theme.surfaceHi)))
+                                .fill(draft.provider == provider ? AnyShapeStyle(Theme.brandGradient) : AnyShapeStyle(Theme.surfaceHi)))
                 }
             }
         }
     }
 
     private var endpointPlaceholder: String {
-        switch engine.s3Config.provider {
+        switch draft.provider {
         case .backblazeB2: return "s3.us-west-004.backblazeb2.com"
         case .cloudflareR2: return "<account>.r2.cloudflarestorage.com"
         case .custom: return "s3.example.com"
@@ -107,16 +113,19 @@ struct StorageSetupView: View {
     }
 
     private func prefillCredentials() {
-        if engine.s3Config.region.isEmpty {
-            engine.s3Config.region = engine.s3Config.provider.defaultRegion
-        }
+        guard !loaded else { return }
+        loaded = true
+        draft = engine.s3Config
+        if draft.region.isEmpty { draft.region = draft.provider.defaultRegion }
         if let creds = S3CredentialStore.load() {
             accessKeyID = creds.accessKeyID
             secretKey = creds.secretAccessKey
         }
     }
 
-    private func persistCredentials() {
+    /// Commit the draft: config becomes live, credentials go to the Keychain.
+    private func commit() {
+        engine.s3Config = draft
         if !accessKeyID.isEmpty && !secretKey.isEmpty {
             engine.saveCredentials(accessKeyID: accessKeyID, secret: secretKey)
         }

@@ -122,3 +122,7 @@ Natural next steps: background-task scheduling (`BGProcessingTask`), multipart
 uploads for videos over the ~5 GB single-PUT ceiling (and resumable large
 uploads), and a pluggable backend protocol so non-S3 targets (SFTP/Borg/Restic)
 could slot beside `S3Client`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

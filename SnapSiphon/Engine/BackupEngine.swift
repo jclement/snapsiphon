@@ -71,6 +71,10 @@ final class BackupEngine: ObservableObject {
     /// Non-nil while the run loop is parked on a closed condition gate
     /// (no Wi-Fi, low battery, offline). The dashboard surfaces it.
     @Published private(set) var waitingReason: String?
+    /// Face ID gate for the Settings tab once the app is configured — so nobody
+    /// holding the unlocked phone can quietly add a key or redirect the bucket.
+    /// Cleared whenever the app goes to the background.
+    @Published var settingsUnlocked = false
 
     // MARK: Configuration (observed by settings screens)
     @Published var settings: BackupSettings { didSet { settings.save() } }
@@ -115,6 +119,7 @@ final class BackupEngine: ObservableObject {
     /// Gated behind DEBUG + the SNAPSIPHON_DEMO env var, so it never ships.
     private func seedDemoState(_ mode: String) {
         demoMode = true   // makes isConfigured true without writing to Keychain/UserDefaults
+        settingsUnlocked = true
 
         var c = BackupIndex.Counts()
         c.total = 12_843

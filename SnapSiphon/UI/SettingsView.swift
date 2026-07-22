@@ -20,6 +20,46 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
+            if engine.isConfigured && !engine.settingsUnlocked {
+                lockedView
+            } else {
+                settingsContent
+            }
+        }
+    }
+
+    /// One Face ID at the door covers everything behind it — keys, storage,
+    /// deletions, restore script, reset. Re-locks when the app backgrounds.
+    /// (Secret reveal and restore-script export still prompt separately —
+    /// those EXPORT secrets rather than merely changing settings.)
+    private var lockedView: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 54)).foregroundStyle(Theme.brandGradient)
+            Text("Settings locked")
+                .font(Theme.rounded(22, weight: .bold)).foregroundStyle(Theme.textPrimary)
+            Text("Keys, storage, and recovery settings are protected so no one can quietly redirect your backups or add their own key.")
+                .font(.system(size: 14)).foregroundStyle(Theme.textSecondary)
+                .multilineTextAlignment(.center).padding(.horizontal, 28)
+            PrimaryButton(title: "Unlock", systemImage: "faceid") {
+                Task { await unlockSettings() }
+            }
+            .padding(.horizontal, 60).padding(.top, 8)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.canvas.ignoresSafeArea())
+        .task { await unlockSettings() }   // prompt immediately on entering the tab
+    }
+
+    private func unlockSettings() async {
+        if await DeviceAuth.authenticate(reason: "Unlock SnapSiphon settings") {
+            engine.settingsUnlocked = true
+        }
+    }
+
+    private var settingsContent: some View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     SectionHeader(caption: "Tune everything", title: "Settings")
@@ -255,7 +295,6 @@ struct SettingsView: View {
             .sheet(item: $restoreScript) { doc in
                 RestoreScriptViewer(script: doc.text)
             }
-        }
     }
 
     private var keySubtitle: String {
