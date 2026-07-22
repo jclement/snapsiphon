@@ -21,11 +21,17 @@ enum Age {
     enum Error: Swift.Error, LocalizedError {
         case badRecipient
         case encryptionFailed
+        case malformed(String)
+        case noMatchingKey
+        case authenticationFailed
 
         var errorDescription: String? {
             switch self {
             case .badRecipient: return "The recipient key is not a valid age X25519 key."
             case .encryptionFailed: return "Encryption failed while sealing a chunk."
+            case .malformed(let m): return "Not a valid age file: \(m)."
+            case .noMatchingKey: return "None of this file's recipients match the available key."
+            case .authenticationFailed: return "Decryption failed — the file is corrupted or was tampered with."
             }
         }
     }
@@ -281,6 +287,130 @@ enum Age {
         var out = try enc.update(plaintext)
         out.append(try enc.finalize())
         return out
+    }
+
+    // MARK: Decryption
+
+    /// Stream-decrypt an age file with an X25519 identity, verifying the header
+    /// MAC and every chunk's Poly1305 tag — a successful decrypt is
+    /// cryptographic proof the stored object is intact and restorable. Used by
+    /// the verify feature's spot check (and any future in-app restore).
+    static func decryptFile(at source: URL, to destination: URL, identity: Identity) throws {
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+
+        // The header is ASCII terminated by "--- <mac>\n", followed immediately
+        // by binary payload — so locate the boundary at the BYTE level before
+        // any string decoding (decoding header+payload together fails UTF-8).
+        let head = try input.read(upToCount: 65536) ?? Data()
+        guard head.starts(with: Data("age-encryption.org/v1\n".utf8)) else {
+            throw Error.malformed("missing version line")
+        }
+        guard let macMark = head.range(of: Data("\n--- ".utf8)) else {
+            throw Error.malformed("missing header MAC line")
+        }
+        guard let macNewline = head.range(of: Data("\n".utf8), in: macMark.upperBound..<head.endIndex) else {
+            throw Error.malformed("unterminated header")
+        }
+        let headerByteLength = head.distance(from: head.startIndex, to: macNewline.upperBound)
+        guard let stanzasText = String(data: head[head.startIndex..<macMark.lowerBound], encoding: .utf8),
+              let macB64 = String(data: head[macMark.upperBound..<macNewline.lowerBound], encoding: .utf8) else {
+            throw Error.malformed("non-ASCII header")
+        }
+        let headerNoMac = stanzasText + "\n---"
+
+        // Parse stanzas and unwrap the file key with our identity.
+        let fileKey = try unwrapFileKey(headerText: stanzasText, identity: identity)
+
+        // Verify the header MAC before trusting anything else.
+        let macKey = SymmetricKey(data: HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: fileKey, salt: Data(), info: Data("header".utf8), outputByteCount: 32))
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(headerNoMac.utf8), using: macKey)
+        guard b64(Data(mac)) == macB64 else { throw Error.authenticationFailed }
+
+        // Payload: 16-byte nonce, then STREAM chunks of 64KiB+16 (last may be short).
+        try input.seek(toOffset: UInt64(headerByteLength))
+        guard let nonce = try input.read(upToCount: 16), nonce.count == 16 else {
+            throw Error.malformed("missing payload nonce")
+        }
+        let streamKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: fileKey, salt: nonce, info: Data("payload".utf8), outputByteCount: 32)
+
+        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? output.close() }
+
+        let encChunk = chunkSize + 16
+        var counter: UInt64 = 0
+        var pending = try input.read(upToCount: encChunk) ?? Data()
+        guard pending.count >= 16 else { throw Error.malformed("truncated payload") }
+        while true {
+            let done = try autoreleasepool { () -> Bool in
+                let next = try input.read(upToCount: encChunk) ?? Data()
+                let last = next.isEmpty
+                if !last && pending.count != encChunk { throw Error.malformed("short interior chunk") }
+                var n = Data(count: 12)
+                var c = counter
+                for i in stride(from: 10, through: 3, by: -1) { n[i] = UInt8(c & 0xff); c >>= 8 }
+                n[11] = last ? 0x01 : 0x00
+                guard let box = try? ChaChaPoly.SealedBox(combined: n + pending),
+                      let plain = try? ChaChaPoly.open(box, using: SymmetricKey(data: streamKey)) else {
+                    throw Error.authenticationFailed
+                }
+                if !plain.isEmpty { try output.write(contentsOf: plain) }
+                counter &+= 1
+                pending = next
+                return last
+            }
+            if done { break }
+        }
+    }
+
+    /// Find an X25519 stanza our identity can open and recover the file key.
+    private static func unwrapFileKey(headerText: String, identity: Identity) throws -> SymmetricKey {
+        let ourPub = identity.privateKey.publicKey.rawRepresentation
+        let lines = headerText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var i = 1  // skip version line
+        while i < lines.count {
+            guard lines[i].hasPrefix("-> ") else { i += 1; continue }
+            let args = lines[i].dropFirst(3).split(separator: " ").map(String.init)
+            // Body: base64 lines wrapped at 64 columns; a line shorter than 64 ends it.
+            var body = ""
+            var j = i + 1
+            while j < lines.count, !lines[j].hasPrefix("-> ") {
+                body += lines[j]
+                let lineLen = lines[j].count
+                j += 1
+                if lineLen < 64 { break }
+            }
+            i = j
+            guard args.first == "X25519", args.count == 2,
+                  let eph = b64decode(args[1]), eph.count == 32,
+                  let wrapped = b64decode(body), wrapped.count == 32,
+                  let ephKey = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: eph),
+                  let shared = try? identity.privateKey.sharedSecretFromKeyAgreement(with: ephKey)
+            else { continue }
+
+            var salt = Data()
+            salt.append(eph)
+            salt.append(ourPub)
+            let wrapKey = shared.hkdfDerivedSymmetricKey(
+                using: SHA256.self, salt: salt,
+                sharedInfo: Data(x25519Info.utf8), outputByteCount: 32)
+            let zeroNonce = Data(repeating: 0, count: 12)
+            if let box = try? ChaChaPoly.SealedBox(combined: zeroNonce + wrapped),
+               let fileKey = try? ChaChaPoly.open(box, using: wrapKey), fileKey.count == 16 {
+                return SymmetricKey(data: fileKey)
+            }
+        }
+        throw Error.noMatchingKey
+    }
+
+    /// Decode age's unpadded standard base64.
+    private static func b64decode(_ s: String) -> Data? {
+        var padded = s
+        while padded.count % 4 != 0 { padded += "=" }
+        return Data(base64Encoded: padded)
     }
 
     // MARK: Base64 helpers (age uses RFC 4648 std base64 with no padding)

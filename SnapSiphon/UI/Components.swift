@@ -138,13 +138,25 @@ struct MediaBackupRing: View {
     }
 }
 
-/// A dense one-line upload row: media icon, filename (left), size (right), with
+/// A dense one-line upload row: phase icon, filename (left), size (right), with
 /// the row background itself filling left-to-right as the upload progresses.
+/// The leading glyph tells you what the lane is doing right now — pulling from
+/// iCloud, encrypting, or on the wire.
 struct UploadRow: View {
     let filename: String
     let byteSize: Int64
     let progress: Double
     let isVideo: Bool
+    var phase: AssetProcessor.Phase = .uploading
+
+    private var phaseIcon: (name: String, color: Color) {
+        switch phase {
+        case .exporting: return ("icloud.and.arrow.down", .cyan)
+        case .encrypting: return ("lock.fill", .orange)
+        case .uploading: return (isVideo ? "video.fill" : "photo.fill",
+                                 isVideo ? Theme.violet : Theme.teal)
+        }
+    }
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -155,9 +167,11 @@ struct UploadRow: View {
                     .animation(.linear(duration: 0.25), value: progress)
             }
             HStack(spacing: 8) {
-                Image(systemName: isVideo ? "video.fill" : "photo.fill")
+                Image(systemName: phaseIcon.name)
                     .font(.system(size: 11))
-                    .foregroundStyle(isVideo ? Theme.violet : Theme.teal)
+                    .foregroundStyle(phaseIcon.color)
+                    .frame(width: 15)
+                    .contentTransition(.symbolEffect(.replace))
                 Text(filename)
                     .font(Theme.mono(12)).foregroundStyle(Theme.textPrimary)
                     .lineLimit(1).truncationMode(.middle)

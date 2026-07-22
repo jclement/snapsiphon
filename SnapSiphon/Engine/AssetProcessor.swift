@@ -11,11 +11,19 @@ struct AssetProcessor {
     let encryptFilenames: Bool
     let tempDir: URL
 
+    /// Where a file currently is in its lane's pipeline (drives the lane UI).
+    enum Phase: Equatable, Sendable {
+        case exporting      // pulling the original (possibly from iCloud)
+        case encrypting
+        case uploading
+    }
+
     struct Result {
         var encryptedBytes: Int64
         var originalBytes: Int64
         var filename: String
         var remoteKey: String
+        var md5Hex: String?
         var alreadyPresent: Bool
     }
 
@@ -23,6 +31,7 @@ struct AssetProcessor {
                  verifyFirst: Bool,
                  bytesPerSecond: Double,
                  onMeta: ((String, Int64) -> Void)? = nil,
+                 onPhase: ((Phase) -> Void)? = nil,
                  progress: @escaping (Double) -> Void) async throws -> Result {
         let token = UUID().uuidString
         let originalURL = tempDir.appendingPathComponent("\(token).orig")
@@ -35,6 +44,7 @@ struct AssetProcessor {
         // 1. Export the untouched original. This is where we learn the real
         //    filename + extension (both key schemes need the extension, so the
         //    key can only be resolved here, not at scan time).
+        onPhase?(.exporting)
         let exported = try await photos.exportOriginal(localIdentifier: record.localIdentifier, to: originalURL)
         onMeta?(exported.filename, exported.byteSize)
 
@@ -47,29 +57,35 @@ struct AssetProcessor {
         //    encrypt + upload, though the export above already happened.
         if verifyFirst, try await client.headObject(key: key) {
             return Result(encryptedBytes: record.byteSize, originalBytes: exported.byteSize,
-                          filename: exported.filename, remoteKey: key, alreadyPresent: true)
+                          filename: exported.filename, remoteKey: key, md5Hex: record.md5,
+                          alreadyPresent: true)
         }
 
         // 3. Encrypt to age, streaming chunk by chunk. We compute the ciphertext's
         //    MD5 in the same pass for the Content-MD5 header (Object-Lock buckets
-        //    require it; a free integrity check everywhere else).
-        let contentMD5 = try Self.encryptFile(at: originalURL, to: encryptedURL, recipients: recipients)
+        //    require it) and keep the hex form for later ETag verification.
+        onPhase?(.encrypting)
+        let digest = try Self.encryptFile(at: originalURL, to: encryptedURL, recipients: recipients)
         let size = (try? FileManager.default.attributesOfItem(atPath: encryptedURL.path)[.size] as? Int64) ?? nil
 
         // 4. Upload the ciphertext (throttled when a speed limit is set).
+        onPhase?(.uploading)
         try await client.putObject(fileURL: encryptedURL, key: key,
                                    contentType: "application/age",
-                                   contentMD5: contentMD5,
+                                   contentMD5: digest.base64EncodedString(),
                                    bytesPerSecond: bytesPerSecond,
                                    progress: progress)
+        let md5Hex = digest.map { String(format: "%02x", $0) }.joined()
         return Result(encryptedBytes: size ?? 0, originalBytes: exported.byteSize,
-                      filename: exported.filename, remoteKey: key, alreadyPresent: false)
+                      filename: exported.filename, remoteKey: key, md5Hex: md5Hex,
+                      alreadyPresent: false)
     }
 
     /// Stream `source` through the age encryptor into `destination`, returning
-    /// the Base64-encoded MD5 of the ciphertext (for the `Content-MD5` header).
+    /// the raw MD5 digest of the ciphertext (base64 it for `Content-MD5`, hex it
+    /// for ETag comparison in verify).
     @discardableResult
-    static func encryptFile(at source: URL, to destination: URL, recipients: [Age.Recipient]) throws -> String {
+    static func encryptFile(at source: URL, to destination: URL, recipients: [Age.Recipient]) throws -> Data {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
         FileManager.default.createFile(atPath: destination.path, contents: nil)
@@ -93,7 +109,7 @@ struct AssetProcessor {
         }
         let tail = try encryptor.finalize()
         if !tail.isEmpty { try output.write(contentsOf: tail); md5.update(data: tail) }
-        return Data(md5.finalize()).base64EncodedString()
+        return Data(md5.finalize())
     }
 
     /// The object name for an asset. Deterministic from the stable local

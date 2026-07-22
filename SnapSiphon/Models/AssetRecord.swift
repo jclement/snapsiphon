@@ -24,6 +24,8 @@ struct AssetRecord: Identifiable, Codable, Equatable {
     var createdAt: Date?
     var uploadedAt: Date?
     var lastError: String?
+    /// Hex MD5 of the encrypted object, kept for ETag verification.
+    var md5: String? = nil
 
     var id: String { localIdentifier }
 

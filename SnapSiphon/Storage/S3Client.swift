@@ -199,11 +199,36 @@ final class S3Client {
         throw S3Error.http(http.statusCode, "")
     }
 
-    // MARK: List (reconcile remote → local index)
+    // MARK: GET (verification downloads)
 
-    /// List object keys under the configured prefix (single page up to 1000).
-    /// Used to reconcile the local index with what's actually in the bucket.
-    func listKeys(continuationToken: String? = nil, now: Date = Date()) async throws -> (keys: [String], next: String?) {
+    /// Download an object to a local file (streamed by URLSession).
+    func getObject(key: String, to destination: URL, now: Date = Date()) async throws {
+        let url = try objectURL(key: key)
+        let signed = signer.sign(method: "GET", url: url, now: now)
+        var request = URLRequest(url: url)
+        for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
+        let (tmp, response) = try await session.download(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let body = (try? String(contentsOf: tmp, encoding: .utf8)) ?? ""
+            try? FileManager.default.removeItem(at: tmp)
+            throw S3Error.http((response as? HTTPURLResponse)?.statusCode ?? -1, body)
+        }
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: tmp, to: destination)
+    }
+
+    // MARK: List (verify / reconcile remote → local index)
+
+    struct RemoteObject {
+        let key: String
+        let size: Int64
+        let etag: String   // MD5 hex for single-part uploads (quotes stripped)
+    }
+
+    /// List objects under the configured prefix with size + ETag (one page,
+    /// up to 1000). This is verification's workhorse: ~10 requests cover a
+    /// 10k-object archive, no per-object HEADs needed.
+    func listObjects(continuationToken: String? = nil, now: Date = Date()) async throws -> (objects: [RemoteObject], next: String?) {
         var components: URLComponents
         if config.provider.usesPathStyle {
             components = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
@@ -232,7 +257,7 @@ final class S3Client {
 
     /// Best-effort connectivity check: list a single page.
     func testConnection() async throws {
-        _ = try await listKeys()
+        _ = try await listObjects()
     }
 
     private static func validate(response: URLResponse, data: Data) throws {
@@ -267,37 +292,44 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
 
 /// Streaming XML parser for the subset of ListBucketResult we care about.
 private final class ListBucketParser: NSObject, XMLParserDelegate {
-    private var keys: [String] = []
+    private var objects: [S3Client.RemoteObject] = []
     private var next: String?
     private var current = ""
     private var currentKey = ""
+    private var currentSize: Int64 = 0
+    private var currentETag = ""
     private var inContents = false
 
-    func parse(_ data: Data) -> (keys: [String], next: String?) {
+    func parse(_ data: Data) -> (objects: [S3Client.RemoteObject], next: String?) {
         let parser = XMLParser(data: data)
         parser.delegate = self
         parser.parse()
-        return (keys, next)
+        return (objects, next)
     }
 
     func parser(_ parser: XMLParser, didStartElement elementName: String,
                 namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String] = [:]) {
         current = ""
-        if elementName == "Contents" { inContents = true; currentKey = "" }
+        if elementName == "Contents" { inContents = true; currentKey = ""; currentSize = 0; currentETag = "" }
     }
 
     func parser(_ parser: XMLParser, foundCharacters string: String) { current += string }
 
     func parser(_ parser: XMLParser, didEndElement elementName: String,
                 namespaceURI: String?, qualifiedName qName: String?) {
+        let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
         switch elementName {
-        case "Key" where inContents:
-            currentKey = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        case "Key" where inContents: currentKey = trimmed
+        case "Size" where inContents: currentSize = Int64(trimmed) ?? 0
+        case "ETag" where inContents:
+            currentETag = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "\"")).lowercased()
         case "Contents":
-            if !currentKey.isEmpty { keys.append(currentKey) }
+            if !currentKey.isEmpty {
+                objects.append(.init(key: currentKey, size: currentSize, etag: currentETag))
+            }
             inContents = false
         case "NextContinuationToken":
-            next = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            next = trimmed
         default:
             break
         }

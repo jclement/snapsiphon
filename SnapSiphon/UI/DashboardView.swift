@@ -173,7 +173,7 @@ struct DashboardView: View {
             ForEach(Array(lanes.enumerated()), id: \.offset) { _, slot in
                 if let slot {
                     UploadRow(filename: slot.filename, byteSize: slot.byteSize,
-                              progress: slot.progress, isVideo: slot.isVideo)
+                              progress: slot.progress, isVideo: slot.isVideo, phase: slot.phase)
                 } else {
                     UploadRow(filename: "idle", byteSize: 0, progress: 0, isVideo: false)
                         .opacity(0.35)

@@ -41,6 +41,7 @@ final class BackupEngine: ObservableObject {
         var progress: Double
         var byteSize: Int64       // original media size
         var isVideo: Bool
+        var phase: AssetProcessor.Phase = .exporting
     }
     @Published private(set) var bytesPerSecond: Double = 0
     @Published private(set) var sessionUploaded: Int = 0
@@ -132,9 +133,9 @@ final class BackupEngine: ObservableObject {
         if mode == "uploading" {
             phase = .running
             uploadLanes = [
-                UploadSlot(id: "1", filename: "IMG_4821.HEIC", progress: 0.62, byteSize: 4_200_000, isVideo: false),
-                UploadSlot(id: "2", filename: "IMG_4822.MOV", progress: 0.28, byteSize: 214_000_000, isVideo: true),
-                UploadSlot(id: "3", filename: "IMG_4823.HEIC", progress: 0.91, byteSize: 3_900_000, isVideo: false),
+                UploadSlot(id: "1", filename: "IMG_4821.HEIC", progress: 0.62, byteSize: 4_200_000, isVideo: false, phase: .uploading),
+                UploadSlot(id: "2", filename: "IMG_4822.MOV", progress: 0.28, byteSize: 214_000_000, isVideo: true, phase: .encrypting),
+                UploadSlot(id: "3", filename: "IMG_4823.HEIC", progress: 0, byteSize: 3_900_000, isVideo: false, phase: .exporting),
             ]
             sessionUploaded = 143
             sessionBytes = 2_410_000_000
@@ -149,6 +150,11 @@ final class BackupEngine: ObservableObject {
     var isConfigured: Bool {
         if demoMode { return true }
         return keyManager.isConfigured && s3Config.isComplete && S3CredentialStore.hasCredentials
+    }
+
+    /// The clamped parallel-upload setting (read live by the run loop).
+    var workerTarget: Int {
+        max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
     }
 
     /// Rough estimate of seconds remaining for the current run, from the average
@@ -456,6 +462,7 @@ final class BackupEngine: ObservableObject {
             let data = try JSONEncoder().encode(manifest)
             try data.write(to: jsonURL)
             let md5 = try AssetProcessor.encryptFile(at: jsonURL, to: encURL, recipients: recipients)
+                .base64EncodedString()
             // Unique, write-once key: never overwrites (Object-Lock safe), and old
             // manifests expire under the same lifecycle rule while the newest stays
             // fresh. Restore lists `manifests/` and takes the last one.
@@ -484,6 +491,74 @@ final class BackupEngine: ObservableObject {
         }
         return RestoreScript.build(config: s3Config, credentials: creds,
                                    ageSecret: keyManager.exportSecret())
+    }
+
+    // MARK: Verification
+
+    @Published private(set) var verifying = false
+    @Published private(set) var verifyStatus: String?
+
+    /// Egress-free backup verification: pages ListObjectsV2 over the prefix
+    /// (~10 requests per 10k objects, zero downloads) and checks every uploaded
+    /// record exists remotely with the expected size and — because B2's ETag for
+    /// single-part uploads IS the object's MD5, which we store at upload — the
+    /// expected checksum. Missing/mismatched files are re-queued for upload.
+    func verifyBackups() async {
+        guard !verifying, !phase.isActive else { return }
+        guard let index, let client = makeClient() else {
+            verifyStatus = "✗ Storage not configured"
+            return
+        }
+        verifying = true
+        defer { verifying = false }
+        do {
+            var remote: [String: (size: Int64, etag: String)] = [:]
+            var token: String? = nil
+            repeat {
+                let page = try await client.listObjects(continuationToken: token)
+                for o in page.objects { remote[o.key] = (o.size, o.etag) }
+                token = page.next
+                verifyStatus = "Listing bucket… \(Format.count(remote.count)) objects"
+            } while token != nil
+
+            let uploaded = index.allUploaded()
+            var ok = 0, missing = 0, mismatched = 0
+            var matchedKeys = Set<String>()
+            for r in uploaded where !r.remoteKey.isEmpty {
+                guard let obj = remote[r.remoteKey] else {
+                    missing += 1
+                    index.requeue(r.localIdentifier, reason: "Verify: missing from bucket")
+                    continue
+                }
+                matchedKeys.insert(r.remoteKey)
+                if r.byteSize > 0 && obj.size != r.byteSize {
+                    mismatched += 1
+                    index.requeue(r.localIdentifier, reason: "Verify: size mismatch")
+                } else if let md5 = r.md5, !obj.etag.isEmpty, obj.etag != md5 {
+                    mismatched += 1
+                    index.requeue(r.localIdentifier, reason: "Verify: checksum mismatch")
+                } else {
+                    ok += 1
+                }
+            }
+            let manifestPrefix = client.fullKey(for: "manifests/")
+            let orphans = remote.keys.filter { !matchedKeys.contains($0) && !$0.hasPrefix(manifestPrefix) }.count
+
+            refreshCounts()
+            if missing == 0 && mismatched == 0 {
+                verifyStatus = "✓ \(Format.count(ok)) backups verified — all present, sizes & checksums match"
+                appendLog("Verify: all \(Format.count(ok)) backups check out.", .success)
+            } else {
+                verifyStatus = "⚠ \(Format.count(ok)) ok · \(missing) missing · \(mismatched) mismatched — re-queued"
+                appendLog("Verify: \(missing) missing, \(mismatched) mismatched — re-queued for upload.", .warning)
+            }
+            if orphans > 0 {
+                appendLog("Verify: \(orphans) untracked object\(orphans == 1 ? "" : "s") in the bucket (tombstoned, older key scheme, or another device).", .info)
+            }
+        } catch {
+            verifyStatus = "✗ \(error.localizedDescription)"
+            appendLog("Verify failed: \(error.localizedDescription)", .error)
+        }
     }
 
     // MARK: Backup run
@@ -577,10 +652,12 @@ final class BackupEngine: ObservableObject {
         }
     }
 
-    private func updateSlot(_ id: String, filename: String? = nil, byteSize: Int64? = nil, progress: Double? = nil) {
+    private func updateSlot(_ id: String, filename: String? = nil, byteSize: Int64? = nil,
+                            phase: AssetProcessor.Phase? = nil, progress: Double? = nil) {
         guard let i = uploadLanes.firstIndex(where: { $0?.id == id }) else { return }
         if let filename { uploadLanes[i]?.filename = filename }
         if let byteSize { uploadLanes[i]?.byteSize = byteSize }
+        if let phase { uploadLanes[i]?.phase = phase }
         if let progress, let slot = uploadLanes[i] {
             // Feed the throughput meter from byte-level progress, not file
             // completions — a single long video used to starve the 5s window
@@ -597,6 +674,12 @@ final class BackupEngine: ObservableObject {
     private func endSlot(_ id: String) {
         // Free the lane (keep the row) so the next file reuses this position.
         if let i = uploadLanes.firstIndex(where: { $0?.id == id }) { uploadLanes[i] = nil }
+        // If the worker slider was lowered mid-run, let excess lanes drain away:
+        // trailing idle rows disappear as their files finish (never mid-upload).
+        let target = max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
+        while uploadLanes.count > target, let last = uploadLanes.last, last == nil {
+            uploadLanes.removeLast()
+        }
     }
 
     private func runLoop(processor: AssetProcessor) async {
@@ -604,7 +687,10 @@ final class BackupEngine: ObservableObject {
         // Convert the MB/s knob to bytes/s once per run (0 = unlimited).
         let bytesPerSecond = settings.speedLimitMBps * 1_000_000
         let verifyFirst = settings.verifyRemoteBeforeUpload
-        let concurrency = max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
+        // Live worker count: refreshed at every refill, so moving the slider
+        // mid-run takes effect as files finish — more lanes spawn up to the new
+        // target, or excess lanes drain away.
+        let initialTarget = workerTarget
 
         if await !waitForFavorableConditions() { return }
 
@@ -616,9 +702,11 @@ final class BackupEngine: ObservableObject {
         var attempted = Set<String>()   // one try per record per run; failures wait for the next run
 
         await withTaskGroup(of: String.self) { group in
+            var target = initialTarget
+
             @discardableResult
             func spawnNext() -> Bool {
-                let candidates = index.pendingRecords(limit: concurrency * 2 + attempted.count)
+                let candidates = index.pendingRecords(limit: target * 2 + attempted.count)
                 guard let record = candidates.first(where: {
                     !inFlight.contains($0.localIdentifier) && !attempted.contains($0.localIdentifier)
                 }) else { return false }
@@ -632,12 +720,14 @@ final class BackupEngine: ObservableObject {
                 return true
             }
 
-            for _ in 0..<concurrency { if !spawnNext() { break } }
+            while inFlight.count < target, spawnNext() {}
             while let finished = await group.next() {
                 inFlight.remove(finished)
                 if Task.isCancelled { continue }                      // drain without refilling
                 if await !waitForFavorableConditions() { continue }   // park refills; in-flight uploads run on
-                spawnNext()
+                // Top up to the (possibly changed) worker target.
+                target = await self.workerTarget
+                while inFlight.count < target, spawnNext() {}
             }
         }
         refreshCounts()
@@ -678,16 +768,20 @@ final class BackupEngine: ObservableObject {
                 onMeta: { filename, size in
                     Task { @MainActor in self.updateSlot(rid, filename: filename, byteSize: size) }
                 },
+                onPhase: { phase in
+                    Task { @MainActor in self.updateSlot(rid, phase: phase) }
+                },
                 progress: { p in
                     Task { @MainActor in self.updateSlot(rid, progress: p) }
                 })
 
-            // Persist the metadata we learned at upload time (filename/size/key).
+            // Persist the metadata we learned at upload time (filename/size/key/md5).
             uploaded.state = .uploaded
             uploaded.filename = result.filename
             uploaded.remoteKey = result.remoteKey
             uploaded.byteSize = result.encryptedBytes
             uploaded.uploadedAt = Date()
+            uploaded.md5 = result.md5Hex
             index.upsert(uploaded)
 
             endSlot(rid)

@@ -39,7 +39,7 @@ struct SettingsView: View {
 
                     knobGroup("Speed & concurrency") {
                         SliderRow(title: "Parallel uploads",
-                                  subtitle: "How many files travel at once.",
+                                  subtitle: "How many files travel at once. Changes apply live as files finish.",
                                   value: Binding(
                                     get: { Double(engine.settings.parallelUploads) },
                                     set: { engine.settings.parallelUploads = Int($0) }),
@@ -134,6 +134,35 @@ struct SettingsView: View {
                             Text(manifestStatus)
                                 .font(Theme.mono(12))
                                 .foregroundStyle(manifestStatus.hasPrefix("✓") ? .green : .red)
+                        }
+                    }
+
+                    knobGroup("Verify backups") {
+                        Button {
+                            Task { await engine.verifyBackups() }
+                        } label: {
+                            HStack {
+                                if engine.verifying {
+                                    ProgressView().tint(Theme.teal)
+                                } else {
+                                    Image(systemName: "checkmark.shield")
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(engine.verifying ? "Verifying…" : "Verify all backups")
+                                        .font(Theme.rounded(16, weight: .medium))
+                                    Text("Egress-free: lists the bucket and checks every file exists with the right size and checksum (stored MD5 vs ETag). Anything missing is re-queued.")
+                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                                }
+                                Spacer()
+                            }
+                            .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
+                        }
+                        .disabled(!engine.isConfigured || engine.phase.isActive || engine.verifying)
+                        if let status = engine.verifyStatus {
+                            Text(status)
+                                .font(Theme.mono(12))
+                                .foregroundStyle(status.hasPrefix("✓") ? .green
+                                                 : status.hasPrefix("✗") ? .red : Theme.textSecondary)
                         }
                     }
 

@@ -31,6 +31,7 @@ final class BackupIndex {
         // Migration: tombstone timestamp for delete grace-period logic. Harmless
         // duplicate-column error on already-migrated DBs (exec ignores it).
         db.exec("ALTER TABLE assets ADD COLUMN deletedAt REAL;")
+        db.exec("ALTER TABLE assets ADD COLUMN md5 TEXT;")
         // Crash recovery: anything mid-flight when the process died goes back to
         // pending, so the next run retries it (deterministic keys mean a re-upload
         // just overwrites the same object — no duplicates).
@@ -43,12 +44,12 @@ final class BackupIndex {
         queue.sync {
             db.exec("""
                 INSERT INTO assets
-                    (localIdentifier, remoteKey, state, mediaType, filename, byteSize, createdAt, uploadedAt, lastError)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (localIdentifier, remoteKey, state, mediaType, filename, byteSize, createdAt, uploadedAt, lastError, md5)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(localIdentifier) DO UPDATE SET
                     remoteKey=excluded.remoteKey, state=excluded.state, mediaType=excluded.mediaType,
                     filename=excluded.filename, byteSize=excluded.byteSize, createdAt=excluded.createdAt,
-                    uploadedAt=excluded.uploadedAt, lastError=excluded.lastError;
+                    uploadedAt=excluded.uploadedAt, lastError=excluded.lastError, md5=excluded.md5;
                 """,
                 [
                     .text(record.localIdentifier),
@@ -60,6 +61,7 @@ final class BackupIndex {
                     .date(record.createdAt),
                     .date(record.uploadedAt),
                     .optText(record.lastError),
+                    .optText(record.md5),
                 ])
         }
     }
@@ -131,6 +133,24 @@ final class BackupIndex {
     func allUploaded() -> [AssetRecord] {
         queue.sync {
             (try? db.query("SELECT * FROM assets WHERE state='uploaded' ORDER BY uploadedAt;", [], Self.mapRow)) ?? []
+        }
+    }
+
+    /// A random sample of uploaded records, for spot-check verification.
+    func randomUploaded(limit: Int) -> [AssetRecord] {
+        queue.sync {
+            (try? db.query(
+                "SELECT * FROM assets WHERE state='uploaded' ORDER BY RANDOM() LIMIT ?;",
+                [.int(Int64(limit))], Self.mapRow)) ?? []
+        }
+    }
+
+    /// Send a record back to the upload queue (verification found it missing or
+    /// mismatched in the bucket — a re-upload heals it).
+    func requeue(_ localIdentifier: String, reason: String) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='pending', lastError=? WHERE localIdentifier=?;",
+                    [.text(reason), .text(localIdentifier)])
         }
     }
 
@@ -230,6 +250,7 @@ final class BackupIndex {
             byteSize: r.int64(5),
             createdAt: r.dateOrNil(6),
             uploadedAt: r.dateOrNil(7),
-            lastError: r.textOrNil(8))
+            lastError: r.textOrNil(8),
+            md5: r.textOrNil(10))   // col 9 = deletedAt, col 10 = md5 (migration order)
     }
 }
