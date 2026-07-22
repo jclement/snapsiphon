@@ -79,10 +79,17 @@ struct AssetProcessor {
         var md5 = Insecure.MD5()
         let encryptor = try Age.Encryptor(recipients: recipients)
         while true {
-            let chunk = try input.read(upToCount: Age.chunkSize) ?? Data()
-            if chunk.isEmpty { break }
-            let out = try encryptor.update(chunk)
-            if !out.isEmpty { try output.write(contentsOf: out); md5.update(data: out) }
+            // autoreleasepool is essential: FileHandle.read returns autoreleased
+            // buffers that otherwise pile up for the whole file — on a multi-GB
+            // video that ballooned resident memory until iOS jetsam-killed us.
+            let done = try autoreleasepool { () -> Bool in
+                let chunk = try input.read(upToCount: Age.chunkSize) ?? Data()
+                if chunk.isEmpty { return true }
+                let out = try encryptor.update(chunk)
+                if !out.isEmpty { try output.write(contentsOf: out); md5.update(data: out) }
+                return false
+            }
+            if done { break }
         }
         let tail = try encryptor.finalize()
         if !tail.isEmpty { try output.write(contentsOf: tail); md5.update(data: tail) }

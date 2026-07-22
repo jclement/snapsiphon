@@ -242,9 +242,13 @@ final class S3Client {
     }
 }
 
-/// Reports byte-level upload progress from `URLSession`.
+/// Reports byte-level upload progress from `URLSession`, coalesced to ≥1%
+/// steps. Uncoalesced, this fires hundreds of times/sec per stream and each
+/// call hops to the main actor to mutate published state — enough sustained
+/// main-thread churn to starve the UI (and trip the watchdog) on long runs.
 private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
     let progress: ((Double) -> Void)?
+    private var lastReported: Double = -1
     init(progress: ((Double) -> Void)?) { self.progress = progress }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -252,7 +256,11 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
                     totalBytesSent: Int64,
                     totalBytesExpectedToSend: Int64) {
         guard totalBytesExpectedToSend > 0 else { return }
-        progress?(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+        let p = Double(totalBytesSent) / Double(totalBytesExpectedToSend)
+        if p - lastReported >= 0.01 || p >= 1 {
+            lastReported = p
+            progress?(p)
+        }
     }
 }
 

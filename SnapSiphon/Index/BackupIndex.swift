@@ -31,6 +31,10 @@ final class BackupIndex {
         // Migration: tombstone timestamp for delete grace-period logic. Harmless
         // duplicate-column error on already-migrated DBs (exec ignores it).
         db.exec("ALTER TABLE assets ADD COLUMN deletedAt REAL;")
+        // Crash recovery: anything mid-flight when the process died goes back to
+        // pending, so the next run retries it (deterministic keys mean a re-upload
+        // just overwrites the same object — no duplicates).
+        db.exec("UPDATE assets SET state='pending' WHERE state='uploading';")
 
         // Load or seed the Bloom filter.
         if let data = try? Data(contentsOf: bloomURL),

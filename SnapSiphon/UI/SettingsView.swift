@@ -5,6 +5,7 @@ struct SettingsView: View {
     // Observe directly so the recipient count refreshes the moment a key is
     // added/removed (SettingsView otherwise only observes `engine`).
     @ObservedObject private var keyManager = AgeKeyManager.shared
+    @State private var showRestoreScriptWarning = false
 
     var body: some View {
         NavigationStack {
@@ -105,6 +106,22 @@ struct SettingsView: View {
                         .disabled(!engine.isConfigured || engine.phase.isActive)
                     }
 
+                    knobGroup("Disaster recovery") {
+                        Button { showRestoreScriptWarning = true } label: {
+                            HStack {
+                                Image(systemName: "cross.case.fill")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Copy restore script").font(Theme.rounded(16, weight: .medium))
+                                    Text("A single Python file with your bucket credentials\(keyManager.hasIdentity ? " and age secret" : "") baked in — run it on a laptop to rebuild the whole archive. Store it like a password.")
+                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                                }
+                                Spacer()
+                            }
+                            .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
+                        }
+                        .disabled(!engine.isConfigured)
+                    }
+
                     knobGroup("Scanning") {
                         ToggleRow(title: "Fast scan",
                                   subtitle: "Only check photos newer than the last scan. Much faster on big libraries.",
@@ -149,6 +166,17 @@ struct SettingsView: View {
             }
             .background(Theme.canvas.ignoresSafeArea())
             .navigationBarHidden(true)
+            .confirmationDialog("Copy restore script?", isPresented: $showRestoreScriptWarning,
+                                titleVisibility: .visible) {
+                Button("Copy to clipboard", role: .destructive) {
+                    if let script = engine.buildRestoreScript() {
+                        UIPasteboard.general.string = script
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The script contains your bucket credentials\(keyManager.hasIdentity ? " AND your age secret key" : "") in plaintext. Anyone holding it can read your entire archive. Paste it straight into a password manager or an encrypted note.")
+            }
         }
     }
 

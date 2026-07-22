@@ -88,6 +88,12 @@ final class BackupEngine: ObservableObject {
         self.s3Config = S3Config.load()
         self.tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("snapsiphon-work", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        // Sweep temp leftovers from a previous crash/kill so they can't
+        // accumulate and eat disk (each dead run could strand up to
+        // 2×parallelism part-written files here).
+        if let leftovers = try? FileManager.default.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil) {
+            for f in leftovers { try? FileManager.default.removeItem(at: f) }
+        }
         openIndex()
         refreshCounts()
         #if DEBUG
@@ -457,6 +463,15 @@ final class BackupEngine: ObservableObject {
             appendLog("Manifest write failed: \(error.localizedDescription)", .error)
             return .failure(error)
         }
+    }
+
+    /// Build the break-glass restore script (bucket creds + age secret baked in).
+    /// Nil until storage is configured. If no on-device identity exists, the
+    /// script carries a placeholder the user must fill with their secret key.
+    func buildRestoreScript() -> String? {
+        guard s3Config.isComplete, let creds = S3CredentialStore.load() else { return nil }
+        return RestoreScript.build(config: s3Config, credentials: creds,
+                                   ageSecret: keyManager.exportSecret())
     }
 
     // MARK: Backup run
