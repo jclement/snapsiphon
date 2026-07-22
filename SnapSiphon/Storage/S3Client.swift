@@ -266,6 +266,46 @@ final class S3Client {
             throw S3Error.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
     }
+
+    // MARK: Transient-error retries
+
+    /// B2 (and S3 generally) documents 5xx/429 as transient — "InternalError"
+    /// incidents are expected to resolve on retry with backoff. Auth/config
+    /// errors (4xx) and cancellation are NOT retryable.
+    static func isTransient(_ error: Error) -> Bool {
+        if case S3Error.http(let code, _) = error {
+            return code == 429 || (500...599).contains(code)
+        }
+        if let url = error as? URLError {
+            switch url.code {
+            case .timedOut, .networkConnectionLost, .cannotConnectToHost,
+                 .notConnectedToInternet, .dnsLookupFailed, .secureConnectionFailed:
+                return true
+            default:
+                return false
+            }
+        }
+        return false
+    }
+
+    /// Run an operation up to `attempts` times, with exponential backoff and
+    /// jitter between transient failures (~1s, ~3s). Cancellation propagates
+    /// immediately — the backoff sleep throws on cancel, so pause stays snappy.
+    static func withRetries<T>(attempts: Int = 3,
+                               onRetry: ((Int, Error) -> Void)? = nil,
+                               _ operation: () async throws -> T) async throws -> T {
+        for attempt in 1...attempts {
+            do {
+                return try await operation()
+            } catch {
+                guard attempt < attempts, isTransient(error) else { throw error }
+                onRetry?(attempt, error)
+                let backoff = pow(3.0, Double(attempt - 1)) * Double.random(in: 0.8...1.4)
+                try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+            }
+        }
+        fatalError("unreachable")
+    }
 }
 
 /// Reports byte-level upload progress from `URLSession`, coalesced to ≥1%

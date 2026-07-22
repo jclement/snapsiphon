@@ -331,6 +331,15 @@ final class BackupEngine: ObservableObject {
 
     // MARK: Fast-scan high-water mark
 
+    /// True whenever the archive's contents have changed since the last
+    /// *successful* manifest write. Persisted, so a failed write (or a kill
+    /// mid-run) is retried at the end of the next run even if that run
+    /// uploads nothing.
+    private var manifestDirty: Bool {
+        get { UserDefaults.standard.bool(forKey: "SnapSiphon.manifestDirty") }
+        set { UserDefaults.standard.set(newValue, forKey: "SnapSiphon.manifestDirty") }
+    }
+
     private static let manifestStampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -387,6 +396,7 @@ final class BackupEngine: ObservableObject {
         }
 
         if resurrected > 0 || !orphans.isEmpty {
+            manifestDirty = true
             refreshCounts()
             if settings.keepBucketManifest { await writeManifest() }
         }
@@ -420,6 +430,7 @@ final class BackupEngine: ObservableObject {
             }
         }
         if freed > 0 {
+            manifestDirty = true
             appendLog("Freed \(freed) deleted backup\(freed == 1 ? "" : "s") from the bucket.", .info)
             if settings.keepBucketManifest { await writeManifest() }
         }
@@ -469,8 +480,11 @@ final class BackupEngine: ObservableObject {
             let stamp = Self.manifestStampFormatter.string(from: Date())
             let key = client.fullKey(for: "manifests/manifest-\(stamp).age")
             let encBytes = (try? FileManager.default.attributesOfItem(atPath: encURL.path)[.size] as? Int64) ?? nil
-            try await client.putObject(fileURL: encURL, key: key,
-                                       contentType: "application/age", contentMD5: md5)
+            try await S3Client.withRetries {
+                try await client.putObject(fileURL: encURL, key: key,
+                                           contentType: "application/age", contentMD5: md5)
+            }
+            manifestDirty = false
             appendLog("Wrote encrypted manifest — \(items.count) item\(items.count == 1 ? "" : "s"), \(Format.bytes(encBytes ?? 0)) → \(key).", .success)
             return .success((items.count, encBytes ?? 0))
         } catch {
@@ -545,6 +559,7 @@ final class BackupEngine: ObservableObject {
             let orphans = remote.keys.filter { !matchedKeys.contains($0) && !$0.hasPrefix(manifestPrefix) }.count
 
             refreshCounts()
+            if missing > 0 || mismatched > 0 { manifestDirty = true }   // uploaded set changed
             if missing == 0 && mismatched == 0 {
                 verifyStatus = "✓ \(Format.count(ok)) backups verified — all present, sizes & checksums match"
                 appendLog("Verify: all \(Format.count(ok)) backups check out.", .success)
@@ -630,8 +645,10 @@ final class BackupEngine: ObservableObject {
             phase = .finished
             appendLog("Backup finished — \(sessionUploaded) uploaded this session.", .success)
         }
-        // Refresh the bucket manifest if this run actually uploaded anything.
-        if settings.keepBucketManifest && sessionUploaded > 0 {
+        // Refresh the bucket manifest whenever the archive has changed since the
+        // last successful write — covering uploads from THIS run, but also a
+        // previous run whose manifest write failed or was cut short.
+        if settings.keepBucketManifest && manifestDirty {
             Task { await writeManifest() }
         }
     }
@@ -771,6 +788,12 @@ final class BackupEngine: ObservableObject {
                 onPhase: { phase in
                     Task { @MainActor in self.updateSlot(rid, phase: phase) }
                 },
+                onRetry: { attempt, error in
+                    Task { @MainActor in
+                        let name = record.filename.isEmpty ? "Upload" : record.filename
+                        self.appendLog("\(name): transient storage error — retry \(attempt + 1)/3…", .warning)
+                    }
+                },
                 progress: { p in
                     Task { @MainActor in self.updateSlot(rid, progress: p) }
                 })
@@ -783,6 +806,7 @@ final class BackupEngine: ObservableObject {
             uploaded.uploadedAt = Date()
             uploaded.md5 = result.md5Hex
             index.upsert(uploaded)
+            manifestDirty = true
 
             endSlot(rid)
             sessionUploaded += 1

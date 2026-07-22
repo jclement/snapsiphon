@@ -32,6 +32,7 @@ struct AssetProcessor {
                  bytesPerSecond: Double,
                  onMeta: ((String, Int64) -> Void)? = nil,
                  onPhase: ((Phase) -> Void)? = nil,
+                 onRetry: ((Int, Swift.Error) -> Void)? = nil,
                  progress: @escaping (Double) -> Void) async throws -> Result {
         let token = UUID().uuidString
         let originalURL = tempDir.appendingPathComponent("\(token).orig")
@@ -55,7 +56,7 @@ struct AssetProcessor {
 
         // 2. Optionally skip if already present — this still saves the (large)
         //    encrypt + upload, though the export above already happened.
-        if verifyFirst, try await client.headObject(key: key) {
+        if verifyFirst, try await S3Client.withRetries(onRetry: onRetry, { try await client.headObject(key: key) }) {
             return Result(encryptedBytes: record.byteSize, originalBytes: exported.byteSize,
                           filename: exported.filename, remoteKey: key, md5Hex: record.md5,
                           alreadyPresent: true)
@@ -69,12 +70,17 @@ struct AssetProcessor {
         let size = (try? FileManager.default.attributesOfItem(atPath: encryptedURL.path)[.size] as? Int64) ?? nil
 
         // 4. Upload the ciphertext (throttled when a speed limit is set).
+        //    Retried on transient errors (B2's 5xx "InternalError" incidents are
+        //    documented as retry-with-backoff) — the encrypted temp is already on
+        //    disk, so a retry costs no re-export or re-encrypt.
         onPhase?(.uploading)
-        try await client.putObject(fileURL: encryptedURL, key: key,
-                                   contentType: "application/age",
-                                   contentMD5: digest.base64EncodedString(),
-                                   bytesPerSecond: bytesPerSecond,
-                                   progress: progress)
+        try await S3Client.withRetries(onRetry: onRetry) {
+            try await client.putObject(fileURL: encryptedURL, key: key,
+                                       contentType: "application/age",
+                                       contentMD5: digest.base64EncodedString(),
+                                       bytesPerSecond: bytesPerSecond,
+                                       progress: progress)
+        }
         let md5Hex = digest.map { String(format: "%02x", $0) }.joined()
         return Result(encryptedBytes: size ?? 0, originalBytes: exported.byteSize,
                       filename: exported.filename, remoteKey: key, md5Hex: md5Hex,
