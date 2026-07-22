@@ -50,6 +50,8 @@ final class BackupEngine: ObservableObject {
     @Published private(set) var log: [LogEntry] = []
     /// Number of library assets examined so far during a scan (for live feedback).
     @Published private(set) var scanChecked: Int = 0
+    /// Result of the last completed scan (shown at the Deep-scan button).
+    @Published private(set) var scanStatus: String?
     /// Library totals by type (denominator) and uploaded-by-type (numerator) for
     /// the photos/videos ring.
     @Published private(set) var libraryPhotos = 0
@@ -287,7 +289,7 @@ final class BackupEngine: ObservableObject {
 
         // Enumerate AND index off the main actor so the UI stays live and we can
         // report progress as we go.
-        let outcome: (added: Int, newest: Date?) = await Task.detached(priority: .utility) {
+        let outcome: (added: Int, newest: Date?, checked: Int) = await Task.detached(priority: .utility) {
             let infos = photos.enumerate(includePhotos: includePhotos, includeVideos: includeVideos, since: since)
             var added = 0
             var newest = startMark
@@ -311,7 +313,7 @@ final class BackupEngine: ObservableObject {
                     lastError: nil))
                 added += 1
             }
-            return (added, newest)
+            return (added, newest, infos.count)
         }.value
 
         let added = outcome.added
@@ -321,6 +323,11 @@ final class BackupEngine: ObservableObject {
 
         refreshCounts()
         await refreshLibraryCounts()
+        // An explicit result — especially for deep scans, where "found nothing
+        // new" is the common case and used to be indistinguishable from a no-op.
+        scanStatus = added == 0
+            ? "✓ \(deep ? "Deep scan" : "Scan") checked \(Format.count(outcome.checked)) item\(outcome.checked == 1 ? "" : "s") — nothing new, everything already indexed"
+            : "✓ \(deep ? "Deep scan" : "Scan") checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
         appendLog("Scan complete — \(added) new item\(added == 1 ? "" : "s") queued.", .success)
 
         if settings.propagateDeletes {

@@ -191,9 +191,17 @@ struct SettingsView: View {
                             Task { await engine.deepScan() }
                         } label: {
                             HStack {
-                                Image(systemName: "arrow.triangle.2.circlepath")
+                                if engine.phase == .scanning {
+                                    ProgressView().tint(Theme.teal)
+                                } else {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                }
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Deep scan").font(Theme.rounded(16, weight: .medium))
+                                    Text(engine.phase == .scanning
+                                         ? "Scanning… \(Format.count(engine.scanChecked)) checked"
+                                         : "Deep scan")
+                                        .font(Theme.rounded(16, weight: .medium))
+                                        .contentTransition(.numericText())
                                     Text("Re-check the entire library, ignoring the fast-scan mark. Use after importing older photos.")
                                         .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                                 }
@@ -202,6 +210,11 @@ struct SettingsView: View {
                             .foregroundStyle(Theme.teal)
                         }
                         .disabled(engine.phase.isActive)
+                        if let status = engine.scanStatus, engine.phase != .scanning {
+                            Text(status)
+                                .font(Theme.mono(12))
+                                .foregroundStyle(.green)
+                        }
                     }
 
                     knobGroup("Maintenance") {
