@@ -117,12 +117,15 @@ struct SettingsView: View {
                     }
 
                     knobGroup("Deletions") {
-                        ToggleRow(title: "Mirror deletions",
-                                  subtitle: "Off = pure archive; deleting here never touches the bucket. On = a deleted photo is marked deleted in the encrypted manifest immediately (restores skip it), and its blob is physically freed only after the grace period below.",
+                        Text("Photos you delete on-device are always marked deleted in the encrypted manifest, so restores skip them (a disaster restore can still recover un-purged ones with --all).")
+                            .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                        Divider().overlay(Theme.hairline)
+                        ToggleRow(title: "Purge deleted backups",
+                                  subtitle: "Also free the storage: best-effort removal of deleted photos' blobs after the grace period. Off = blobs are kept forever (marked only).",
                                   isOn: $engine.settings.propagateDeletes)
                         if engine.settings.propagateDeletes {
                             Divider().overlay(Theme.hairline)
-                            SliderRow(title: "Delete grace period",
+                            SliderRow(title: "Purge grace period",
                                       subtitle: "Accident window: erase iCloud by mistake and get it back within this many days → nothing is purged.",
                                       value: Binding(
                                         get: { Double(engine.settings.deleteGraceDays) },
@@ -131,7 +134,7 @@ struct SettingsView: View {
                             HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: "info.circle.fill")
                                     .foregroundStyle(Theme.teal).font(.system(size: 13))
-                                Text("Photos are freed only after the grace period AND once Object Lock retention expires, whichever is longer. A bulk mistake can't wipe recent backups.")
+                                Text("Blobs are freed only after the grace period AND once Object Lock retention expires, whichever is longer. Photos that reappear are un-marked automatically. A purged blob also drops out of the manifest.")
                                     .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                             }
                             .padding(10)

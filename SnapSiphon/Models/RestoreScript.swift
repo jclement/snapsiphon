@@ -23,6 +23,8 @@ Downloads every backed-up photo/video from the bucket, decrypts it with age,
 and renames it back to its original filename using the encrypted manifest.
 
     python3 restore.py [output-dir]      # default: ./SnapSiphonRestore
+    python3 restore.py --all             # ALSO restore deleted-but-unpurged items
+                                         # (disaster mode, e.g. after a library wipe)
 
 Requires: python3 (stdlib only) and the `age` CLI (https://age-encryption.org).
 ⚠️  This file contains live bucket credentials and an age secret key.
@@ -92,7 +94,10 @@ def age_decrypt(src, dest, identity):
     subprocess.run(["age", "-d", "-i", identity, "-o", str(dest), str(src)], check=True)
 
 def main():
-    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "SnapSiphonRestore")
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    restore_all = "--all" in flags
+    out = pathlib.Path(args[0] if args else "SnapSiphonRestore")
     out.mkdir(parents=True, exist_ok=True)
     if not shutil.which("age"):
         sys.exit("The `age` CLI is required (brew install age / apt install age).")
@@ -117,8 +122,12 @@ def main():
         manifest = json.loads(mjson.read_text())
 
         deleted = set(manifest.get("deletedKeys", []))
-        items = [i for i in manifest["items"] if i["key"] not in deleted]
-        print(f"{len(items)} items to restore ({len(deleted)} tombstoned, skipped)")
+        if restore_all:
+            items = manifest["items"] + manifest.get("deleted", [])
+            print(f"{len(items)} items to restore (--all: including {len(deleted)} deleted-but-unpurged)")
+        else:
+            items = [i for i in manifest["items"] if i["key"] not in deleted]
+            print(f"{len(items)} items to restore ({len(deleted)} deleted, skipped — rerun with --all to include)")
 
         used, done, failed = {}, 0, 0
         for i, item in enumerate(items, 1):

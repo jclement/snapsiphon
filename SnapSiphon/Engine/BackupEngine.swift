@@ -357,9 +357,10 @@ final class BackupEngine: ObservableObject {
             : "✓ \(deep ? "Deep scan" : "Scan") checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
         appendLog("Scan complete — \(added) new item\(added == 1 ? "" : "s") queued.", .success)
 
-        if settings.propagateDeletes {
-            await reconcileDeletes()
-        }
+        // Deletions are ALWAYS reconciled into the manifest (tombstones +
+        // resurrections) so restores reflect reality; the toggle only governs
+        // whether blobs are physically purged.
+        await reconcileDeletes()
         phase = .idle
     }
 
@@ -398,15 +399,15 @@ final class BackupEngine: ObservableObject {
         }
     }
 
-    /// Reconcile on-device deletions (only when "Mirror deletions" is on).
+    /// Reconcile on-device deletions — runs on EVERY scan:
     ///
-    /// - Photos removed on-device become **tombstones**, stamped with the time so
-    ///   the grace period can run. They're immediately recorded in the manifest.
-    /// - Tombstoned photos that have **reappeared** in the library are resurrected
-    ///   — this is the accidental-erase recovery: restore iCloud within the grace
-    ///   window and nothing is lost.
-    /// - Then `purgeTombstones` physically frees any that are past the grace
-    ///   period (Object Lock permitting).
+    /// - Photos removed on-device become **tombstones**, stamped with the time,
+    ///   and are immediately marked deleted in the manifest (restores skip them
+    ///   by default; `restore.py --all` can still recover un-purged ones).
+    /// - Tombstoned photos that have **reappeared** in the library are
+    ///   resurrected — the accidental-erase recovery.
+    /// - Only when "Purge deleted backups" is on does `purgeTombstones` then
+    ///   physically free blobs past the grace period (Object Lock permitting).
     private func reconcileDeletes() async {
         guard let index else { return }
         let photos = self.photos
@@ -426,7 +427,7 @@ final class BackupEngine: ObservableObject {
         let now = Date()
         for orphan in orphans { index.markDeleted(orphan.id, at: now) }
         if !orphans.isEmpty {
-            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device — tombstoned (grace \(settings.deleteGraceDays)d).", .warning)
+            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device — marked deleted in the manifest.", .warning)
         }
 
         if resurrected > 0 || !orphans.isEmpty {
@@ -435,7 +436,8 @@ final class BackupEngine: ObservableObject {
             if settings.keepBucketManifest { await writeManifest() }
         }
 
-        await purgeTombstones()
+        // Physical space reclamation is opt-in; marking above is unconditional.
+        if settings.propagateDeletes { await purgeTombstones() }
     }
 
     /// Physically remove tombstones past the grace period, freeing bucket bytes.
@@ -484,17 +486,19 @@ final class BackupEngine: ObservableObject {
         guard !recipients.isEmpty else { return .failure(Age.Error.badRecipient) }
 
         let iso = ISO8601DateFormatter()
-        let records = index.allUploaded()
-        let items = records.map { r in
+        func item(_ r: AssetRecord) -> Manifest.Item {
             Manifest.Item(key: r.remoteKey, filename: r.filename, mediaType: r.mediaType.rawValue,
                           storedBytes: r.byteSize,
                           createdAt: r.createdAt.map { iso.string(from: $0) },
                           uploadedAt: r.uploadedAt.map { iso.string(from: $0) })
         }
-        let manifest = Manifest(version: 1, generatedAt: iso.string(from: Date()),
+        let items = index.allUploaded().map(item)
+        let deletedItems = index.deletedRecords().map(item)
+        let manifest = Manifest(version: 2, generatedAt: iso.string(from: Date()),
                                 bucket: s3Config.bucket, prefix: s3Config.prefix,
                                 count: items.count, items: items,
-                                deletedKeys: index.deletedKeys())
+                                deletedKeys: deletedItems.map(\.key),
+                                deleted: deletedItems)
 
         let token = UUID().uuidString
         let jsonURL = tempDir.appendingPathComponent("\(token).json")

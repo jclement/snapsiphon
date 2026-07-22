@@ -38,10 +38,9 @@ struct BackupSettings: Codable, Equatable {
     /// each run that uploads something.
     var keepBucketManifest: Bool = true
 
-    /// Mirror on-device deletions to the bucket. OFF by default = pure
-    /// append-only archive (phone deletes never touch the bucket). When ON,
-    /// deletes are tombstoned in the manifest immediately, then physically
-    /// purged only after `deleteGraceDays` (and only when Object Lock allows).
+    /// Whether to physically purge deleted photos' blobs (best-effort, after
+    /// the grace period, Object Lock permitting). Deletions are ALWAYS marked
+    /// in the manifest regardless — this knob only reclaims storage.
     var propagateDeletes: Bool = false
 
     /// How long a deleted photo must stay tombstoned before the app tries to

@@ -14,10 +14,14 @@ struct Manifest: Codable {
     let prefix: String
     let count: Int
     let items: [Item]
-    /// Object keys that were logically deleted on-device. They may still exist in
-    /// the bucket (Object Lock) until the lifecycle rule expires them — a restore
-    /// should ignore these, and a non-locked bucket may safely purge them.
+    /// Object keys logically deleted on-device (blobs may still exist until
+    /// purged). Restores skip these by default.
     let deletedKeys: [String]
+    /// Full metadata for the deleted objects, so a disaster restore can still
+    /// recover them (`restore.py --all`) — e.g. after an accidental library
+    /// wipe marked everything deleted. Entries disappear once a blob is
+    /// actually purged from the bucket.
+    let deleted: [Item]
 
     struct Item: Codable {
         let key: String            // full object key in the bucket

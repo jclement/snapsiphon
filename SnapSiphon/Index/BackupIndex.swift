@@ -215,6 +215,14 @@ final class BackupIndex {
         }
     }
 
+    /// Full records for tombstoned assets, so the manifest can carry their
+    /// metadata for disaster (`--all`) restores until the blob is purged.
+    func deletedRecords() -> [AssetRecord] {
+        queue.sync {
+            (try? db.query("SELECT * FROM assets WHERE state='deleted' ORDER BY uploadedAt;", [], Self.mapRow)) ?? []
+        }
+    }
+
     /// Tombstones whose grace period has elapsed and are eligible for physical
     /// purge (returns their object keys).
     func purgeableKeys(before cutoff: Date) -> [String] {
