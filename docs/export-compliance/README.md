@@ -64,8 +64,22 @@ App Store Connect → your app → App Information → App Encryption Documentat
 these answers; once the questionnaire is saved in App Information, uploads
 won't be blocked on the compliance question.
 
-## France
+## EU / DSA / France — decision (July 2026): not distributing in the EU
 
-Apps in this category technically also require a declaration to ANSSI if
-distributed in France. Options: file the ANSSI declaration (a one-time form,
-no approval wait), or deselect France from the app's territories.
+To avoid the DSA "trader" requirements (publicly displayed address + phone on
+the EU product page) and the France/ANSSI encryption declaration, SnapSiphon
+is not distributed in EU countries.
+
+In App Store Connect:
+
+1. Business (or the app's Distribution section) → Digital Services Act →
+   select **"I'm not a trader under the DSA or I don't plan to distribute in
+   the EU."**
+2. App → Pricing and Availability → edit country/region availability →
+   deselect all EU member states. (UK, Switzerland, and Norway are not EU and
+   can stay selected.)
+
+This is fully reversible: to sell in the EU later, get a displayable business
+address (virtual mailbox, ~CA$10/month, e.g. PostScan Mail Calgary), switch to
+trader status, re-add the EU territories, and file the ANSSI declaration for
+France.
