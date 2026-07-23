@@ -1,5 +1,23 @@
 # SnapSiphon Help
 
+## Why
+
+SnapSiphon exists because of a NAS. A shiny new network-storage box arrived, its photo-backup app was switched on with great optimism, and — let's just say the optimism did not survive the week.
+
+Which forced the actual question: photos are the one dataset that's truly irreplaceable, and the two standard answers are both uncomfortable. Trusting everything to Apple alone is a single point of failure with a monthly fee. Syncing originals in plaintext to somebody else's cloud is a hard nope.
+
+So — *SnapSiphon*:
+
+- Always encrypted **phone-side** (age encryption, multiple keys, obfuscated file names — the bucket never learns what anything is).
+- Pushed to **S3-compatible storage you control** — Backblaze B2, Cloudflare R2, MinIO, even a self-hosted box over Tailscale.
+- **Soft deletes** that respect append-only buckets: nothing is ever silently destroyed.
+- A one-tap **verify** that proves every backup is really there.
+- **Parallel uploads** with actual knobs.
+- An in-app **Python restore script** that just works — your photos come back on any laptop, no SnapSiphon required.
+- **Background backups** and a nudge when you haven't backed up in a while.
+
+The rule underneath all of it: your photos should outlive any app, any provider, and any NAS. Including this one.
+
 ## Who
 
 SnapSiphon is made by **Straybits Corp** — [straybits.ca](https://straybits.ca).
@@ -29,7 +47,7 @@ Inside your bucket, under your chosen prefix, lives a **repository**:
 
 Three independent paths, none of which need this app:
 
-1. **Restore script** (Settings → Disaster recovery): one Python file with credentials + key baked in. `python3 restore.py` reads the newest checkpoint, replays the journals (verifying the chain), and rebuilds everything with original filenames and integrity checks. Needs the `age` CLI *or* `pip3 install cryptography`.
+1. **Restore script** (Settings → Disaster recovery): one Python file. `python3 restore.py` shows its configuration for review (ENTER to confirm, or pick a number to change a value), reads the newest checkpoint, replays the journals (verifying the chain), and rebuilds everything with original filenames and integrity checks. Export it **with secrets baked in** (one file that just works — store it like a password) or **without secrets** (the script prompts for the bucket secret key and age secret at run time — safe to keep anywhere). Needs the `age` CLI *or* `pip3 install cryptography`.
 2. **age CLI** anywhere: `age -d -i key.txt file.age` — even the checkpoint is just an age file holding a SQLite database.
 3. This app on a new phone: import your secret key, point at the bucket, and the attach prompt reloads the whole index from the repository — no re-uploading.
 

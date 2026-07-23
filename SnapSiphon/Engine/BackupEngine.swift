@@ -1083,14 +1083,22 @@ final class BackupEngine: ObservableObject {
     /// gated behind Face ID / passcode. Nil if storage isn't configured or auth
     /// fails. Without an on-device identity, the script carries a placeholder
     /// the user must fill with a secret key.
-    func buildRestoreScript() async -> String? {
+    /// `includeSecrets: false` builds the prompting variant — no SECRET_KEY or
+    /// AGE_SECRET in the file, the script asks at run time — and therefore
+    /// needs no biometric gate (the remaining contents identify the bucket but
+    /// can't read it).
+    func buildRestoreScript(includeSecrets: Bool = true) async -> String? {
         guard s3Config.isComplete, let creds = S3CredentialStore.load() else { return nil }
+        guard includeSecrets else {
+            return RestoreScript.build(config: s3Config, credentials: creds,
+                                       ageSecret: nil, includeSecrets: false)
+        }
         let what = keyManager.hasIdentity ? "bucket credentials and encryption secret key" : "bucket credentials"
         guard await DeviceAuth.authenticate(reason: "Export a restore script containing your \(what)") else {
             return nil
         }
         return RestoreScript.build(config: s3Config, credentials: creds,
-                                   ageSecret: keyManager.exportSecret())
+                                   ageSecret: keyManager.exportSecret(), includeSecrets: true)
     }
 
     // MARK: Verification

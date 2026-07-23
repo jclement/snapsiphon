@@ -11,8 +11,14 @@ import Foundation
 /// Runtime needs: python3 (stdlib only — SigV4 is implemented inline) and the
 /// `age` CLI (`brew install age`) for decryption.
 enum RestoreScript {
-    static func build(config: S3Config, credentials: S3Credentials, ageSecret: String?) -> String {
-        let secret = ageSecret ?? "PASTE-YOUR-AGE-SECRET-KEY-HERE"
+    /// `includeSecrets: false` leaves SECRET_KEY and AGE_SECRET empty — the
+    /// script's startup config review highlights them as missing and prompts
+    /// (hidden input) at run time, so the exported file is safe-ish to store
+    /// anywhere the bucket name is acceptable.
+    static func build(config: S3Config, credentials: S3Credentials, ageSecret: String?,
+                      includeSecrets: Bool = true) -> String {
+        let secret = includeSecrets ? (ageSecret ?? "") : ""
+        let secretKey = includeSecrets ? credentials.secretAccessKey : ""
         let prefix = config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         let pathStyle = config.usesPathStyle ? "True" : "False"
         return #"""
@@ -42,11 +48,92 @@ REGION     = "\#(config.region)"
 BUCKET     = "\#(config.bucket)"
 PREFIX     = "\#(prefix)"
 ACCESS_KEY = "\#(credentials.accessKeyID)"
-SECRET_KEY = "\#(credentials.secretAccessKey)"
-AGE_SECRET = "\#(secret)"
+SECRET_KEY = "\#(secretKey)"      # empty = prompted at run
+AGE_SECRET = "\#(secret)"         # empty = prompted at run
 PATH_STYLE = \#(pathStyle)
 
 S3NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+
+# ---------- interactive config review ----------
+# Values baked in above are shown for confirmation; anything missing (e.g. a
+# secrets-free export) is highlighted and prompted for. ENTER continues,
+# a number edits that value. Non-interactive runs skip the review when
+# everything needed is present, and fail with a clear list when it isn't.
+
+CONFIG_FIELDS = [
+    ("ENDPOINT",   "Endpoint"),
+    ("REGION",     "Region"),
+    ("BUCKET",     "Bucket"),
+    ("PREFIX",     "Prefix"),
+    ("PATH_STYLE", "Path style"),
+    ("ACCESS_KEY", "Access key"),
+    ("SECRET_KEY", "Secret key"),
+    ("AGE_SECRET", "Age secret"),
+]
+OPTIONAL = {"PREFIX"}
+HIDDEN = {"SECRET_KEY", "AGE_SECRET"}
+
+def _shown(name, val):
+    if name == "PATH_STYLE":
+        return str(bool(val))
+    if not val:
+        return None
+    if name == "AGE_SECRET":
+        return val[:18] + "…" + val[-4:] if len(val) > 26 else "(set)"
+    if name == "SECRET_KEY":
+        return val[:4] + "…" + val[-4:] if len(val) > 12 else "(set)"
+    return str(val)
+
+def configure():
+    import getpass
+    g = globals()
+    color = sys.stdout.isatty()
+    def paint(s, code):
+        return f"\033[{code}m{s}\033[0m" if color else s
+    def missing_names():
+        return [label for name, label in CONFIG_FIELDS
+                if name not in OPTIONAL and name != "PATH_STYLE" and not g[name]]
+    if not sys.stdin.isatty():
+        if missing_names():
+            sys.exit("Missing required values: " + ", ".join(missing_names())
+                     + ". Run interactively to enter them, or edit the script.")
+        return
+    while True:
+        print()
+        print(paint("SnapSiphon restore — configuration", "1"))
+        for i, (name, label) in enumerate(CONFIG_FIELDS, 1):
+            shown = _shown(name, g[name])
+            if shown is None:
+                shown = paint("(none)", "2") if name in OPTIONAL \
+                    else paint("MISSING — required", "1;31")
+            elif name in HIDDEN:
+                shown = paint(shown, "33")
+            print(f"  {i}. {label:<11} {shown}")
+        prompt = "ENTER to continue, or a number to change a value: " \
+            if not missing_names() else \
+            paint("Fill in the missing values (enter a number): ", "1;31")
+        try:
+            choice = input(prompt).strip()
+            if choice == "":
+                if not missing_names():
+                    return
+                continue
+            if choice.isdigit() and 1 <= int(choice) <= len(CONFIG_FIELDS):
+                name, label = CONFIG_FIELDS[int(choice) - 1]
+                if name == "PATH_STYLE":
+                    raw = input(f"{label} (true/false) [{g[name]}]: ").strip().lower()
+                    if raw:
+                        g[name] = raw in ("true", "t", "yes", "y", "1")
+                elif name in HIDDEN:
+                    raw = getpass.getpass(f"{label} (input hidden): ").strip()
+                    if raw:
+                        g[name] = raw
+                else:
+                    raw = input(f"{label} [{g[name] or 'none'}]: ").strip()
+                    if raw:
+                        g[name] = raw
+        except (EOFError, KeyboardInterrupt):
+            sys.exit("\nAborted before configuration was confirmed — nothing was restored.")
 
 def s3_open(method, key="", query=None):
     """Signed S3 request (SigV4, UNSIGNED-PAYLOAD) using only the stdlib."""
@@ -236,8 +323,7 @@ def main():
     restore_all = "--all" in flags
     out = pathlib.Path(args[0] if args else "SnapSiphonRestore")
     out.mkdir(parents=True, exist_ok=True)
-    if AGE_SECRET.startswith("PASTE-"):
-        sys.exit("Edit this script and fill in AGE_SECRET with your age secret key.")
+    configure()   # review baked-in values; prompt for anything missing
 
     base = (PREFIX + "/" if PREFIX else "")
     with tempfile.TemporaryDirectory() as tmpdir:

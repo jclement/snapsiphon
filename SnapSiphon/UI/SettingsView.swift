@@ -393,16 +393,23 @@ struct SettingsView: View {
             .navigationBarHidden(true)
             .alert("Restore script", isPresented: $showRestoreScriptWarning) {
                 Button("Cancel", role: .cancel) {}
-                Button("Continue") {
+                Button("Without secrets") {
+                    Task {
+                        if let script = await engine.buildRestoreScript(includeSecrets: false) {
+                            restoreScript = ScriptDocument(text: script)
+                        }
+                    }
+                }
+                Button("With secrets baked in") {
                     Task {
                         // Face ID / passcode prompt happens inside buildRestoreScript.
-                        if let script = await engine.buildRestoreScript() {
+                        if let script = await engine.buildRestoreScript(includeSecrets: true) {
                             restoreScript = ScriptDocument(text: script)
                         }
                     }
                 }
             } message: {
-                Text("This builds a single Python file containing your bucket credentials\(keyManager.hasIdentity ? " AND this phone's secret key" : "") in plaintext — enough to rebuild your entire archive on a laptop. After Face ID you can review the script before copying it. Store it like a password.")
+                Text("A single Python file that rebuilds your whole archive on a laptop.\n\n“With secrets baked in” includes your bucket secret key\(keyManager.hasIdentity ? " AND this phone's age secret" : "") in plaintext — one file that just works; store it like a password (Face ID required).\n\n“Without secrets” embeds only the bucket settings; the script shows them at launch and prompts for the two secrets — safe to keep anywhere you'd keep the bucket name.")
             }
             .sheet(item: $restoreScript) { doc in
                 RestoreScriptViewer(script: doc.text)
