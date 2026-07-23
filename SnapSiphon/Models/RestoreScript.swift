@@ -14,7 +14,7 @@ enum RestoreScript {
     static func build(config: S3Config, credentials: S3Credentials, ageSecret: String?) -> String {
         let secret = ageSecret ?? "PASTE-YOUR-AGE-SECRET-KEY-HERE"
         let prefix = config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        let pathStyle = config.provider.usesPathStyle ? "True" : "False"
+        let pathStyle = config.usesPathStyle ? "True" : "False"
         return #"""
 #!/usr/bin/env python3
 """SnapSiphon disaster-recovery restore.
@@ -269,12 +269,18 @@ def main():
             if target.exists() and target.stat().st_size > 0:
                 continue                                    # resume: already restored
             blob = pathlib.Path(tmp) / "blob.age"
+            part = target.with_name(target.name + ".part")
             try:
                 download(item["key"], blob)
-                decrypt(blob, target)
+                # Decrypt to a temp name and rename only on success, so an
+                # interrupted/failed decrypt can't leave a partial file that the
+                # resume check above would silently accept as restored.
+                decrypt(blob, part)
+                os.replace(part, target)
                 done += 1
                 print(f"[{i}/{len(items)}] {name}")
             except Exception as e:                          # keep going; report at end
+                part.unlink(missing_ok=True)
                 failed += 1
                 print(f"[{i}/{len(items)}] FAILED {item['key']}: {e}", file=sys.stderr)
     print(f"Done: {done} restored, {failed} failed → {out}")

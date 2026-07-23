@@ -53,7 +53,7 @@ struct StorageSetupView: View {
 
                 PrimaryButton(title: testing ? "Testing…" : "Save & Test",
                               systemImage: testing ? "hourglass" : "checkmark.seal",
-                              enabled: draft.isComplete && !testing) {
+                              enabled: draft.isComplete && !accessKeyID.isEmpty && !secretKey.isEmpty && !testing) {
                     Task { await saveAndTest() }
                 }
 
@@ -100,6 +100,10 @@ struct StorageSetupView: View {
     }
 
     private func commit() {
+        let old = engine.s3Config
+        if old.isComplete, (old.bucket != draft.bucket || old.endpoint != draft.endpoint) {
+            engine.noteDestinationChanged()
+        }
         engine.s3Config = draft
         if !accessKeyID.isEmpty && !secretKey.isEmpty {
             engine.saveCredentials(accessKeyID: accessKeyID, secret: secretKey)

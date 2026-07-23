@@ -79,7 +79,20 @@ final class BackupEngine: ObservableObject {
     @Published var settingsUnlocked = false
 
     // MARK: Configuration (observed by settings screens)
-    @Published var settings: BackupSettings { didSet { settings.save() } }
+    @Published var settings: BackupSettings {
+        didSet {
+            settings.save()
+            // Widening a filter (videos back on, favorites-only off) means older
+            // assets the mark already passed become eligible — reset it so the
+            // next scan re-checks the whole library for them.
+            if (settings.includePhotos && !oldValue.includePhotos) ||
+               (settings.includeVideos && !oldValue.includeVideos) ||
+               (!settings.favoritesOnly && oldValue.favoritesOnly) {
+                scanMark = nil
+                appendLog("Backup filters widened — next scan re-checks the whole library.", .info)
+            }
+        }
+    }
     @Published var s3Config: S3Config { didSet { s3Config.save() } }
 
     let keyManager = AgeKeyManager.shared
@@ -87,6 +100,11 @@ final class BackupEngine: ObservableObject {
     private let photos = PhotoLibrary()
     private var index: BackupIndex?
     private var runTask: Task<Void, Never>?
+    /// Whole-pipeline task (scan → adopt → run) for reentrancy + BG expiry cancel.
+    private var pipelineTask: Task<Void, Never>?
+    /// Monotonic run counter so a stale (paused, still-draining) run's cleanup
+    /// can never clobber the state of a newer run.
+    private var runGeneration = 0
     /// The previous run while its cancelled tasks finish unwinding.
     private var drainingTask: Task<Void, Never>?
     private var meter = ThroughputMeter()
@@ -115,7 +133,7 @@ final class BackupEngine: ObservableObject {
             appendLog("Generated this phone's encryption key. Reveal & back it up in Settings → Encryption key (requires Face ID).", .info)
         }
         registerBackgroundTask()
-        rescheduleReminder()
+        rescheduleReminder(force: false)
     }
 
     #if DEBUG
@@ -200,7 +218,10 @@ final class BackupEngine: ObservableObject {
             // On expiry, pause gracefully — the index checkpoints per file, so
             // whatever uploaded stays uploaded and the rest resumes next window.
             task.expirationHandler = { [weak self] in
-                Task { @MainActor in self?.pause() }
+                Task { @MainActor in
+                    self?.pipelineTask?.cancel()
+                    self?.pause()
+                }
             }
             self.appendLog("Background window granted — backing up…", .info)
             await self.scan()
@@ -227,11 +248,24 @@ final class BackupEngine: ObservableObject {
     /// (Re)schedule the "no backup for N days" local notification. Called after
     /// every completed run and whenever the setting changes, so the countdown
     /// always measures from the last backup.
-    func rescheduleReminder() {
+    func rescheduleReminder(force: Bool = true) {
         let center = UNUserNotificationCenter.current()
-        center.removePendingNotificationRequests(withIdentifiers: ["ca.straybits.snapsiphon.reminder"])
         let days = settings.reminderDays
-        guard days > 0 else { return }
+        guard days > 0 else {
+            center.removePendingNotificationRequests(withIdentifiers: ["ca.straybits.snapsiphon.reminder"])
+            return
+        }
+        if !force {
+            // Launch path: keep an existing countdown (it measures from the last
+            // backup); only create one if none is pending yet.
+            center.getPendingNotificationRequests { pending in
+                if !pending.contains(where: { $0.identifier == "ca.straybits.snapsiphon.reminder" }) {
+                    Task { @MainActor in self.rescheduleReminder(force: true) }
+                }
+            }
+            return
+        }
+        center.removePendingNotificationRequests(withIdentifiers: ["ca.straybits.snapsiphon.reminder"])
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             guard granted else { return }
             let content = UNMutableNotificationContent()
@@ -302,6 +336,14 @@ final class BackupEngine: ObservableObject {
         storedPhotoBytes = byType.photoBytes
         storedVideoBytes = byType.videoBytes
         lastBackupDate = index.recentUploads(limit: 1).first?.uploadedAt
+    }
+
+    /// Called when the storage destination (bucket/endpoint) changes while an
+    /// index exists: the index describes the OLD bucket, so surface it loudly
+    /// and point at the healing paths instead of quietly lying.
+    func noteDestinationChanged() {
+        appendLog("Storage destination changed — the local index still describes the old bucket. Run Verify (re-queues anything missing), Adopt existing backups (if the new bucket already has this archive), or Reset local index for a fresh start.", .warning)
+        manifestDirty = true
     }
 
     /// Refresh the library totals by type (cheap PhotoKit counts). Runs off-main
@@ -400,8 +442,11 @@ final class BackupEngine: ObservableObject {
                     let checked = i
                     await MainActor.run { self.scanChecked = checked }
                 }
-                if let d = info.creationDate, newest == nil || d > newest! { newest = d }
+                // Skip BEFORE advancing the mark: a filtered-out asset is not
+                // covered, so the mark must not move past it (favoriting it
+                // later has to be picked up by a fast scan).
                 if favoritesOnly && !info.isFavorite { continue }
+                if let d = info.creationDate, newest == nil || d > newest! { newest = d }
                 if known.contains(info.localIdentifier) { continue }
                 idx.upsert(AssetRecord(
                     localIdentifier: info.localIdentifier,
@@ -420,7 +465,9 @@ final class BackupEngine: ObservableObject {
 
         let added = outcome.added
         // Advance the mark so the next fast scan starts where this one ended.
-        if settings.incrementalScan, let newest = outcome.newest { scanMark = newest }
+        // Clamp to now: one future-dated asset (bad camera clock) must not
+        // blind every future fast scan.
+        if settings.incrementalScan, let newest = outcome.newest { scanMark = min(newest, Date()) }
         scanChecked = 0
 
         refreshCounts()
@@ -485,6 +532,11 @@ final class BackupEngine: ObservableObject {
     ///   physically free blobs past the grace period (Object Lock permitting).
     private func reconcileDeletes() async {
         guard let index else { return }
+        // Absence-from-library only means "deleted" under FULL photo access.
+        // Under .limited, unselected photos vanish from fetches while still
+        // existing on the phone — tombstoning them would mark valid backups
+        // deleted (and purge could destroy them).
+        guard photoAuth == .authorized else { return }
         let photos = self.photos
         let liveIDs = await Task.detached(priority: .utility) { photos.allLocalIdentifiers() }.value
 
@@ -498,7 +550,21 @@ final class BackupEngine: ObservableObject {
         }
 
         // Tombstone assets we uploaded that are no longer anywhere in the library.
-        let orphans = index.uploadedKeyPairs().filter { !liveIDs.contains($0.id) }
+        let uploadedPairs = index.uploadedKeyPairs()
+        let orphans = uploadedPairs.filter { !liveIDs.contains($0.id) }
+        // Mass-deletion fuse: if a huge fraction of the archive suddenly reads
+        // as deleted, it's far more likely an access/App-state anomaly than a
+        // real intent — refuse to tombstone and tell the user.
+        if orphans.count > 50 && orphans.count * 4 > uploadedPairs.count {
+            appendLog("\(orphans.count) of \(uploadedPairs.count) backed-up photos are missing from the library — refusing to mark them deleted (safety fuse). If this is intentional, delete in smaller batches or reset the index.", .warning)
+            return
+        }
+        // Records that never uploaded and whose asset is gone: drop them so they
+        // don't retry (and fail) forever.
+        let liveSet = liveIDs
+        for rec in index.pendingRecords(limit: 100_000) where !liveSet.contains(rec.localIdentifier) {
+            index.hardDeleteRecord(rec.localIdentifier)
+        }
         let now = Date()
         for orphan in orphans { index.markDeleted(orphan.id, at: now) }
         if !orphans.isEmpty {
@@ -631,7 +697,7 @@ final class BackupEngine: ObservableObject {
     /// single-part uploads IS the object's MD5, which we store at upload — the
     /// expected checksum. Missing/mismatched files are re-queued for upload.
     func verifyBackups() async {
-        guard !verifying, !phase.isActive else { return }
+        guard !verifying, !phase.isActive, runTask == nil, pipelineTask == nil else { return }
         guard let index, let client = makeClient() else {
             verifyStatus = "✗ Storage not configured"
             return
@@ -793,11 +859,14 @@ final class BackupEngine: ObservableObject {
     /// On a fresh index pointed at a bucket that already has content, existing
     /// objects are adopted first, so only genuinely-new photos upload.
     func backUpNow() {
-        guard runTask == nil, phase != .scanning else { return }
-        Task {
-            await scan()
-            await adoptExistingBackups(auto: true)
-            start()
+        guard runTask == nil, pipelineTask == nil, phase != .scanning, !verifying else { return }
+        pipelineTask = Task { [weak self] in
+            await self?.scan()
+            await self?.adoptExistingBackups(auto: true)
+            await MainActor.run { [weak self] in
+                self?.start()
+                self?.pipelineTask = nil
+            }
         }
     }
 
@@ -829,13 +898,15 @@ final class BackupEngine: ObservableObject {
 
         let draining = drainingTask
         drainingTask = nil
+        runGeneration += 1
+        let generation = runGeneration
         runTask = Task { [weak self] in
             // Let a just-paused run finish unwinding before touching the same
             // records, so a stale cancellation can't stamp over fresh state.
             await draining?.value
             await self?.runLoop(processor: processor)
             await MainActor.run { [weak self] in
-                self?.finishRun()
+                self?.finishRun(generation: generation)
             }
         }
     }
@@ -851,7 +922,10 @@ final class BackupEngine: ObservableObject {
         appendLog("Paused.", .warning)
     }
 
-    private func finishRun() {
+    private func finishRun(generation: Int) {
+        // A paused run drains asynchronously; if the user already resumed, this
+        // cleanup belongs to the OLD run and must not touch the new one.
+        guard generation == runGeneration else { return }
         runTask = nil
         waitingReason = nil
         UIApplication.shared.isIdleTimerDisabled = false
@@ -920,8 +994,13 @@ final class BackupEngine: ObservableObject {
 
     private func runLoop(processor: AssetProcessor) async {
         guard let index else { return }
-        // Convert the MB/s knob to bytes/s once per run (0 = unlimited).
-        let bytesPerSecond = settings.speedLimitMBps * 1_000_000
+        // Convert the MB/s knob to bytes/s once per run (0 = unlimited). The
+        // limit is TOTAL: divided across lanes so N parallel uploads can't
+        // multiply it.
+        let totalBudget = settings.speedLimitMBps * 1_000_000
+        let bytesPerSecond = totalBudget > 0 ? totalBudget / Double(workerTarget) : 0
+        let includePhotos = settings.includePhotos
+        let includeVideos = settings.includeVideos
         let verifyFirst = settings.verifyRemoteBeforeUpload
         // Live worker count: refreshed at every refill, so moving the slider
         // mid-run takes effect as files finish — more lanes spawn up to the new
@@ -945,6 +1024,9 @@ final class BackupEngine: ObservableObject {
                 let candidates = index.pendingRecords(limit: target * 2 + attempted.count)
                 guard let record = candidates.first(where: {
                     !inFlight.contains($0.localIdentifier) && !attempted.contains($0.localIdentifier)
+                        // Honour type filters for items queued before a toggle changed.
+                        && !($0.mediaType == .photo && !includePhotos)
+                        && !($0.mediaType == .video && !includeVideos)
                 }) else { return false }
                 inFlight.insert(record.localIdentifier)
                 attempted.insert(record.localIdentifier)
@@ -999,8 +1081,11 @@ final class BackupEngine: ObservableObject {
                                        uploadedAt: nil, lastError: nil)
             index.upsert(uploaded)
 
+            // A record requeued by Verify has a size/checksum mismatch — the
+            // HEAD shortcut would just re-mark the bad object as fine.
+            let effectiveVerifyFirst = verifyFirst && !(record.lastError?.hasPrefix("Verify:") ?? false)
             let result = try await processor.process(
-                record, verifyFirst: verifyFirst, bytesPerSecond: bytesPerSecond,
+                record, verifyFirst: effectiveVerifyFirst, bytesPerSecond: bytesPerSecond,
                 onMeta: { filename, size in
                     Task { @MainActor in self.updateSlot(rid, filename: filename, byteSize: size) }
                 },

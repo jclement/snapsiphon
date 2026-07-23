@@ -33,6 +33,7 @@ struct AboutView: View {
                     • **Manifests** → `manifests/manifest-<timestamp>.age` — an age-encrypted JSON index written after every backup: object key → original filename, dates, sizes, and which items were deleted on-device. The newest one is the source of truth.
                     • **Deletions** are marked in the manifest immediately; blobs are only physically removed if "Purge deleted backups" is on, after the grace period.
                     • **Integrity**: every upload carries its MD5 (Content-MD5); Verify compares stored checksums against bucket ETags with zero downloads.
+                    • **Live Photos**: the full-quality still is backed up; the 3-second motion clip is not yet (planned).
                     """)
                 }
 

@@ -87,7 +87,7 @@ struct SettingsView: View {
                                   range: 1...8) { "\(Int($0))" }
                         Divider().overlay(Theme.hairline)
                         SliderRow(title: "Speed limit",
-                                  subtitle: "Cap upload throughput. 0 = unlimited.",
+                                  subtitle: "Caps TOTAL upload throughput across all parallel lanes. 0 = unlimited.",
                                   value: $engine.settings.speedLimitMBps,
                                   range: BackupSettings.speedRange, step: 1) {
                             $0 == 0 ? "∞" : String(format: "%.0f MB/s", $0)
@@ -95,11 +95,12 @@ struct SettingsView: View {
                     }
 
                     knobGroup("Conditions") {
-                        ToggleRow(title: "Wi-Fi only", subtitle: "Never upload over cellular.",
+                        ToggleRow(title: "Wi-Fi only",
+                                  subtitle: "New uploads wait for Wi-Fi. A file already mid-upload finishes on the current connection rather than wasting the transfer.",
                                   isOn: $engine.settings.wifiOnly)
                         Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Pause on low battery",
-                                  subtitle: "Hold uploads below \(Int(engine.settings.lowBatteryThreshold * 100))%.",
+                                  subtitle: "No new uploads below \(Int(engine.settings.lowBatteryThreshold * 100))% (unless charging); in-flight files finish.",
                                   isOn: $engine.settings.pauseOnLowBattery)
                         Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Keep screen on",
@@ -299,7 +300,7 @@ struct SettingsView: View {
                             }
                             .foregroundStyle(Theme.teal)
                         }
-                        .disabled(engine.phase.isActive)
+                        .disabled(engine.phase.isActive || engine.phase == .paused)
                         if let status = engine.scanStatus, engine.phase != .scanning {
                             Text(status)
                                 .font(Theme.mono(12))

@@ -131,9 +131,15 @@ struct AssetProcessor {
             let hex = identifierHash(localIdentifier)
             return "\(hex.prefix(2))/\(hex).\(ext).age"
         } else {
+            // A per-asset suffix keeps keys unique: two photos can share a
+            // filename and month (IMG_0042.HEIC from two cameras, AirDrops,
+            // FullSizeRender.jpg…) and must never overwrite each other.
             let stamp = Self.folderFormatter.string(from: createdAt ?? Date(timeIntervalSince1970: 0))
-            let safe = filename.replacingOccurrences(of: "/", with: "_")
-            return "\(stamp)/\(safe).age"
+            let base = ((filename as NSString).deletingPathExtension.isEmpty
+                        ? filename : (filename as NSString).deletingPathExtension)
+                .replacingOccurrences(of: "/", with: "_")
+            let suffix = identifierHash(localIdentifier).prefix(8)
+            return "\(stamp)/\(base)-\(suffix).\(ext).age"
         }
     }
 

@@ -146,8 +146,7 @@ final class S3Client {
         } else {
             components = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!
         }
-        components.queryItems = [URLQueryItem(name: "versions", value: ""),
-                                 URLQueryItem(name: "prefix", value: key)]
+        components.percentEncodedQuery = "versions=&prefix=\(SigV4.uriEncode(key, encodeSlash: true))"
         guard let url = components.url else { throw S3Error.badConfig }
         let signed = signer.sign(method: "GET", url: url, now: now)
         var request = URLRequest(url: url)
@@ -164,7 +163,7 @@ final class S3Client {
         guard var comps = URLComponents(url: try objectURL(key: key), resolvingAgainstBaseURL: false) else {
             throw S3Error.badConfig
         }
-        comps.queryItems = [URLQueryItem(name: "versionId", value: versionId)]
+        comps.percentEncodedQuery = "versionId=\(SigV4.uriEncode(versionId, encodeSlash: true))"
         guard let url = comps.url else { throw S3Error.badConfig }
         let signed = signer.sign(method: "DELETE", url: url, now: now)
         var request = URLRequest(url: url)
@@ -230,14 +229,20 @@ final class S3Client {
         } else {
             components = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!
         }
+        // Match the trimmed prefix used for uploads (fullKey), and percent-
+        // encode the query OURSELVES with the same encoder SigV4 canonicalizes
+        // with — otherwise a '+' in a continuation token is signed as %2B but
+        // sent literally, breaking pagination with a signature mismatch.
         var items = [
-            URLQueryItem(name: "list-type", value: "2"),
-            URLQueryItem(name: "prefix", value: config.prefix),
+            ("list-type", "2"),
+            ("prefix", config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))),
         ]
         if let token = continuationToken {
-            items.append(URLQueryItem(name: "continuation-token", value: token))
+            items.append(("continuation-token", token))
         }
-        components.queryItems = items
+        components.percentEncodedQuery = items
+            .map { "\(SigV4.uriEncode($0.0, encodeSlash: true))=\(SigV4.uriEncode($0.1, encodeSlash: true))" }
+            .joined(separator: "&")
         guard let url = components.url else { throw S3Error.badConfig }
 
         let signed = signer.sign(method: "GET", url: url, now: now)

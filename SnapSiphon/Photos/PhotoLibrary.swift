@@ -110,7 +110,10 @@ final class PhotoLibrary {
     /// it stays cheap even for large libraries.
     func allLocalIdentifiers() -> Set<String> {
         let options = PHFetchOptions()
-        options.includeHiddenAssets = false
+        // MUST include hidden assets: this set defines "still exists on device"
+        // for delete-tombstoning. Excluding hidden photos made Hiding a photo
+        // indistinguishable from deleting it.
+        options.includeHiddenAssets = true
         let result = PHAsset.fetchAssets(with: options)
         var ids = Set<String>()
         ids.reserveCapacity(result.count)

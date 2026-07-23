@@ -233,6 +233,14 @@ final class BackupIndex {
         }
     }
 
+    /// Drop a record entirely (used for pending items whose asset was deleted
+    /// before ever uploading — nothing exists remotely to track or tombstone).
+    func hardDeleteRecord(_ localIdentifier: String) {
+        queue.sync {
+            db.exec("DELETE FROM assets WHERE localIdentifier=?;", [.text(localIdentifier)])
+        }
+    }
+
     /// Permanently drop a tombstone once its object is confirmed gone from the bucket.
     func hardDelete(remoteKey: String) {
         queue.sync {

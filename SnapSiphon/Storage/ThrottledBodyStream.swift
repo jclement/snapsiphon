@@ -19,6 +19,7 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
     private var pending = Data()
     private var reachedEOF = false
     private var finished = false
+    private var cancelled = false
     private var thread: Thread?
     private var runLoop: CFRunLoop?
 
@@ -37,6 +38,7 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
     /// Begin producing. Call once, before/while the upload task runs.
     func start() {
         let thread = Thread { [self] in
+            if cancelled { finish(); return }   // cancelled before we even started
             runLoop = CFRunLoopGetCurrent()
             output.delegate = self
             output.schedule(in: .current, forMode: .default)
@@ -55,7 +57,8 @@ final class ThrottledBodyStream: NSObject, StreamDelegate {
     /// thread (plus stream buffers and an open file handle) per throttled
     /// upload. Idempotent; safe to call from any thread.
     func cancel() {
-        guard let runLoop else { return }
+        cancelled = true
+        guard let runLoop else { return }   // pre-start: the thread checks the flag
         CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) { [self] in finish() }
         CFRunLoopWakeUp(runLoop)
     }
