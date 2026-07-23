@@ -12,6 +12,11 @@ struct BackupSettings: Codable, Equatable {
     /// separate encrypted blob per Live Photo). Off = stills only.
     var backupLivePhotoMovies: Bool? = nil
     var includeLiveMotion: Bool { backupLivePhotoMovies ?? false }
+    /// Also back up the Hidden album. Off by default: hidden photos are often
+    /// the most sensitive, so leaving them out is the conservative default.
+    /// (Hiding a photo AFTER backup never deletes its backup either way.)
+    var backupHiddenPhotos: Bool? = nil
+    var includeHidden: Bool { backupHiddenPhotos ?? false }
     /// Only back up content captured on/after this date (nil = everything).
     /// For testing against a slice of a huge library, or when older content is
     /// already safe in a pre-existing backup.

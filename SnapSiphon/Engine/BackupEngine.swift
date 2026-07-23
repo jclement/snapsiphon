@@ -89,6 +89,7 @@ final class BackupEngine: ObservableObject {
             if (settings.includePhotos && !oldValue.includePhotos) ||
                (settings.includeVideos && !oldValue.includeVideos) ||
                (settings.includeLiveMotion && !oldValue.includeLiveMotion) ||
+               (settings.includeHidden && !oldValue.includeHidden) ||
                (!settings.favoritesOnly && oldValue.favoritesOnly) ||
                // Cutoff removed or moved earlier: assets before the old cutoff
                // are behind the mark and would otherwise never be picked up.
@@ -413,7 +414,10 @@ final class BackupEngine: ObservableObject {
         if demoMode || !photoAuth.canRead { return }
         let photos = self.photos
         let cutoff = settings.backupCutoff
-        let counts = await Task.detached(priority: .utility) { photos.libraryCounts(since: cutoff) }.value
+        let includeHidden = settings.includeHidden
+        let counts = await Task.detached(priority: .utility) {
+            photos.libraryCounts(since: cutoff, includeHidden: includeHidden)
+        }.value
         libraryPhotos = counts.photos
         libraryVideos = counts.videos
     }
@@ -475,6 +479,7 @@ final class BackupEngine: ObservableObject {
         let includePhotos = settings.includePhotos
         let includeVideos = settings.includeVideos
         let includeLiveMotion = settings.includeLiveMotion
+        let includeHidden = settings.includeHidden
         let favoritesOnly = settings.favoritesOnly
         let photos = self.photos
         // Fast-scan mark: only enumerate assets created after it (unless deep or
@@ -502,7 +507,8 @@ final class BackupEngine: ObservableObject {
         // Enumerate AND index off the main actor so the UI stays live and we can
         // report progress as we go.
         let outcome: (added: Int, newest: Date?, checked: Int) = await Task.detached(priority: .utility) {
-            let infos = photos.enumerate(includePhotos: includePhotos, includeVideos: includeVideos, since: since)
+            let infos = photos.enumerate(includePhotos: includePhotos, includeVideos: includeVideos,
+                                         since: since, includeHidden: includeHidden)
             var added = 0
             var newest = startMark
             for (i, info) in infos.enumerated() {

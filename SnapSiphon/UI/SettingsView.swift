@@ -90,6 +90,12 @@ struct SettingsView: View {
                                     get: { engine.settings.includeLiveMotion },
                                     set: { engine.settings.backupLivePhotoMovies = $0 }))
                         Divider().overlay(Theme.hairline)
+                        ToggleRow(title: "Hidden album",
+                                  subtitle: "Also back up photos in the Hidden album (everything is encrypted either way). Off = hidden photos are never uploaded — though hiding a photo AFTER backup never deletes its backup.",
+                                  isOn: Binding(
+                                    get: { engine.settings.includeHidden },
+                                    set: { engine.settings.backupHiddenPhotos = $0 }))
+                        Divider().overlay(Theme.hairline)
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Text("Back up from")
@@ -186,14 +192,16 @@ struct SettingsView: View {
                                  ? "\(Format.count(purgePendingCount)) deleted backup\(purgePendingCount == 1 ? " is" : "s are") already past the grace period — their storage is freed on the NEXT sync, permanently. Photos deleted more recently stay recoverable until their grace period ends."
                                  : "Nothing is currently past the grace period. From now on, deleted photos' storage is freed automatically once their grace period ends.")
                         }
+                        Divider().overlay(Theme.hairline)
+                        // Always visible: the grace period gates BOTH automatic
+                        // purging and the manual Clean up now below.
+                        SliderRow(title: "Purge grace period",
+                                  subtitle: "Accident window for automatic purge AND Clean up now: erase iCloud by mistake and get it back within this many days → nothing is purged.",
+                                  value: Binding(
+                                    get: { Double(engine.settings.deleteGraceDays) },
+                                    set: { engine.settings.deleteGraceDays = Int($0) }),
+                                  range: 7...180, step: 1) { "\(Int($0))d" }
                         if engine.settings.propagateDeletes {
-                            Divider().overlay(Theme.hairline)
-                            SliderRow(title: "Purge grace period",
-                                      subtitle: "Accident window: erase iCloud by mistake and get it back within this many days → nothing is purged.",
-                                      value: Binding(
-                                        get: { Double(engine.settings.deleteGraceDays) },
-                                        set: { engine.settings.deleteGraceDays = Int($0) }),
-                                      range: 7...180, step: 1) { "\(Int($0))d" }
                             HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: "info.circle.fill")
                                     .foregroundStyle(Theme.teal).font(.system(size: 13))

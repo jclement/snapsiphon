@@ -55,8 +55,10 @@ final class PhotoLibrary {
     /// after it — so after the first pass a scan touches just the new photos.
     /// No `PHAssetResource` lookups happen here, which is what made scanning a
     /// large library slow; those are deferred to the moment we actually upload.
-    func enumerate(includePhotos: Bool, includeVideos: Bool, since: Date? = nil) -> [AssetInfo] {
+    func enumerate(includePhotos: Bool, includeVideos: Bool, since: Date? = nil,
+                   includeHidden: Bool = false) -> [AssetInfo] {
         let options = PHFetchOptions()
+        options.includeHiddenAssets = includeHidden
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         var predicates: [NSPredicate] = []
         var typePredicates: [NSPredicate] = []
@@ -101,9 +103,10 @@ final class PhotoLibrary {
     /// "% of photos / videos backed up" (we can't cheaply know total *bytes*).
     /// `since` mirrors the backup-cutoff setting so the ring/banner denominator
     /// matches what the backup will actually cover.
-    func libraryCounts(since: Date? = nil) -> (photos: Int, videos: Int) {
+    func libraryCounts(since: Date? = nil, includeHidden: Bool = false) -> (photos: Int, videos: Int) {
         func count(_ type: PHAssetMediaType) -> Int {
             let o = PHFetchOptions()
+            o.includeHiddenAssets = includeHidden
             var predicates = [NSPredicate(format: "mediaType == %d", type.rawValue)]
             if let since {
                 predicates.append(NSPredicate(format: "creationDate >= %@", since as NSDate))

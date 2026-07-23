@@ -54,6 +54,8 @@ Inside your bucket, under your chosen prefix, lives a **repository**:
 ## What to back up
 
 - **Photos / Videos / Favorites-only** filters, plus **Back up from** — an optional cutoff date: content captured before it is skipped and left out of the progress ring. Handy for testing, or when older content already lives in another backup.
+- **Live Photo motion clips** (optional): store each Live Photo's ~3-second clip as its own encrypted file; enabling it back-fills clips for stills already backed up.
+- **Hidden album** (optional, off by default): hidden photos are often the most sensitive, so they're excluded unless you opt in. Either way, *hiding* a photo after it's backed up never deletes its backup — only real deletion starts the tombstone/grace-period process.
 - **Photo access**: with *full* access everything works. Under *limited* access (only selected photos shared), backup works but **deletion tracking is disabled** — an unselected photo is indistinguishable from a deleted one, so nothing is ever tombstoned in that mode.
 - **Mass-deletion fuse**: if a huge fraction of the archive suddenly reads as deleted (an iCloud hiccup, a signed-out account), SnapSiphon refuses to record the deletions and says so, instead of tombstoning your whole archive.
 
