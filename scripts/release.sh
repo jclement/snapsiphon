@@ -71,7 +71,14 @@ if [[ "$UPLOAD" == 1 ]]; then
     trap 'rm -rf "$KEYDIR"' EXIT
     KEY_ID=$(printf '%s' "$KEY_JSON"    | python3 -c 'import json,sys; print(json.load(sys.stdin)["key_id"])')
     ISSUER_ID=$(printf '%s' "$KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer_id"])')
-    printf '%s' "$KEY_JSON" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["key"])' \
+    # Sanitize: copy/paste into 1Password can smuggle invisible control chars
+    # into the PEM body — strip to pure base64 and rewrap.
+    printf '%s' "$KEY_JSON" | python3 -c '
+import json, sys, re
+k = json.load(sys.stdin)["key"]
+body = re.sub(r"[^A-Za-z0-9+/=]", "", k.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", ""))
+lines = "\n".join(body[i:i+64] for i in range(0, len(body), 64))
+sys.stdout.write(f"-----BEGIN PRIVATE KEY-----\n{lines}\n-----END PRIVATE KEY-----\n")' \
         > "$KEYDIR/AuthKey_$KEY_ID.p8"
     chmod 600 "$KEYDIR/AuthKey_$KEY_ID.p8"
 
