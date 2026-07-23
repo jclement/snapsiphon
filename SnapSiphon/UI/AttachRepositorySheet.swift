@@ -79,13 +79,7 @@ struct AttachRepositorySheet: View {
 
                     if working { ProgressView().tint(Theme.teal).frame(maxWidth: .infinity) }
                     if let report {
-                        Text(report)
-                            .font(Theme.mono(12))
-                            .foregroundStyle(report.hasPrefix("✓") ? .green
-                                             : report.hasPrefix("✗") ? .red : Theme.textSecondary)
-                            .padding(10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(RoundedRectangle(cornerRadius: 10).fill(Theme.surface))
+                        reportBanner(report)
                     }
                 }
                 .padding(16)
@@ -94,6 +88,40 @@ struct AttachRepositorySheet: View {
             .background(Theme.canvas.ignoresSafeArea())
             .interactiveDismissDisabled(working)
         }
+    }
+
+    /// The verify/take-over outcome, styled so success is unmissable: a green
+    /// (or red/orange) banner with a big status icon, headline first line, and
+    /// the details below.
+    private func reportBanner(_ report: String) -> some View {
+        let good = report.hasPrefix("✓")
+        let bad = report.hasPrefix("✗")
+        let color: Color = good ? .green : bad ? .red : .orange
+        let icon = good ? "checkmark.seal.fill" : bad ? "xmark.octagon.fill" : "exclamationmark.triangle.fill"
+        let lines = report.split(separator: "\n", maxSplits: 1)
+        let headline = String(lines.first ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "✓✗⚠ "))
+        let detail = lines.count > 1 ? String(lines[1]) : nil
+        return HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 26))
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(headline)
+                    .font(Theme.rounded(17, weight: .bold))
+                    .foregroundStyle(color)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.textPrimary.opacity(0.85))
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .multilineTextAlignment(.leading)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(color.opacity(0.14)))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(color.opacity(0.5), lineWidth: 1))
     }
 
     private func optionButton(icon: String, title: String, detail: String,

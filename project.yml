@@ -41,3 +41,24 @@ targets:
         SUPPORTS_MACCATALYST: NO
         ENABLE_PREVIEWS: YES
         SWIFT_EMIT_LOC_STRINGS: YES
+
+schemes:
+  SnapSiphon:
+    build:
+      targets:
+        SnapSiphon: all
+    run:
+      config: Debug
+      # Local StoreKit testing: Debug runs use the bundled .storekit catalog,
+      # so the premium purchase works in the simulator / Xcode with no App
+      # Store Connect, sandbox account, or network. TestFlight/App Store
+      # builds ignore this and hit the real store.
+      storeKitConfiguration: SnapSiphon/Config/StoreKit.storekit
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

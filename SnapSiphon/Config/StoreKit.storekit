@@ -1,0 +1,38 @@
+{
+  "identifier" : "F2A6D9E1-4C83-4B7A-9E0D-3A1B5C7D8E9F",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "0.99",
+      "familyShareable" : true,
+      "internalID" : "A1B2C3D4",
+      "localizations" : [
+        {
+          "description" : "Opportunistic background backups while the app is closed.",
+          "displayName" : "Background Backup",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "ca.straybits.snapsiphon.premium",
+      "referenceName" : "Premium — Background Backup",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_failTransactionsEnabled" : false,
+    "_locale" : "en_US",
+    "_storefront" : "CAN",
+    "_storeKitErrors" : [
+
+    ]
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}

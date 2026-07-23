@@ -1062,12 +1062,18 @@ final class BackupEngine: ObservableObject {
             let repoOnly = repoUUIDs.subtracting(localUUIDs).count
             let localOnly = localUUIDs.subtracting(repoUUIDs).count
             let missingBlobs = repoUUIDs.subtracting(blobs).count
-            var lines = ["Repository: \(Format.count(repoUUIDs.count)) items · Local: \(Format.count(localUUIDs.count)) · Matching: \(Format.count(matching))"]
-            if repoOnly > 0 { lines.append("\(Format.count(repoOnly)) only in the repository (from another install or before a reset)") }
-            if localOnly > 0 { lines.append("\(Format.count(localOnly)) only local (not yet in the repository)") }
-            lines.append(missingBlobs == 0 ? "All repository items have their blob present ✓"
-                                          : "⚠ \(Format.count(missingBlobs)) repository item\(missingBlobs == 1 ? "" : "s") missing their blob")
-            attachStatus = (repoOnly == 0 && localOnly == 0 && missingBlobs == 0 ? "✓ " : "") + lines.joined(separator: "\n")
+            if repoOnly == 0 && localOnly == 0 && missingBlobs == 0 {
+                // The unambiguous good outcome deserves an unambiguous headline.
+                attachStatus = "✓ Perfect match\nThis phone and the repository agree on all \(Format.count(matching)) backed-up item\(matching == 1 ? "" : "s"), and every blob is present in the bucket. Taking over this repository is safe."
+            } else {
+                var lines = ["⚠ Differences found",
+                             "Repository: \(Format.count(repoUUIDs.count)) items · This phone: \(Format.count(localUUIDs.count)) · Matching: \(Format.count(matching))"]
+                if repoOnly > 0 { lines.append("• \(Format.count(repoOnly)) only in the repository (from another install, or before a reset)") }
+                if localOnly > 0 { lines.append("• \(Format.count(localOnly)) only on this phone (not yet in the repository)") }
+                if missingBlobs > 0 { lines.append("• \(Format.count(missingBlobs)) repository item\(missingBlobs == 1 ? "" : "s") missing their blob from the bucket") }
+                lines.append("Differences aren't necessarily bad — taking over merges the repository's view; anything only on this phone re-queues on the next scan.")
+                attachStatus = lines.joined(separator: "\n")
+            }
         } catch {
             attachStatus = "✗ \(error.localizedDescription)"
         }
