@@ -142,6 +142,10 @@ struct DashboardView: View {
             } else if isRunning || engine.uploadLanes.contains(where: { $0 != nil }) {
                 uploadStreams
                 gaugeRow(now: now)
+            } else if case .failed(let reason) = engine.phase {
+                infoPanel(icon: "wifi.exclamationmark", color: .red, spinning: false,
+                          title: "Backup stopped", subtitle: reason)
+                gaugeRow(now: now)
             } else if engine.counts.failed > 0 {
                 infoPanel(icon: "exclamationmark.triangle.fill", color: .red, spinning: false,
                           title: "\(Format.count(engine.counts.failed)) failed to upload",

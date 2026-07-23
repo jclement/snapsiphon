@@ -157,9 +157,12 @@ struct StorageSetupView: View {
         .init(id: "Wasabi", endpoint: "s3.us-west-1.wasabisys.com",
               region: "us-west-1", pathStyle: "off",
               note: "Region matches the endpoint."),
+        .init(id: "picos3 + Tailscale (self-hosted)", endpoint: "picos3.your-tailnet.ts.net",
+              region: "us-east-1", pathStyle: "on",
+              note: "A tiny single-bucket S3 server that serves HTTPS with your Tailscale cert — backups stay entirely on your tailnet. Bucket = your PICOS3_BUCKET; keys = the PICOS3_ACCESS/SECRET_KEY env vars. Copy-paste compose file: github.com/jclement/snapsiphon → docs/self-hosting-picos3.md."),
         .init(id: "MinIO / self-hosted", endpoint: "minio.example.com",
               region: "us-east-1", pathStyle: "on",
-              note: "Any HTTPS S3-compatible server works. Region is whatever your server expects (often us-east-1)."),
+              note: "Any HTTPS S3-compatible server works (HTTPS is required — the app never speaks plain HTTP). Region is whatever your server expects (often us-east-1)."),
     ]
 
     private var providerCheatSheet: some View {

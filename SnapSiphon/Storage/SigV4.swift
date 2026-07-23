@@ -28,9 +28,12 @@ struct SigV4 {
         let amzDate = Self.amzDateFormatter.string(from: now)
         let dateStamp = Self.dateStampFormatter.string(from: now)
 
-        guard let host = url.host else {
+        guard let hostOnly = url.host else {
             return SignedRequest(url: url, method: method, headers: headers)
         }
+        // Canonical Host must match what's sent on the wire — including an
+        // explicit port (self-hosted endpoints like picos3 on :9000).
+        let host = url.port.map { "\(hostOnly):\($0)" } ?? hostOnly
 
         var canonicalHeaders = headers
         canonicalHeaders["host"] = host

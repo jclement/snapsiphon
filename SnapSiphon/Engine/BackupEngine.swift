@@ -105,6 +105,13 @@ final class BackupEngine: ObservableObject {
     /// Monotonic run counter so a stale (paused, still-draining) run's cleanup
     /// can never clobber the state of a newer run.
     private var runGeneration = 0
+    /// Consecutive transport-class upload failures; trips the circuit breaker
+    /// so a dead endpoint doesn't churn the whole queue (export+encrypt+fail
+    /// for every pending file).
+    private var consecutiveTransportFailures = 0
+    /// Set when a run is aborted early (endpoint unreachable); finishRun turns
+    /// it into a visible failed state instead of "finished".
+    private var runAbortReason: String?
     /// The previous run while its cancelled tasks finish unwinding.
     private var drainingTask: Task<Void, Never>?
     private var meter = ThroughputMeter()
@@ -886,6 +893,8 @@ final class BackupEngine: ObservableObject {
         phase = .running
         sessionUploaded = 0
         sessionBytes = 0
+        consecutiveTransportFailures = 0
+        runAbortReason = nil
         sessionStartedAt = Date()
         // One fixed lane per parallel thread — the row count stays put all run.
         let concurrency = max(1, min(settings.parallelUploads, BackupSettings.parallelRange.upperBound))
@@ -932,7 +941,11 @@ final class BackupEngine: ObservableObject {
         refreshCounts()
         uploadLanes.removeAll()
         bytesPerSecond = 0
-        if phase == .running {
+        if let reason = runAbortReason {
+            runAbortReason = nil
+            phase = .failed(reason)
+            appendLog(reason, .error)
+        } else if phase == .running {
             phase = .finished
             appendLog("Backup finished — \(sessionUploaded) uploaded this session.", .success)
         }
@@ -1009,6 +1022,17 @@ final class BackupEngine: ObservableObject {
 
         if await !waitForFavorableConditions() { return }
 
+        // Preflight: one cheap LIST against the endpoint before exporting and
+        // encrypting anything. A self-hosted node that's offline (or a tailnet
+        // the phone isn't on) should fail in seconds with a clear message, not
+        // churn the entire queue through export→encrypt→retry→fail.
+        do {
+            try await S3Client.withRetries(attempts: 2) { try await processor.client.testConnection() }
+        } catch {
+            runAbortReason = "Storage endpoint unreachable — server offline, or this network can't reach it (Tailscale/VPN off?). Nothing was uploaded; backup will retry next run."
+            return
+        }
+
         // Continuous refill — one new file starts the moment any lane frees up.
         // The old design processed fixed batches of 200 with a barrier at the
         // end of each: a multi-GB video in flight at a batch boundary idled
@@ -1042,6 +1066,14 @@ final class BackupEngine: ObservableObject {
             while let finished = await group.next() {
                 inFlight.remove(finished)
                 if Task.isCancelled { continue }                      // drain without refilling
+                // Circuit breaker: several consecutive transport failures means
+                // the endpoint died mid-run — stop cleanly instead of failing
+                // every remaining file one by one.
+                if consecutiveTransportFailures >= 3 {
+                    runAbortReason = "Storage endpoint became unreachable mid-backup — pausing the run. Uploaded files are safe; the rest retry next run."
+                    group.cancelAll()
+                    continue
+                }
                 if await !waitForFavorableConditions() { continue }   // park refills; in-flight uploads run on
                 // Top up to the (possibly changed) worker target.
                 target = await self.workerTarget
@@ -1113,6 +1145,7 @@ final class BackupEngine: ObservableObject {
             manifestDirty = true
 
             endSlot(rid)
+            consecutiveTransportFailures = 0
             sessionUploaded += 1
             if !result.alreadyPresent {
                 // Session totals only — the speed meter is fed by byte-level
@@ -1124,6 +1157,7 @@ final class BackupEngine: ObservableObject {
             // URLSession surfaces task cancellation as URLError.cancelled, not
             // CancellationError — treat both as a quiet pause, not a failure.
             let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
+            if !cancelled, S3Client.isTransient(error) { consecutiveTransportFailures += 1 }
             index.markFailed(rid, error: cancelled ? "Cancelled" : error.localizedDescription)
             endSlot(rid)
             if !cancelled {

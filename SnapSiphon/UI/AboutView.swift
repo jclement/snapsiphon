@@ -49,7 +49,7 @@ struct AboutView: View {
 
                 card("Setting up storage") {
                     Text("""
-                    Any S3-compatible provider works — Backblaze B2, Cloudflare R2, AWS, Wasabi, MinIO… The Storage screen has a per-provider cheat sheet for endpoints and regions. What makes a *great* bucket:
+                    Any S3-compatible provider works — Backblaze B2, Cloudflare R2, AWS, Wasabi, MinIO, or fully self-hosted with [picos3](https://github.com/jclement/picos3) over Tailscale (compose file in the repo's docs/). The Storage screen has a per-provider cheat sheet for endpoints and regions. What makes a *great* bucket:
 
                     • **Append-only key** — SnapSiphon only needs read/write/list (delete is only used by the optional "Purge deleted backups"). A key that can't delete means malware or a stolen phone can't destroy the archive.
                     • **Object Lock / retention** (B2) — makes objects immutable until the lock expires. Tamper-proof, even with delete rights.
