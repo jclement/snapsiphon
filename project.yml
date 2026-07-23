@@ -24,6 +24,11 @@ targets:
     platform: iOS
     sources:
       - path: SnapSiphon
+        excludes:
+          - "Resources/Help.md"
+      # Explicit resource entry — xcodegen won't bundle bare .md files on its own.
+      - path: SnapSiphon/Resources/Help.md
+        buildPhase: resources
     configFiles:
       Debug: SnapSiphon/Config/Signing.xcconfig
       Release: SnapSiphon/Config/Signing.xcconfig
