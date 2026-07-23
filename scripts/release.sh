@@ -47,15 +47,22 @@ ARCHIVE="build/SnapSiphon-$VERSION.xcarchive"
 
 echo "▸ v$VERSION  build $BUILD  commit $HASH"
 xcodegen generate --quiet
-xcodebuild -project SnapSiphon.xcodeproj -scheme SnapSiphon \
+mkdir -p build
+ALOG="build/archive-$VERSION.log"
+if ! xcodebuild -project SnapSiphon.xcodeproj -scheme SnapSiphon \
     -destination 'generic/platform=iOS' \
     -archivePath "$ARCHIVE" \
     -allowProvisioningUpdates \
     MARKETING_VERSION="$VERSION" \
     CURRENT_PROJECT_VERSION="$BUILD" \
     GIT_COMMIT_HASH="$HASH" \
-    archive | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" || true
-[[ -d "$ARCHIVE" ]] || { echo "✗ archive failed"; exit 1; }
+    archive >"$ALOG" 2>&1; then
+    grep -E "error:" "$ALOG" | head -5
+    echo "✗ archive failed — see $ALOG"
+    exit 1
+fi
+[[ -d "$ARCHIVE" ]] || { echo "✗ archive missing"; exit 1; }
+echo "✓ archived"
 
 if [[ "$UPLOAD" == 1 ]]; then
     KEY_JSON="${ASC_KEY_JSON:-}"
@@ -83,14 +90,20 @@ sys.stdout.write(f"-----BEGIN PRIVATE KEY-----\n{lines}\n-----END PRIVATE KEY---
     chmod 600 "$KEYDIR/AuthKey_$KEY_ID.p8"
 
     echo "▸ uploading to App Store Connect (TestFlight)…"
-    xcodebuild -exportArchive \
+    ULOG="build/upload-$VERSION.log"
+    if ! xcodebuild -exportArchive \
         -archivePath "$ARCHIVE" \
         -exportOptionsPlist scripts/ExportOptions.plist \
         -allowProvisioningUpdates \
         -authenticationKeyPath "$KEYDIR/AuthKey_$KEY_ID.p8" \
         -authenticationKeyID "$KEY_ID" \
         -authenticationKeyIssuerID "$ISSUER_ID" \
-        | grep -E "error:|EXPORT (SUCCEEDED|FAILED)|Upload" || true
+        >"$ULOG" 2>&1; then
+        grep -E "error:" "$ULOG" | head -5
+        echo "✗ TestFlight upload FAILED — NOT tagging. Fix and re-run (see $ULOG)."
+        exit 1
+    fi
+    echo "✓ uploaded to App Store Connect"
 fi
 
 git tag -a "v$VERSION" -m "SnapSiphon $VERSION (build $BUILD, $HASH)"
