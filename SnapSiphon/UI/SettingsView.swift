@@ -20,6 +20,10 @@ struct SettingsView: View {
     @State private var reloadingIndex = false
     @State private var showReloadConfirm = false
 
+    /// Initial cutoff when the toggle is first enabled: Jan 1 2000, i.e.
+    /// "everything" — predates any phone photo library.
+    private static let cutoffSeed = DateComponents(calendar: .current, year: 2000, month: 1, day: 1).date ?? .distantPast
+
     var body: some View {
         NavigationStack {
             if engine.isConfigured && !engine.settingsUnlocked {
@@ -83,9 +87,11 @@ struct SettingsView: View {
                                   isOn: Binding(
                                     get: { engine.settings.backupCutoff != nil },
                                     set: { on in
+                                        // Seed far in the past: flipping the toggle
+                                        // on excludes NOTHING until the user
+                                        // actually moves the date.
                                         engine.settings.backupCutoff = on
-                                            ? (engine.settings.backupCutoff
-                                               ?? Calendar.current.date(byAdding: .month, value: -2, to: Calendar.current.startOfDay(for: Date())))
+                                            ? (engine.settings.backupCutoff ?? Self.cutoffSeed)
                                             : nil
                                     }))
                         if let cutoff = engine.settings.backupCutoff {
