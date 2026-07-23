@@ -87,7 +87,7 @@ struct AboutView: View {
         HStack(spacing: 14) {
             Image(systemName: "camera.aperture")
                 .font(.system(size: 40, weight: .bold))
-                .foregroundStyle(Theme.brandGradient)
+                .foregroundStyle(Theme.teal)
             VStack(alignment: .leading, spacing: 2) {
                 Text("SnapSiphon").font(Theme.rounded(24, weight: .bold)).foregroundStyle(Theme.textPrimary)
                 Text("Encrypted photo backup — your keys, your bucket")

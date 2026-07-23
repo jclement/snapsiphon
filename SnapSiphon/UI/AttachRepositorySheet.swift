@@ -18,7 +18,7 @@ struct AttachRepositorySheet: View {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(spacing: 10) {
                         Image(systemName: "externaldrive.badge.questionmark")
-                            .font(.system(size: 34)).foregroundStyle(Theme.brandGradient)
+                            .font(.system(size: 34)).foregroundStyle(Theme.teal)
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Existing backup found")
                                 .font(Theme.rounded(20, weight: .bold)).foregroundStyle(Theme.textPrimary)

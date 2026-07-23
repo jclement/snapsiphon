@@ -48,7 +48,7 @@ struct DashboardView: View {
             HStack(spacing: 9) {
                 Image(systemName: "camera.aperture")
                     .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(Theme.brandGradient)
+                    .foregroundStyle(Theme.teal)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("SnapSiphon")
                         .font(Theme.rounded(22, weight: .bold))
@@ -194,8 +194,7 @@ struct DashboardView: View {
             .padding(14)
             .background(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(LinearGradient(colors: [.orange, Theme.violet],
-                                         startPoint: .leading, endPoint: .trailing)))
+                    .fill(Color.orange))
         }
     }
 
@@ -338,7 +337,7 @@ struct DashboardView: View {
         VStack(spacing: 16) {
             Spacer()
             Image(systemName: "lock.shield.fill")
-                .font(.system(size: 54)).foregroundStyle(Theme.brandGradient)
+                .font(.system(size: 54)).foregroundStyle(Theme.teal)
             VStack(spacing: 6) {
                 Text("Let's get set up").font(Theme.rounded(22, weight: .bold)).foregroundStyle(Theme.textPrimary)
                 Text("SnapSiphon needs an encryption key and an S3-compatible bucket before it can protect your photos.")
@@ -365,7 +364,7 @@ struct DashboardView: View {
     private func setupRow(_ icon: String, _ title: String, _ ok: Bool) -> some View {
         Card {
             HStack(spacing: 14) {
-                Image(systemName: icon).font(.system(size: 18)).foregroundStyle(Theme.brandGradient).frame(width: 28)
+                Image(systemName: icon).font(.system(size: 18)).foregroundStyle(Theme.teal).frame(width: 28)
                 Text(title).font(Theme.rounded(16, weight: .semibold)).foregroundStyle(Theme.textPrimary)
                 Spacer()
                 Image(systemName: ok ? "checkmark.circle.fill" : "circle.dashed")

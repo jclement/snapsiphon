@@ -42,7 +42,7 @@ struct SettingsView: View {
         VStack(spacing: 14) {
             Spacer()
             Image(systemName: "lock.shield.fill")
-                .font(.system(size: 54)).foregroundStyle(Theme.brandGradient)
+                .font(.system(size: 54)).foregroundStyle(Theme.teal)
             Text("Settings locked")
                 .font(Theme.rounded(22, weight: .bold)).foregroundStyle(Theme.textPrimary)
             Text("Keys, storage, and recovery settings are protected so no one can quietly redirect your backups or add their own key.")
@@ -424,7 +424,7 @@ struct SettingsView: View {
                     }
                     .padding(.horizontal, 14).padding(.vertical, 9)
                     .foregroundStyle(.black)
-                    .background(Capsule().fill(Theme.brandGradient))
+                    .background(Capsule().fill(Theme.teal))
                 }
                 .disabled(premium.purchasing)
                 Button {
@@ -473,7 +473,7 @@ struct SettingsView: View {
         Card {
             HStack(spacing: 14) {
                 Image(systemName: icon)
-                    .font(.system(size: 18)).foregroundStyle(Theme.brandGradient)
+                    .font(.system(size: 18)).foregroundStyle(Theme.teal)
                     .frame(width: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(Theme.rounded(16, weight: .semibold)).foregroundStyle(Theme.textPrimary)

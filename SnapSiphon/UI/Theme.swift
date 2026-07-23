@@ -1,8 +1,9 @@
 import SwiftUI
 
 /// Shared visual language: SnapSiphon is "polished and nerdy" — deep charcoal
-/// canvas, a teal→violet signature gradient, and monospaced type for the parts
-/// that should feel like a terminal (keys, hashes, throughput).
+/// canvas, solid teal/violet accents, and monospaced type for the parts that
+/// should feel like a terminal (keys, hashes, throughput). The teal→violet
+/// gradient is reserved for ONE thing: the progress rings.
 enum Theme {
     static let teal = Color("BrandTeal")
     static let violet = Color("BrandViolet")
@@ -15,13 +16,10 @@ enum Theme {
     static let textSecondary = Color.white.opacity(0.55)
     static let textTertiary = Color.white.opacity(0.35)
 
+    /// Rings only — everywhere else uses solid `teal`/`violet`.
     static let brandGradient = LinearGradient(
         colors: [teal, violet],
         startPoint: .topLeading, endPoint: .bottomTrailing)
-
-    static let subtleGradient = LinearGradient(
-        colors: [surfaceHi, surface],
-        startPoint: .top, endPoint: .bottom)
 
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight, design: .monospaced)
@@ -86,7 +84,7 @@ struct PrimaryButton: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 15)
             .foregroundStyle(.black)
-            .background(Theme.brandGradient)
+            .background(Theme.teal)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .opacity(enabled ? 1 : 0.35)
         }
