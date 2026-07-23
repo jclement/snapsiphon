@@ -5,21 +5,47 @@ import Foundation
 /// in. Save that one file somewhere safe and a laptop can rebuild the whole
 /// photo archive with `python3 restore.py` — no SnapSiphon, no SDKs.
 ///
-/// ⚠️ The output contains live secrets in plaintext. The UI copies it behind a
-/// warning and tells the user to store it like a password (it *is* one).
+/// ⚠️ The full export contains live secrets in plaintext — the UI gates it
+/// behind Face ID and tells the user to store it like a password (it *is*
+/// one). The secrets-free export prompts for them at run time instead.
 ///
-/// Runtime needs: python3 (stdlib only — SigV4 is implemented inline) and the
-/// `age` CLI (`brew install age`) for decryption.
+/// Runtime needs: python3 ≥3.8 (stdlib SigV4 + sqlite3), plus ONE decryption
+/// backend: the `age` CLI (preferred) or `pip3 install cryptography` (a
+/// pure-Python age-v1 decryptor is embedded).
 enum RestoreScript {
     /// `includeSecrets: false` leaves SECRET_KEY and AGE_SECRET empty — the
     /// script's startup config review highlights them as missing and prompts
     /// (hidden input) at run time, so the exported file is safe-ish to store
     /// anywhere the bucket name is acceptable.
+    /// Escape a value for embedding inside a double-quoted Python string
+    /// literal — config values are user-controlled text and must never be able
+    /// to break out of the assignment.
+    private static func pyString(_ s: String) -> String {
+        var out = ""
+        for c in s.unicodeScalars {
+            switch c {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if c.value < 0x20 { out += String(format: "\\x%02x", c.value) }
+                else { out.unicodeScalars.append(c) }
+            }
+        }
+        return out
+    }
+
     static func build(config: S3Config, credentials: S3Credentials, ageSecret: String?,
                       includeSecrets: Bool = true) -> String {
-        let secret = includeSecrets ? (ageSecret ?? "") : ""
-        let secretKey = includeSecrets ? credentials.secretAccessKey : ""
-        let prefix = config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        let secret = pyString(includeSecrets ? (ageSecret ?? "") : "")
+        let secretKey = pyString(includeSecrets ? credentials.secretAccessKey : "")
+        let endpoint = pyString(config.endpoint)
+        let region = pyString(config.region)
+        let bucket = pyString(config.bucket)
+        let accessKey = pyString(credentials.accessKeyID)
+        let prefix = pyString(config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")))
         let pathStyle = config.usesPathStyle ? "True" : "False"
         return #"""
 #!/usr/bin/env python3
@@ -39,15 +65,18 @@ Python `cryptography` package (pip3 install cryptography) as a fallback.
 ⚠️  This file contains live bucket credentials and an age secret key.
     Store it like a password. Anyone holding it can read your entire archive.
 """
+import sys
+if sys.version_info < (3, 8):
+    sys.exit("This script needs Python 3.8 or newer (you have %d.%d)." % sys.version_info[:2])
 import base64, datetime, hashlib, hmac, json, os, pathlib, re, shutil, sqlite3
-import subprocess, sys, tempfile
-import urllib.parse, urllib.request, xml.etree.ElementTree as ET
+import subprocess, tempfile, time
+import urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
 
-ENDPOINT   = "\#(config.endpoint)"
-REGION     = "\#(config.region)"
-BUCKET     = "\#(config.bucket)"
+ENDPOINT   = "\#(endpoint)"
+REGION     = "\#(region)"
+BUCKET     = "\#(bucket)"
 PREFIX     = "\#(prefix)"
-ACCESS_KEY = "\#(credentials.accessKeyID)"
+ACCESS_KEY = "\#(accessKey)"
 SECRET_KEY = "\#(secretKey)"      # empty = prompted at run
 AGE_SECRET = "\#(secret)"         # empty = prompted at run
 PATH_STYLE = \#(pathStyle)
@@ -162,7 +191,25 @@ def s3_open(method, key="", query=None):
     headers["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={ACCESS_KEY}/{scope}, "
                                 f"SignedHeaders={sh}, Signature={sig}")
     url = f"https://{host}{path}" + (f"?{cq}" if cq else "")
-    return urllib.request.urlopen(urllib.request.Request(url, method=method, headers=headers))
+    return urllib.request.urlopen(urllib.request.Request(url, method=method, headers=headers),
+                                  timeout=60)
+
+RETRYABLE_HTTP = (429, 500, 502, 503, 504)
+
+def _retry(fn, what, attempts=4):
+    """Run fn with exponential backoff on transient network/server errors."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRYABLE_HTTP or i == attempts - 1:
+                raise
+            print(f"  transient HTTP {e.code} on {what} — retry {i + 1}/{attempts - 1}", file=sys.stderr)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            if i == attempts - 1:
+                raise
+            print(f"  network hiccup on {what} ({e}) — retry {i + 1}/{attempts - 1}", file=sys.stderr)
+        time.sleep(2 ** i)
 
 def list_keys(prefix):
     keys, token = [], None
@@ -170,7 +217,7 @@ def list_keys(prefix):
         q = {"list-type": "2", "prefix": prefix}
         if token:
             q["continuation-token"] = token
-        root = ET.fromstring(s3_open("GET", "", q).read())
+        root = ET.fromstring(_retry(lambda: s3_open("GET", "", q).read(), "LIST"))
         keys += [e.text for c in root.iter(S3NS + "Contents") for e in c.iter(S3NS + "Key")]
         tok = root.find(S3NS + "NextContinuationToken")
         if tok is None or not tok.text:
@@ -178,8 +225,29 @@ def list_keys(prefix):
         token = tok.text
 
 def download(key, dest):
-    with s3_open("GET", key) as r, open(dest, "wb") as f:
-        shutil.copyfileobj(r, f)
+    def go():
+        with s3_open("GET", key) as r, open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+    _retry(go, key.rsplit("/", 1)[-1])
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def safe_name(name):
+    """Filenames come from the (encrypted) repository, but treat them as
+    untrusted anyway: no directories, no traversal, nothing Windows chokes on."""
+    name = os.path.basename(str(name).replace("\\", "/")).strip()
+    if os.name == "nt":
+        name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).rstrip(" .")
+        stem = name.split(".")[0].upper()
+        if stem in {"CON", "PRN", "AUX", "NUL",
+                    *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+            name = "_" + name
+    return "" if name in ("", ".", "..") else name
 
 # ---------- decryption backends ----------
 # Preferred: the `age` CLI. Fallback: pure-Python age-v1 decrypt using the
@@ -190,11 +258,16 @@ CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 CHUNK = 64 * 1024
 
 def bech32_decode(s, want_hrp):
-    s = s.lower()
+    s = s.strip().lower()
     pos = s.rfind("1")
+    if pos < 1:
+        sys.exit("AGE_SECRET doesn't look like a bech32 key (no separator).")
     hrp, data = s[:pos], s[pos + 1:]
     if hrp != want_hrp:
         sys.exit(f"AGE_SECRET has prefix '{hrp}', expected '{want_hrp}'")
+    bad = sorted({c for c in data if c not in CHARSET})
+    if bad:
+        sys.exit(f"AGE_SECRET contains invalid character(s): {' '.join(bad)} — check for typos or stray whitespace.")
     vals = [CHARSET.index(c) for c in data]
     GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
     chk = 1
@@ -320,6 +393,9 @@ def make_decryptor(tmp):
 def main():
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    unknown = [f for f in flags if f != "--all"]
+    if unknown:
+        sys.exit(f"Unknown option(s): {', '.join(unknown)}. Usage: restore.py [output-dir] [--all]")
     restore_all = "--all" in flags
     out = pathlib.Path(args[0] if args else "SnapSiphonRestore")
     out.mkdir(parents=True, exist_ok=True)
@@ -341,32 +417,58 @@ def main():
         complete = [g for g, files in gens.items() if 0 in files]
         if not complete:
             sys.exit(f"No checkpoint found under {base}checkpoints/ — nothing to restore.")
-        gen = max(complete)
+
+        # ---- 2. Load the newest READABLE checkpoint (encrypted SQLite).
+        #      A corrupt/undecryptable one falls back to the previous
+        #      generation instead of killing the whole restore. ----
+        items, gen = None, None
+        for candidate in sorted(complete, reverse=True):
+            ck_enc, ck_db = tmp / "ckpt.age", tmp / "ckpt.sqlite"
+            try:
+                download(gens[candidate][0], ck_enc)
+                last_hash = sha256_file(ck_enc)
+                decrypt(ck_enc, ck_db)
+                # Keyed by localIdentifier, NOT blob name: blobs are content-
+                # addressed, so identical files share one blob but restore as
+                # separate files.
+                loaded = {}   # localIdentifier -> {uuid, filename, state, hash}
+                con = sqlite3.connect(ck_db)
+                for lid, u, state, filename, plain in con.execute(
+                        "SELECT localIdentifier, uuid, state, filename, plaintextHash FROM assets WHERE uuid != ''"):
+                    if state in ("uploaded", "deleted"):
+                        loaded[lid] = {"uuid": u, "filename": filename or "", "state": state, "hash": plain}
+                con.close()
+                items, gen = loaded, candidate
+                break
+            except Exception as e:
+                print(f"WARNING: checkpoint of generation {candidate} is unreadable ({e}) — "
+                      "falling back to the previous generation.", file=sys.stderr)
+        if items is None:
+            sys.exit("No readable checkpoint in any generation — cannot restore.")
         seqs = sorted(s for s in gens[gen] if s > 0)
         print(f"Generation {gen}: checkpoint + {len(seqs)} journal(s)")
 
-        # ---- 2. Load the checkpoint (an encrypted SQLite snapshot) ----
-        ck_enc, ck_db = tmp / "ckpt.age", tmp / "ckpt.sqlite"
-        download(gens[gen][0], ck_enc)
-        last_hash = hashlib.sha256(ck_enc.read_bytes()).hexdigest()
-        decrypt(ck_enc, ck_db)
-        # Keyed by localIdentifier, NOT blob name: blobs are content-addressed,
-        # so two identical files share one blob but restore as two files.
-        items = {}   # localIdentifier -> {uuid, filename, state, hash}
-        con = sqlite3.connect(ck_db)
-        for lid, u, state, filename, plain in con.execute(
-                "SELECT localIdentifier, uuid, state, filename, plaintextHash FROM assets WHERE uuid != ''"):
-            if state in ("uploaded", "deleted"):
-                items[lid] = {"uuid": u, "filename": filename or "", "state": state, "hash": plain}
-        con.close()
-
-        # ---- 3. Replay journals, verifying the tamper-evidence chain ----
+        # ---- 3. Replay journals, verifying the tamper-evidence chain. A
+        #      single unreadable journal is skipped with a loud warning —
+        #      everything else still restores. (Note: the chain proves order
+        #      and integrity of what's present; deletion of the newest tail
+        #      journal is inherently undetectable within a generation.) ----
         for seq in seqs:
             j_enc, j_json = tmp / f"j{seq}.age", tmp / f"j{seq}.json"
-            download(gens[gen][seq], j_enc)
-            raw = j_enc.read_bytes()
-            decrypt(j_enc, j_json)
-            j = json.loads(j_json.read_text())
+            try:
+                download(gens[gen][seq], j_enc)
+                raw = j_enc.read_bytes()
+                decrypt(j_enc, j_json)
+                j = json.loads(j_json.read_text())
+            except Exception as e:
+                print(f"WARNING: journal {seq} is unreadable ({e}) — skipping it. "
+                      "Changes recorded in it will be missing from this restore.", file=sys.stderr)
+                if j_enc.exists():
+                    last_hash = sha256_file(j_enc)   # keep later chain checks meaningful
+                continue
+            finally:
+                j_enc.unlink(missing_ok=True)
+                j_json.unlink(missing_ok=True)
             if j.get("prevHash") != last_hash:
                 print(f"WARNING: journal {seq} does not chain to its predecessor — "
                       "the repository history has been altered or partially deleted. "
@@ -374,7 +476,7 @@ def main():
             last_hash = hashlib.sha256(raw).hexdigest()
             for e in j.get("entries", []):
                 op, u = e.get("op"), e.get("uuid")
-                lid = e.get("localIdentifier") or ("blob-" + u)
+                lid = e.get("localIdentifier") or ("blob-" + str(u))
                 if op in ("add", "update", "restore"):
                     prev = items.get(lid, {})
                     items[lid] = {"uuid": u,
@@ -394,40 +496,52 @@ def main():
         else:
             print(f"{len(todo)} items to restore ({len(dele)} deleted, skipped — rerun with --all to include)")
 
-        used, done, failed = {}, 0, 0
-        ordered = sorted(todo.items(), key=lambda kv: (kv[1]["filename"], kv[0]))
-        for i, (lid, it) in enumerate(ordered, 1):
-            u = it["uuid"]
-            name = it["filename"] or u
-            if used.get(name) not in (None, lid):           # filename collision
+        # Assign every output name up front, deterministically (sorted by
+        # filename then identifier, collision suffix derived from the stable
+        # identifier) — so a resumed run maps every item to the SAME file it
+        # would have gotten the first time.
+        plan, used = [], set()
+        for lid, it in sorted(todo.items(), key=lambda kv: (kv[1]["filename"], kv[0])):
+            name = safe_name(it["filename"]) or it["uuid"]
+            if name in used:                                # filename collision
                 name = hashlib.sha256(lid.encode()).hexdigest()[:8] + "-" + name
-            used[name] = lid
+            used.add(name)
+            plan.append((lid, it, name))
+
+        done, failed = 0, 0
+        restored_by_uuid = {}   # shared blobs: decrypt once, copy for twins
+        for i, (lid, it, name) in enumerate(plan, 1):
+            u = it["uuid"]
             target = out / name
             if target.exists() and target.stat().st_size > 0:
+                restored_by_uuid.setdefault(u, target)
                 continue                                    # resume: already restored
             blob = tmp / "blob.age"
             part = target.with_name(target.name + ".part")
             try:
-                download(base + "objects/" + u, blob)
-                # Decrypt to a temp name and rename only on success, so an
-                # interrupted/failed decrypt can't leave a partial file that the
-                # resume check above would silently accept as restored.
-                decrypt(blob, part)
-                if it.get("hash"):                          # end-to-end integrity
-                    h = hashlib.sha256()
-                    with open(part, "rb") as f:
-                        for chunk in iter(lambda: f.read(1 << 20), b""):
-                            h.update(chunk)
-                    if h.hexdigest() != it["hash"]:
-                        raise ValueError("decrypted file fails its integrity hash")
+                twin = restored_by_uuid.get(u)
+                if twin is not None and twin.exists():
+                    shutil.copyfile(twin, part)             # same content, already verified
+                else:
+                    download(base + "objects/" + u, blob)
+                    # Decrypt to a temp name and rename only on success, so an
+                    # interrupted/failed decrypt can't leave a partial file that
+                    # the resume check above would silently accept as restored.
+                    decrypt(blob, part)
+                    blob.unlink(missing_ok=True)
+                if it.get("hash") and sha256_file(part) != it["hash"]:
+                    raise ValueError("decrypted file fails its integrity hash")
                 os.replace(part, target)
+                restored_by_uuid.setdefault(u, target)
                 done += 1
-                print(f"[{i}/{len(todo)}] {name}")
+                print(f"[{i}/{len(plan)}] {name}")
             except Exception as e:                          # keep going; report at end
                 part.unlink(missing_ok=True)
                 failed += 1
-                print(f"[{i}/{len(todo)}] FAILED {u}: {e}", file=sys.stderr)
+                print(f"[{i}/{len(plan)}] FAILED {u}: {e}", file=sys.stderr)
     print(f"Done: {done} restored, {failed} failed → {out}")
+    if failed:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

@@ -11,8 +11,10 @@ import CryptoKit
 /// <prefix>/checkpoints/000002/…                 next self-contained generation
 /// ```
 ///
-/// Principles (see docs/design): blobs are immutable and named by random UUID
-/// (no content hashes → no confirmation attacks; no extensions → no type leak);
+/// Principles (see docs/design): blobs are immutable and named by SALTED
+/// content address — HMAC-SHA256(repo salt, sha256(content)) — deterministic
+/// per repository (idempotent uploads, dedup) yet opaque to outsiders (no
+/// confirmation attacks without the salt; no extensions → no type leak);
 /// metadata is append-only; each generation is restorable alone; the local
 /// SQLite is only a cache — checkpoint + journals are the source of truth;
 /// blobs upload BEFORE journal commit, so a crash strands only ignorable

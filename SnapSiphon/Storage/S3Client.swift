@@ -102,6 +102,7 @@ final class S3Client {
     func putObject(fileURL: URL, key: String, contentType: String,
                    contentMD5: String? = nil,
                    bytesPerSecond: Double = 0,
+                   ifNoneMatch: Bool = false,
                    now: Date = Date(),
                    progress: ((Double) -> Void)? = nil) async throws {
         let url = try objectURL(key: key)
@@ -111,6 +112,9 @@ final class S3Client {
         if let size { headers["content-length"] = String(size) }
         // Object-Lock buckets (and integrity-checking in general) require Content-MD5.
         if let contentMD5 { headers["content-md5"] = contentMD5 }
+        // Conditional create (AWS/R2 honor it; others ignore it harmlessly):
+        // fails 412 if the key already exists, making create-once atomic.
+        if ifNoneMatch { headers["if-none-match"] = "*" }
         let signed = signer.sign(method: "PUT", url: url, headers: headers, now: now)
 
         var request = URLRequest(url: url)

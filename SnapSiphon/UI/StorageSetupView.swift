@@ -51,9 +51,14 @@ struct StorageSetupView: View {
                     statusBanner(status)
                 }
 
+                if engine.isRunActive {
+                    Text("A backup is running — pause it before changing storage, so journals and blobs can't split across two destinations.")
+                        .font(.system(size: 12)).foregroundStyle(.orange)
+                }
                 PrimaryButton(title: testing ? "Testing…" : "Save & Test",
                               systemImage: testing ? "hourglass" : "checkmark.seal",
-                              enabled: draft.isComplete && !accessKeyID.isEmpty && !secretKey.isEmpty && !testing) {
+                              enabled: draft.isComplete && !accessKeyID.isEmpty && !secretKey.isEmpty
+                                       && !testing && !engine.isRunActive) {
                     Task { await saveAndTest() }
                 }
 
@@ -101,7 +106,10 @@ struct StorageSetupView: View {
 
     private func commit() {
         let old = engine.s3Config
-        if old.isComplete, (old.bucket != draft.bucket || old.endpoint != draft.endpoint) {
+        // ANY change to where objects land is a destination change — prefix
+        // and path-style included. A prefix edit moves the whole repository.
+        if old.isComplete, (old.bucket != draft.bucket || old.endpoint != draft.endpoint
+                            || old.prefix != draft.prefix || old.usesPathStyle != draft.usesPathStyle) {
             engine.noteDestinationChanged()
         }
         engine.s3Config = draft

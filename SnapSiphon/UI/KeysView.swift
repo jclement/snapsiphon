@@ -239,6 +239,10 @@ struct KeysView: View {
                         do {
                             try manager.addRecipient(pastedRecipient)
                             pastedRecipient = ""
+                            // New key can't read anything already written —
+                            // roll a fresh checkpoint so it can at least read
+                            // the index (and everything from here on).
+                            engine.noteRecipientsChanged()
                         } catch {
                             errorText = error.localizedDescription
                         }
@@ -268,6 +272,7 @@ struct KeysView: View {
         do {
             try manager.importIdentity(secret)
             pastedRecipient = ""
+            engine.noteRecipientsChanged()
         } catch {
             errorText = error.localizedDescription
         }

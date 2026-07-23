@@ -38,6 +38,21 @@ struct DashboardView: View {
                 AttachRepositorySheet(info: info)
                     .environmentObject(engine)
             }
+            // The configured folder is EMPTY but the index still lists uploads
+            // from a previous destination — never write a checkpoint that
+            // claims backups this bucket doesn't hold.
+            .alert("New folder, existing index",
+                   isPresented: Binding(get: { engine.pendingFreshInit != nil },
+                                        set: { if !$0 { engine.pendingFreshInit = nil } }),
+                   presenting: engine.pendingFreshInit) { info in
+                Button("Re-upload here") {
+                    engine.confirmFreshInitRequeueAll()
+                    engine.backUpNow()
+                }
+                Button("Cancel", role: .cancel) { engine.pendingFreshInit = nil }
+            } message: { info in
+                Text("This folder is empty, but the index lists \(Format.count(info.staleUploads)) backups made to a previous destination. Re-upload queues them all for THIS folder (already-present files are skipped automatically). Or cancel and fix the destination in Settings → Storage.")
+            }
         }
     }
 

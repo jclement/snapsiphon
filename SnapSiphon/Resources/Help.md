@@ -4,7 +4,7 @@
 
 SnapSiphon exists because of a NAS. A shiny new network-storage box arrived, its photo-backup app was switched on with great optimism, and — let's just say the optimism did not survive the week.
 
-Which forced the actual question: photos are the one dataset that's truly irreplaceable, and the two standard answers are both uncomfortable. Trusting everything to Apple alone is a single point of failure with a monthly fee. Syncing originals in plaintext to somebody else's cloud is a hard nope.
+Which forced the actual question: photos are the one dataset that's truly irreplaceable, and the two standard answers are both uncomfortable. Trusting everything to a single vendor alone is a single point of failure with a monthly fee. Syncing my private photo collection in plaintext to somebody else's cloud is a hard nope.
 
 So — *SnapSiphon*:
 
@@ -39,9 +39,33 @@ Inside your bucket, under your chosen prefix, lives a **repository**:
 - **Journals** → `checkpoints/000001/journal000001.age`, … — append-only encrypted change logs (adds, deletions, purges). Every journal records the hash of its predecessor, so rollback, deletion, or reordering of history is detectable.
 - **The bucket is the source of truth** — the app's local database is just a cache and can be rebuilt from the repository at any time (Settings → Repository).
 - Blobs upload **before** their journal entry commits: a crash mid-backup strands at most an unreferenced blob, never a phantom journal entry.
-- **Deletions** are journaled immediately; blobs are physically removed only if "Purge deleted backups" is on, after the grace period (and Object Lock permitting).
+- **Deletions** are journaled immediately; blobs are physically removed only by garbage collection — the automatic "Purge deleted backups" toggle or the manual *Clean up now* button — after the grace period (and Object Lock permitting).
 - **Integrity**: the repository stores sha256 hashes of both the original file and the ciphertext; restores verify end-to-end. Uploads also carry Content-MD5.
 - **Live Photos**: the full-quality still is backed up; the 3-second motion clip is not yet (planned).
+- **Very large videos**: a single upload tops out around the S3 5 GB single-request ceiling (provider-dependent). Files beyond it fail with a clear error rather than uploading partially; multipart support is planned.
+
+## One phone per folder
+
+- Each device writes its own journal chain, so **two devices must never back up into the same folder** — give each its own prefix (or bucket).
+- Pointing a fresh install at a folder that already holds a repository raises a prompt: **take over** (reload the index from the bucket — right after a reinstall or when the old phone is retired), **verify match first** (read-only comparison), or **use a different folder**.
+- If a foreign journal ever appears where this phone was about to write, backups halt with a conflict banner instead of corrupting anything.
+- After taking over on a **new** phone, the repository's history is preserved and nothing re-uploads (identical content is recognized by its address). The new phone's own library is re-indexed alongside; deletion tracking applies only to photos this phone has actually seen.
+
+## What to back up
+
+- **Photos / Videos / Favorites-only** filters, plus **Back up from** — an optional cutoff date: content captured before it is skipped and left out of the progress ring. Handy for testing, or when older content already lives in another backup.
+- **Photo access**: with *full* access everything works. Under *limited* access (only selected photos shared), backup works but **deletion tracking is disabled** — an unselected photo is indistinguishable from a deleted one, so nothing is ever tombstoned in that mode.
+- **Mass-deletion fuse**: if a huge fraction of the archive suddenly reads as deleted (an iCloud hiccup, a signed-out account), SnapSiphon refuses to record the deletions and says so, instead of tombstoning your whole archive.
+
+## Background backups & Premium
+
+- The one paid feature: **Back up in the background** (a small one-time purchase). iOS grants short processing windows — typically overnight, charging, on Wi-Fi — and SnapSiphon uploads new photos during them. Best-effort by design: iOS decides when.
+- Everything else — manual backups, verification, restore, all the knobs — is free forever.
+- **Reminders**: optional notification when no backup has run for N days; pairs well with background backup as a safety net.
+
+## Face ID lock
+
+Once configured, the Settings tab locks behind Face ID / passcode, so nobody holding your unlocked phone can quietly redirect the bucket, add their own key, or export the restore script. Revealing the secret key and exporting a with-secrets restore script each require a separate confirmation on top.
 
 ## Getting your photos back
 
@@ -55,7 +79,7 @@ Three independent paths, none of which need this app:
 
 Any S3-compatible provider works — Backblaze B2, Cloudflare R2, AWS, Wasabi, MinIO, or fully self-hosted with [picos3](https://github.com/jclement/picos3) over Tailscale (compose file in the repo's docs/). The Storage screen has a per-provider cheat sheet for endpoints and regions. What makes a *great* bucket:
 
-- **Append-only key** — SnapSiphon only needs read/write/list (delete is only used by the optional "Purge deleted backups"). A key that can't delete means malware or a stolen phone can't destroy the archive.
+- **Append-only key** — SnapSiphon only needs read/write/list for backups. Delete permission (specifically *version* delete on versioned buckets) is used only by garbage collection — the "Purge deleted backups" toggle and *Clean up now*. A key that can't delete means malware or a stolen phone can't destroy the archive; cleanup then simply reports "blocked" until retention expires or you use a fuller key.
 - **Object Lock / retention** (B2) — makes objects immutable until the lock expires. Tamper-proof, even with delete rights.
 - **Keep all versions, no lifecycle expiry** — this is a forever archive; nothing should age out on its own.
 - **One bucket, one key** — scope the application key to just this bucket.

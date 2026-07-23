@@ -39,6 +39,17 @@ struct AttachRepositorySheet: View {
                     .padding(10)
                     .background(RoundedRectangle(cornerRadius: 10).fill(Color.red.opacity(0.12)))
 
+                    if !engine.keyManager.hasIdentity {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "key.slash")
+                                .foregroundStyle(.orange).font(.system(size: 14))
+                            Text("This phone holds no secret key, so it cannot read this repository. To take over or verify, first import your saved AGE-SECRET-KEY in Settings → Encryption key. With a public key only, your option here is a different folder.")
+                                .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                        }
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
+                    }
+
                     VStack(spacing: 10) {
                         optionButton(icon: "arrow.triangle.2.circlepath",
                                      title: "Take over this repository",

@@ -202,6 +202,17 @@ final class AgeKeyManager: ObservableObject {
         hasIdentity = false
     }
 
+    // MARK: Device-scoped scratch values
+
+    /// A value that lives in the ThisDeviceOnly keychain — it survives app
+    /// re-installs on the SAME phone but never migrates to a restored/cloned
+    /// one. The engine keeps its writer instance ID here so a device-transfer
+    /// clone can't impersonate the original writer.
+    func deviceScopedValue(account: String) -> String? { readString(account: account) }
+    func setDeviceScopedValue(_ value: String, account: String) {
+        try? write(value, account: account)
+    }
+
     // MARK: Keychain plumbing
 
     private static func split(_ joined: String) -> [String] {

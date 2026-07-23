@@ -19,6 +19,8 @@ struct SettingsView: View {
     @State private var compacting = false
     @State private var reloadingIndex = false
     @State private var showReloadConfirm = false
+    @State private var showPurgeConfirm = false
+    @State private var purgePendingCount = 0
 
     /// Initial cutoff when the toggle is first enabled: Jan 1 2000, i.e.
     /// "everything" — predates any phone photo library.
@@ -161,7 +163,23 @@ struct SettingsView: View {
                         Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Purge deleted backups automatically",
                                   subtitle: "Garbage-collect on every sync: best-effort removal of deleted photos' blobs after the grace period. Off = blobs are kept forever (marked only). Needs a key with delete permission — pointless on append-only buckets until retention expires.",
-                                  isOn: $engine.settings.propagateDeletes)
+                                  isOn: Binding(
+                                    get: { engine.settings.propagateDeletes },
+                                    set: { on in
+                                        // Turning this ON can free blobs on the
+                                        // very next automatic sync — confirm
+                                        // with the real number first.
+                                        if on { purgePendingCount = engine.purgeEligibleCount(); showPurgeConfirm = true }
+                                        else { engine.settings.propagateDeletes = false }
+                                    }))
+                        .alert("Enable automatic purge?", isPresented: $showPurgeConfirm) {
+                            Button("Enable", role: .destructive) { engine.settings.propagateDeletes = true }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text(purgePendingCount > 0
+                                 ? "\(Format.count(purgePendingCount)) deleted backup\(purgePendingCount == 1 ? " is" : "s are") already past the grace period — their storage is freed on the NEXT sync, permanently. Photos deleted more recently stay recoverable until their grace period ends."
+                                 : "Nothing is currently past the grace period. From now on, deleted photos' storage is freed automatically once their grace period ends.")
+                        }
                         if engine.settings.propagateDeletes {
                             Divider().overlay(Theme.hairline)
                             SliderRow(title: "Purge grace period",

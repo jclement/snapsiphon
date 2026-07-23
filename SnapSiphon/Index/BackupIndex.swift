@@ -36,9 +36,17 @@ final class BackupIndex {
                 plaintextHash TEXT,
                 ciphertextHash TEXT,
                 journaled INTEGER NOT NULL DEFAULT 0,
-                deletedAt REAL
+                deletedAt REAL,
+                localSeen INTEGER NOT NULL DEFAULT 0
             );
         """)
+        // v2.1 migration: localSeen tracks "this phone's library has shown me
+        // this asset" — the precondition for tombstoning it on absence.
+        let hasLocalSeen = db.scalarInt(
+            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='localSeen';")
+        if hasLocalSeen == 0 {
+            db.exec("ALTER TABLE assets ADD COLUMN localSeen INTEGER NOT NULL DEFAULT 0;")
+        }
         db.exec("CREATE INDEX IF NOT EXISTS idx_state ON assets(state);")
         db.exec("CREATE INDEX IF NOT EXISTS idx_journaled ON assets(journaled);")
         db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")
@@ -130,6 +138,19 @@ final class BackupIndex {
         }
     }
 
+    /// State-guarded variant for the journal flush: only stamps rows still in
+    /// the state that was journaled. A row that changed mid-flight (e.g. a
+    /// tombstone recorded while its `add` was being written) keeps journaled=0
+    /// so the NEW state gets its own entry next flush.
+    func markJournaled(records: [AssetRecord]) {
+        queue.sync {
+            for r in records {
+                db.exec("UPDATE assets SET journaled=1 WHERE localIdentifier=? AND state=?;",
+                        [.text(r.localIdentifier), .text(r.state.rawValue)])
+            }
+        }
+    }
+
     func unjournaledCount() -> Int {
         queue.sync {
             Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE journaled=0 AND state IN ('uploaded','deleted');"))
@@ -144,13 +165,65 @@ final class BackupIndex {
         }
     }
 
-    /// True when any OTHER live (non-deleted) row points at this blob —
-    /// with content addressing, identical files share one blob, so a purge
-    /// must not delete a blob a surviving twin still needs.
-    func blobSharedByLive(_ uuid: String, excluding localIdentifier: String) -> Bool {
+    /// True when any row OUTSIDE `excluding` still points at this blob — live
+    /// twins AND tombstones still inside their grace window (both restorable,
+    /// both need the blob). With content addressing, identical files share one
+    /// blob; a purge may only delete it when no reference outside the current
+    /// purge batch remains.
+    func blobReferencedOutside(_ uuid: String, excluding ids: Set<String>) -> Bool {
         queue.sync {
-            db.scalarInt("SELECT COUNT(*) FROM assets WHERE uuid=? AND localIdentifier != ? AND state != 'deleted';",
-                         [.text(uuid), .text(localIdentifier)]) > 0
+            let refs = (try? db.query("SELECT localIdentifier FROM assets WHERE uuid=?;",
+                                      [.text(uuid)]) { $0.text(0) }) ?? []
+            return refs.contains { !ids.contains($0) }
+        }
+    }
+
+    /// A shared blob was re-uploaded (verify repair): keep every referencing
+    /// row's stored hashes/size in sync with the new ciphertext, and re-journal
+    /// them so the repository metadata follows.
+    func updateTwinHashes(uuid: String, plaintextHash: String, ciphertextHash: String,
+                          byteSize: Int64, excluding localIdentifier: String) {
+        queue.sync {
+            db.exec("""
+                UPDATE assets SET plaintextHash=?, ciphertextHash=?, byteSize=?, journaled=0
+                WHERE uuid=? AND localIdentifier != ? AND state IN ('uploaded','deleted');
+                """,
+                [.text(plaintextHash), .text(ciphertextHash), .int(byteSize),
+                 .text(uuid), .text(localIdentifier)])
+        }
+    }
+
+    func deletedRecords() -> [AssetRecord] {
+        queue.sync {
+            (try? db.query("SELECT * FROM assets WHERE state='deleted';", [], Self.mapRow)) ?? []
+        }
+    }
+
+    // MARK: Locally-seen tracking (multi-device safety)
+
+    /// Mark rows as having been observed in THIS phone's photo library (or
+    /// uploaded from it). Absence-from-library may only tombstone rows that
+    /// were seen here — rows imported from another install's repository must
+    /// never read as "deleted" just because this phone never had them.
+    func markLocalSeen(_ localIdentifiers: [String]) {
+        queue.sync {
+            for chunk in stride(from: 0, to: localIdentifiers.count, by: 500).map({
+                Array(localIdentifiers[$0..<min($0 + 500, localIdentifiers.count)])
+            }) {
+                let marks = chunk.map { _ in "?" }.joined(separator: ",")
+                db.exec("UPDATE assets SET localSeen=1 WHERE localSeen=0 AND localIdentifier IN (\(marks));",
+                        chunk.map { .text($0) })
+            }
+        }
+    }
+
+    /// Uploaded rows this phone has actually seen locally — the only rows
+    /// deletion reconciliation may tombstone.
+    func locallySeenUploadedPairs() -> [(id: String, uuid: String)] {
+        queue.sync {
+            (try? db.query("SELECT localIdentifier, uuid FROM assets WHERE state='uploaded' AND localSeen=1;", []) {
+                (id: $0.text(0), uuid: $0.text(1))
+            }) ?? []
         }
     }
 
@@ -189,6 +262,17 @@ final class BackupIndex {
     func hardDeleteRecord(_ localIdentifier: String) {
         queue.sync {
             db.exec("DELETE FROM assets WHERE localIdentifier=?;", [.text(localIdentifier)])
+        }
+    }
+
+    /// Destination changed to a fresh location: every "uploaded" claim refers
+    /// to blobs that live elsewhere. Requeue them all (journaled=0) so the new
+    /// repository is built from actual uploads, not inherited claims.
+    @discardableResult
+    func requeueAllUploaded() -> Int {
+        queue.sync {
+            db.exec("UPDATE assets SET state='pending', journaled=0, lastError='Destination changed' WHERE state='uploaded';")
+            return Int(db.scalarInt("SELECT changes();"))
         }
     }
 
@@ -288,7 +372,16 @@ final class BackupIndex {
         }
     }
 
+    /// Meta keys that describe the WRITER's position in the journal chain, not
+    /// the repository itself. A checkpoint inevitably embeds the snapshotting
+    /// device's (stale) position — importing it would let a half-finished
+    /// reload silently fork the chain, so these never cross the import.
+    private static let writerLocalMetaKeys: Set<String> =
+        ["repo.generation", "repo.nextSeq", "repo.lastHash"]
+
     /// Replace this database's contents with a decrypted checkpoint snapshot.
+    /// Repository-level meta (the blob salt) imports; writer-position meta
+    /// does not — the caller re-derives its own position from the replay.
     func importSnapshot(from url: URL) throws {
         let snap = try SQLiteDatabase(path: url.path)
         let rows = try snap.query("SELECT * FROM assets;", [], Self.mapRow)
@@ -300,7 +393,7 @@ final class BackupIndex {
             db.exec("DELETE FROM meta;")
         }
         for r in rows { upsert(r) }
-        for (k, v) in metaRows { setMeta(k, v) }
+        for (k, v) in metaRows where !Self.writerLocalMetaKeys.contains(k) { setMeta(k, v) }
     }
 
     /// Apply one journal's entries on top of current state (repo replay).

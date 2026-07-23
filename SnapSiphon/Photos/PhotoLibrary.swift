@@ -3,8 +3,9 @@ import Photos
 
 /// Wraps PhotoKit: authorization, enumeration, and exporting an asset's original
 /// file to a temp URL for encryption + upload. Uses the *original* resource so
-/// backups are the untouched masters (including RAW/Live Photo components where
-/// available), not re-encoded derivatives.
+/// backups are untouched masters, not re-encoded derivatives. One resource per
+/// asset: a Live Photo's motion clip and a RAW+JPEG's secondary file are NOT
+/// yet included (disclosed in Help).
 final class PhotoLibrary {
 
     enum AuthState {
