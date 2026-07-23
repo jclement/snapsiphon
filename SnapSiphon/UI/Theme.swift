@@ -5,7 +5,7 @@ import SwiftUI
 /// should feel like a terminal (keys, hashes, throughput). The teal→violet
 /// gradient is reserved for ONE thing: the progress rings.
 enum Theme {
-    static let teal = Color("BrandTeal")
+    static let teal = Color("BrandTeal")   // steel blue (name kept for churn-free refs)
     static let violet = Color("BrandViolet")
 
     static let canvas = Color(red: 0.043, green: 0.055, blue: 0.078)
