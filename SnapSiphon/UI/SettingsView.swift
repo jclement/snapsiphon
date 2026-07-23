@@ -198,6 +198,8 @@ struct SettingsView: View {
                         if let status = engine.gcStatus {
                             Text(status)
                                 .font(Theme.mono(12))
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .foregroundStyle(status.hasPrefix("✓") ? .green
                                                  : status.hasPrefix("✗") ? .red : Theme.textSecondary)
                         }
@@ -234,6 +236,8 @@ struct SettingsView: View {
                         if let status = engine.checkpointStatus {
                             Text(status)
                                 .font(Theme.mono(12))
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .foregroundStyle(status.hasPrefix("✓") ? .green
                                                  : status.hasPrefix("✗") ? .red : Theme.textSecondary)
                         }
@@ -271,6 +275,8 @@ struct SettingsView: View {
                         if let status = engine.attachStatus {
                             Text(status)
                                 .font(Theme.mono(12))
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .foregroundStyle(status.hasPrefix("✓") ? .green
                                                  : status.hasPrefix("✗") ? .red : Theme.textSecondary)
                         }
@@ -300,6 +306,8 @@ struct SettingsView: View {
                         if let status = engine.verifyStatus {
                             Text(status)
                                 .font(Theme.mono(12))
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .foregroundStyle(status.hasPrefix("✓") ? .green
                                                  : status.hasPrefix("✗") ? .red : Theme.textSecondary)
                         }
@@ -339,9 +347,7 @@ struct SettingsView: View {
                             .onChange(of: engine.settings.reminderDays) { _, _ in
                                 engine.rescheduleReminder()
                             }
-                    }
-
-                    knobGroup("Scanning") {
+                        Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Auto back up on open",
                                   subtitle: "Start a backup when the app opens, if the last run finished more than 30 minutes ago.",
                                   isOn: $engine.settings.autoStartOnLaunch)
@@ -351,6 +357,8 @@ struct SettingsView: View {
                         if let status = engine.scanStatus, engine.phase != .scanning {
                             Text(status)
                                 .font(Theme.mono(12))
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .foregroundStyle(.green)
                         }
                     }
