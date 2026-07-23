@@ -192,6 +192,7 @@ struct SettingsView: View {
                                 }
                                 Spacer()
                             }
+                            .multilineTextAlignment(.leading)
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
                         .disabled(!engine.isConfigured || engine.phase.isActive)
@@ -230,6 +231,7 @@ struct SettingsView: View {
                                 }
                                 Spacer()
                             }
+                            .multilineTextAlignment(.leading)
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
                         .disabled(!engine.isConfigured || engine.phase.isActive || compacting)
@@ -257,6 +259,7 @@ struct SettingsView: View {
                                 }
                                 Spacer()
                             }
+                            .multilineTextAlignment(.leading)
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
                         .disabled(!engine.isConfigured || engine.phase.isActive || reloadingIndex)
@@ -300,6 +303,7 @@ struct SettingsView: View {
                                 }
                                 Spacer()
                             }
+                            .multilineTextAlignment(.leading)
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
                         .disabled(!engine.isConfigured || engine.phase.isActive || engine.verifying)
@@ -324,6 +328,7 @@ struct SettingsView: View {
                                 }
                                 Spacer()
                             }
+                            .multilineTextAlignment(.leading)
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
                         .disabled(!engine.isConfigured)
