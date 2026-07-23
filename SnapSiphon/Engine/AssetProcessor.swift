@@ -8,7 +8,6 @@ struct AssetProcessor {
     let photos: PhotoLibrary
     let client: S3Client
     let recipients: [Age.Recipient]
-    let encryptFilenames: Bool
     let tempDir: URL
 
     /// Where a file currently is in its lane's pipeline (drives the lane UI).
@@ -51,8 +50,7 @@ struct AssetProcessor {
 
         let key = client.fullKey(for: Self.remoteKey(
             localIdentifier: record.localIdentifier, filename: exported.filename,
-            createdAt: record.createdAt, mediaType: record.mediaType,
-            encryptFilenames: encryptFilenames))
+            createdAt: record.createdAt, mediaType: record.mediaType))
 
         // 2. Optionally skip if already present — this still saves the (large)
         //    encrypt + upload, though the export above already happened.
@@ -118,29 +116,16 @@ struct AssetProcessor {
         return Data(md5.finalize())
     }
 
-    /// The object name for an asset. Deterministic from the stable local
-    /// identifier, so re-runs overwrite the same object.
-    /// - Filenames encrypted (default): `ab/<sha256>.<ext>.age` — the bucket
-    ///   never sees the real name, but the extension is kept so you can tell a
-    ///   PNG from a JPEG from a MOV at a glance (a small, deliberate leak).
-    /// - Filenames plain: `yyyy/MM/<originalName>.age`.
+    /// The object name for an asset: `ab/<sha256-of-asset-id>.<ext>.age`.
+    /// Deterministic from the stable local identifier (re-runs overwrite the
+    /// same object; collisions impossible), private (the bucket never sees real
+    /// names — the encrypted manifest carries them), with the extension kept so
+    /// object types are recognisable at a glance.
     static func remoteKey(localIdentifier: String, filename: String, createdAt: Date?,
-                          mediaType: AssetRecord.MediaType, encryptFilenames: Bool) -> String {
+                          mediaType: AssetRecord.MediaType) -> String {
         let ext = fileExtension(filename: filename, mediaType: mediaType)
-        if encryptFilenames {
-            let hex = identifierHash(localIdentifier)
-            return "\(hex.prefix(2))/\(hex).\(ext).age"
-        } else {
-            // A per-asset suffix keeps keys unique: two photos can share a
-            // filename and month (IMG_0042.HEIC from two cameras, AirDrops,
-            // FullSizeRender.jpg…) and must never overwrite each other.
-            let stamp = Self.folderFormatter.string(from: createdAt ?? Date(timeIntervalSince1970: 0))
-            let base = ((filename as NSString).deletingPathExtension.isEmpty
-                        ? filename : (filename as NSString).deletingPathExtension)
-                .replacingOccurrences(of: "/", with: "_")
-            let suffix = identifierHash(localIdentifier).prefix(8)
-            return "\(stamp)/\(base)-\(suffix).\(ext).age"
-        }
+        let hex = identifierHash(localIdentifier)
+        return "\(hex.prefix(2))/\(hex).\(ext).age"
     }
 
     /// The stable hash used as an asset's object name — exposed so the adopt

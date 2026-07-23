@@ -845,7 +845,7 @@ final class BackupEngine: ObservableObject {
                 appendLog("Adopted \(Format.count(adopted)) existing backup\(adopted == 1 ? "" : "s") from the bucket — no re-upload needed.", .success)
                 adoptStatus = "✓ Adopted \(Format.count(adopted)) existing backups"
             } else if !auto {
-                adoptStatus = "No bucket objects match this library (different device, or plain-filename mode?)."
+                adoptStatus = "No bucket objects match this library (backups from a different device?)."
             }
         } catch {
             if !auto { adoptStatus = "✗ \(error.localizedDescription)" }
@@ -894,7 +894,7 @@ final class BackupEngine: ObservableObject {
         appendLog("Backup started.", .info)
 
         let processor = AssetProcessor(photos: photos, client: client, recipients: recipients,
-                                       encryptFilenames: settings.encryptFilenames, tempDir: tempDir)
+                                       tempDir: tempDir)
 
         let draining = drainingTask
         drainingTask = nil

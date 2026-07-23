@@ -29,7 +29,7 @@ struct AboutView: View {
                     Text("""
                     Inside your bucket, under your chosen prefix:
 
-                    • **Photos/videos** → `ab/<sha256-of-asset-id>.<ext>.age` — hashed names (the extension is kept so you can tell types apart), or `yyyy/MM/<name>.age` if filename encryption is off.
+                    • **Photos/videos** → `ab/<sha256-of-asset-id>.<ext>.age` — always hashed names, so the bucket never sees what anything is called (the extension is kept so you can tell types apart; the manifest maps names back).
                     • **Manifests** → `manifests/manifest-<timestamp>.age` — an age-encrypted JSON index written after every backup: object key → original filename, dates, sizes, and which items were deleted on-device. The newest one is the source of truth.
                     • **Deletions** are marked in the manifest immediately; blobs are only physically removed if "Purge deleted backups" is on, after the grace period.
                     • **Integrity**: every upload carries its MD5 (Content-MD5); Verify compares stored checksums against bucket ETags with zero downloads.

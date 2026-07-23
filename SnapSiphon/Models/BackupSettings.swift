@@ -23,9 +23,6 @@ struct BackupSettings: Codable, Equatable {
     var keepScreenOnWhileUploading: Bool = true
     var runInLowPowerMode: Bool = false
 
-    // Encryption
-    var encryptFilenames: Bool = true       // hash the object key so names don't leak
-
     // Housekeeping
     var verifyRemoteBeforeUpload: Bool = false  // HEAD each object before PUT (slower, safer)
     var autoStartOnLaunch: Bool = false

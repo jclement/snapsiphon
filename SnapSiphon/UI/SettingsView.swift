@@ -109,10 +109,6 @@ struct SettingsView: View {
                     }
 
                     knobGroup("Privacy & safety") {
-                        ToggleRow(title: "Encrypt filenames",
-                                  subtitle: "Store objects under hashed names so the bucket leaks nothing.",
-                                  isOn: $engine.settings.encryptFilenames)
-                        Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Verify before upload",
                                   subtitle: "Checks the bucket for each file before encrypting/uploading, and skips ones already there. Turn on after a reinstall, a phone restore, or a crash mid-backup — anytime the local index might disagree with the bucket. Costs one cheap request per file.",
                                   isOn: $engine.settings.verifyRemoteBeforeUpload)

@@ -10,7 +10,7 @@ Polished and nerdy. Your keys, your bucket, zero trust in the provider.
 SnapSiphon walks your photo library, encrypts every original **on-device** with
 [age](https://age-encryption.org), and uploads the ciphertext to an
 S3-compatible bucket you control. The storage provider never sees a decrypted
-byte — or even a real filename, if you leave filename-hashing on.
+byte — or even a real filename: objects are stored under hashed names, and the encrypted manifest maps them back.
 
 - **End-to-end encryption with age.** Paste an `age1…` public key you already
   own (SnapSiphon can then *encrypt but never decrypt* — the safest mode), or
@@ -28,7 +28,7 @@ byte — or even a real filename, if you leave filename-hashing on.
   parallel-upload count, **mid-stream speed limit** (a throttled bound-stream
   body, not just a per-file average), **Wi-Fi-only** and **pause-on-low-battery**
   (the run loop parks on a closed gate and resumes automatically), keep-screen-on,
-  filename encryption, and **verify-before-upload** (HEAD-skip objects already in
+  and **verify-before-upload** (HEAD-skip objects already in
   the bucket).
 - **Multiple recipients, incl. hardware keys.** Encrypts to every recipient at
   once (any one decrypts). Native X25519 (`age1…`) plus **Secure Enclave**
