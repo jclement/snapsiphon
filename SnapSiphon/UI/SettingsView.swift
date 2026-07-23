@@ -155,12 +155,6 @@ struct SettingsView: View {
                                   isOn: $engine.settings.keepScreenOnWhileUploading)
                     }
 
-                    knobGroup("Privacy & safety") {
-                        ToggleRow(title: "Verify before upload",
-                                  subtitle: "Checks the bucket for each file before encrypting/uploading, and skips ones already there. Turn on after a reinstall, a phone restore, or a crash mid-backup — anytime the local index might disagree with the bucket. Costs one cheap request per file.",
-                                  isOn: $engine.settings.verifyRemoteBeforeUpload)
-                    }
-
                     knobGroup("Deletions") {
                         Text("Photos you delete on-device are always recorded as deleted in the encrypted journal, so restores skip them (a disaster restore can still recover un-purged ones with --all).")
                             .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
@@ -352,33 +346,8 @@ struct SettingsView: View {
                                   subtitle: "Start a backup when the app opens, if the last run finished more than 30 minutes ago.",
                                   isOn: $engine.settings.autoStartOnLaunch)
                         Divider().overlay(Theme.hairline)
-                        ToggleRow(title: "Fast scan",
-                                  subtitle: "Only check photos newer than the last scan. Much faster on big libraries.",
-                                  isOn: $engine.settings.incrementalScan)
-                        Divider().overlay(Theme.hairline)
-                        Button {
-                            Task { await engine.deepScan() }
-                        } label: {
-                            HStack {
-                                if engine.phase == .scanning {
-                                    ProgressView().tint(Theme.teal)
-                                } else {
-                                    Image(systemName: "arrow.triangle.2.circlepath")
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(engine.phase == .scanning
-                                         ? "Scanning… \(Format.count(engine.scanChecked)) checked"
-                                         : "Deep scan")
-                                        .font(Theme.rounded(16, weight: .medium))
-                                        .contentTransition(.numericText())
-                                    Text("Re-check the entire library, ignoring the fast-scan mark. Use after importing older photos.")
-                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
-                                }
-                                Spacer()
-                            }
-                            .foregroundStyle(Theme.teal)
-                        }
-                        .disabled(engine.phase.isActive || engine.phase == .paused)
+                        Text("Scans are incremental (only what's newer than the last scan) and self-healing: if the library ever holds more items than the index knows about — an old import, an iCloud backfill — the next scan automatically re-checks everything.")
+                            .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                         if let status = engine.scanStatus, engine.phase != .scanning {
                             Text(status)
                                 .font(Theme.mono(12))

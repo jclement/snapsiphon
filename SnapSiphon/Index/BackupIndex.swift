@@ -144,6 +144,16 @@ final class BackupIndex {
         }
     }
 
+    /// True when any OTHER live (non-deleted) row points at this blob —
+    /// with content addressing, identical files share one blob, so a purge
+    /// must not delete a blob a surviving twin still needs.
+    func blobSharedByLive(_ uuid: String, excluding localIdentifier: String) -> Bool {
+        queue.sync {
+            db.scalarInt("SELECT COUNT(*) FROM assets WHERE uuid=? AND localIdentifier != ? AND state != 'deleted';",
+                         [.text(uuid), .text(localIdentifier)]) > 0
+        }
+    }
+
     // MARK: State transitions
 
     func markDeleted(_ localIdentifier: String, at date: Date) {

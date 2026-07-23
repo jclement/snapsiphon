@@ -9,6 +9,9 @@ struct AssetProcessor {
     let client: S3Client
     let recipients: [Age.Recipient]
     let tempDir: URL
+    /// The repository's blob-naming salt (hex). Blob names are
+    /// HMAC(salt, sha256(content)) — deterministic per repo, opaque outside it.
+    let saltHex: String
 
     /// Where a file currently is in its lane's pipeline (drives the lane UI).
     enum Phase: Equatable, Sendable {
@@ -18,6 +21,7 @@ struct AssetProcessor {
     }
 
     struct Result {
+        var uuid: String              // blob name actually used
         var encryptedBytes: Int64
         var originalBytes: Int64
         var filename: String
@@ -36,14 +40,12 @@ struct AssetProcessor {
     }
 
     func process(_ record: AssetRecord,
-                 verifyFirst: Bool,
+                 forceUpload: Bool,
                  bytesPerSecond: Double,
                  onMeta: ((String, Int64) -> Void)? = nil,
                  onPhase: ((Phase) -> Void)? = nil,
                  onRetry: ((Int, Swift.Error) -> Void)? = nil,
                  progress: @escaping (Double) -> Void) async throws -> Result {
-        let key = client.fullKey(for: Repo.objectKey(uuid: record.uuid))
-
         let token = UUID().uuidString
         let originalURL = tempDir.appendingPathComponent("\(token).orig")
         let encryptedURL = tempDir.appendingPathComponent("\(token).age")
@@ -58,23 +60,34 @@ struct AssetProcessor {
         let exported = try await photos.exportOriginal(localIdentifier: record.localIdentifier, to: originalURL)
         onMeta?(exported.filename, exported.byteSize)
 
-        // 2. Optionally skip if this asset's blob already exists (same UUID —
-        //    a previous attempt whose success we failed to record).
-        if verifyFirst, try await S3Client.withRetries(onRetry: onRetry, { try await client.headObject(key: key) }) {
-            return Result(encryptedBytes: record.byteSize, originalBytes: exported.byteSize,
+        // 2. Hash the plaintext (fast local read) — its salted HMAC IS the
+        //    blob name, so identical content always maps to the same key.
+        //    Records that already carry a name keep it (stability).
+        let plainHash = try Repo.sha256Hex(fileAt: originalURL)
+        let uuid = record.uuid.isEmpty ? Repo.blobName(saltHex: saltHex, plaintextHash: plainHash)
+                                       : record.uuid
+        let key = client.fullKey(for: Repo.objectKey(uuid: uuid))
+
+        // 3. Skip if the blob is already there: a crashed previous attempt, or
+        //    a different asset with identical bytes (dedup). One cheap HEAD.
+        //    `forceUpload` (verify found a bad blob) bypasses the shortcut so
+        //    the repair actually re-uploads.
+        if !forceUpload,
+           let remoteSize = try await S3Client.withRetries(onRetry: onRetry, { try await client.headObject(key: key) }) {
+            return Result(uuid: uuid, encryptedBytes: remoteSize, originalBytes: exported.byteSize,
                           filename: exported.filename,
-                          plaintextHash: record.plaintextHash ?? "",
+                          plaintextHash: plainHash,
                           ciphertextHash: record.ciphertextHash ?? "",
                           alreadyPresent: true)
         }
 
-        // 3. Encrypt to age, streaming chunk by chunk, computing all three
+        // 4. Encrypt to age, streaming chunk by chunk, computing the remaining
         //    digests in the same pass.
         onPhase?(.encrypting)
         let digests = try Self.encryptFile(at: originalURL, to: encryptedURL, recipients: recipients)
         let size = (try? FileManager.default.attributesOfItem(atPath: encryptedURL.path)[.size] as? Int64) ?? nil
 
-        // 4. Upload the ciphertext (throttled when a speed limit is set;
+        // 5. Upload the ciphertext (throttled when a speed limit is set;
         //    retried on transient errors — the encrypted temp is on disk, so a
         //    retry costs no re-export or re-encrypt).
         onPhase?(.uploading)
@@ -85,7 +98,7 @@ struct AssetProcessor {
                                        bytesPerSecond: bytesPerSecond,
                                        progress: progress)
         }
-        return Result(encryptedBytes: size ?? 0, originalBytes: exported.byteSize,
+        return Result(uuid: uuid, encryptedBytes: size ?? 0, originalBytes: exported.byteSize,
                       filename: exported.filename,
                       plaintextHash: digests.plaintextSHA256,
                       ciphertextHash: digests.ciphertextSHA256,

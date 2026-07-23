@@ -76,6 +76,36 @@ enum Repo {
         var entries: [Entry]
     }
 
+    // MARK: Blob naming (salted content addressing)
+
+    /// Blob name for a file: HMAC-SHA256 of the file's sha256, keyed with the
+    /// repository's secret salt. Deterministic (same content → same blob →
+    /// idempotent uploads and free dedup) yet useless to an outsider: without
+    /// the salt, no one can hash a known photo and probe whether you have it.
+    /// The salt is minted at repository init and rides inside the encrypted
+    /// checkpoint's meta table.
+    static func newSaltHex() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func blobName(saltHex: String, plaintextHash: String) -> String {
+        let key = SymmetricKey(data: dataFromHex(saltHex))
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(plaintextHash.utf8), using: key)
+        return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func dataFromHex(_ hex: String) -> Data {
+        var data = Data(capacity: hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex, let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) {
+            data.append(UInt8(hex[index..<next], radix: 16) ?? 0)
+            index = next
+        }
+        return data
+    }
+
     // MARK: Hashing
 
     static func sha256Hex(_ data: Data) -> String {

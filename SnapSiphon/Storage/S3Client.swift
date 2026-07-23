@@ -180,7 +180,8 @@ final class S3Client {
     // MARK: HEAD (existence check)
 
     /// Returns true if the object exists remotely.
-    func headObject(key: String, now: Date = Date()) async throws -> Bool {
+    /// HEAD an object. Returns its size, or nil if it doesn't exist.
+    func headObject(key: String, now: Date = Date()) async throws -> Int64? {
         let url = try objectURL(key: key)
         let signed = signer.sign(method: "HEAD", url: url, now: now)
         var request = URLRequest(url: url)
@@ -188,8 +189,11 @@ final class S3Client {
         for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
         let (_, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw S3Error.network("No response") }
-        if http.statusCode == 404 { return false }
-        if (200..<300).contains(http.statusCode) { return true }
+        if http.statusCode == 404 { return nil }
+        if (200..<300).contains(http.statusCode) {
+            let len = (http.value(forHTTPHeaderField: "Content-Length")).flatMap(Int64.init)
+            return len ?? http.expectedContentLength
+        }
         throw S3Error.http(http.statusCode, "")
     }
 

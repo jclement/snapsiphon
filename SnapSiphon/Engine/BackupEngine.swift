@@ -414,9 +414,11 @@ final class BackupEngine: ObservableObject {
     /// A normal (fast) scan: only looks at photos newer than the high-water mark.
     func scan() async { await runScan(deep: false) }
 
-    /// A deep scan: ignores the high-water mark and re-checks the whole library.
-    /// Use after importing older photos or changing filters.
-    func deepScan() async { await runScan(deep: true) }
+    /// A full scan: ignores the high-water mark and re-checks the whole
+    /// library. Not user-facing — scans self-heal: a fast scan that finds the
+    /// library holding more eligible items than the index triggers this
+    /// automatically.
+    private func fullScan() async { await runScan(deep: true) }
 
     private func runScan(deep: Bool) async {
         guard let index else { return }
@@ -440,14 +442,13 @@ final class BackupEngine: ObservableObject {
         // on another device can sync in with a creationDate BEHIND the mark and
         // would otherwise be skipped forever. The known-set dedups the overlap,
         // so this costs almost nothing. (Imports older than 48h → Deep scan.)
-        // The cutoff setting bounds every scan (even deep ones): content older
+        // The cutoff setting bounds every scan (even full ones): content older
         // than it is out of scope by user choice, not covered-and-skipped.
         let cutoff = settings.backupCutoff
-        let markSince: Date? = (deep || !settings.incrementalScan)
-            ? nil : scanMark?.addingTimeInterval(-48 * 3600)
+        let markSince: Date? = deep ? nil : scanMark?.addingTimeInterval(-48 * 3600)
         let since: Date? = [markSince, cutoff].compactMap { $0 }.max()
-        appendLog(deep ? "Deep scan — re-checking the whole library…"
-                       : (since == nil ? "Scanning library…" : "Fast scan — checking new photos…"), .info)
+        appendLog(deep ? "Full scan — re-checking the whole library…"
+                       : (since == nil ? "Scanning library…" : "Checking for new photos…"), .info)
 
         // One query for everything we already know, then in-memory membership
         // checks — no per-asset database round-trips.
@@ -475,10 +476,9 @@ final class BackupEngine: ObservableObject {
                 if known.contains(info.localIdentifier) { continue }
                 idx.upsert(AssetRecord(
                     localIdentifier: info.localIdentifier,
-                    // Random blob name, fixed for the record's whole life — a
-                    // crashed upload retries to the SAME key, so verify-first
-                    // HEADs can spot the finished blob.
-                    uuid: UUID().uuidString.lowercased(),
+                    // Blob name is a salted content address, computed at
+                    // upload time once the bytes have been hashed.
+                    uuid: "",
                     state: .pending,
                     mediaType: info.mediaType,
                     filename: "",             // filled in at upload (deferred PHAssetResource lookup)
@@ -495,16 +495,30 @@ final class BackupEngine: ObservableObject {
         // Advance the mark so the next fast scan starts where this one ended.
         // Clamp to now: one future-dated asset (bad camera clock) must not
         // blind every future fast scan.
-        if settings.incrementalScan, let newest = outcome.newest { scanMark = min(newest, Date()) }
+        if let newest = outcome.newest { scanMark = min(newest, Date()) }
         scanChecked = 0
 
         refreshCounts()
         await refreshLibraryCounts()
-        // An explicit result — especially for deep scans, where "found nothing
-        // new" is the common case and used to be indistinguishable from a no-op.
+
+        // Self-healing full check: if the library holds more eligible items
+        // than the index knows about, something slipped behind the incremental
+        // mark (an old import, iCloud backfill) — silently re-check everything.
+        // This replaces the old user-facing "Deep scan" button.
+        if !deep, !favoritesOnly {
+            let expected = (includePhotos ? libraryPhotos : 0) + (includeVideos ? libraryVideos : 0)
+            let indexed = index.counts().total
+            if expected > indexed {
+                appendLog("Library has \(Format.count(expected)) eligible items but the index only knows \(Format.count(indexed)) — running a full re-check.", .info)
+                return await runScan(deep: true)
+            }
+        }
+
+        // An explicit result — "found nothing new" is the common case and used
+        // to be indistinguishable from a no-op.
         scanStatus = added == 0
-            ? "✓ \(deep ? "Deep scan" : "Scan") checked \(Format.count(outcome.checked)) item\(outcome.checked == 1 ? "" : "s") — nothing new, everything already indexed"
-            : "✓ \(deep ? "Deep scan" : "Scan") checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
+            ? "✓ \(deep ? "Full scan" : "Scan") checked \(Format.count(outcome.checked)) item\(outcome.checked == 1 ? "" : "s") — nothing new, everything already indexed"
+            : "✓ \(deep ? "Full scan" : "Scan") checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
         appendLog("Scan complete — \(added) new item\(added == 1 ? "" : "s") queued.", .success)
 
         // Deletions are ALWAYS reconciled into the manifest (tombstones +
@@ -523,6 +537,20 @@ final class BackupEngine: ObservableObject {
         static let generation = "repo.generation"
         static let nextSeq = "repo.nextSeq"
         static let lastHash = "repo.lastHash"
+        static let salt = "repo.salt"      // blob-naming HMAC salt (hex)
+    }
+
+    /// The repository's blob-naming salt. Minted once at repo init; travels
+    /// inside the encrypted checkpoint (the meta table is part of the
+    /// snapshot), so an attach/reload recovers it automatically.
+    private var repoSalt: String? { index?.metaValue(RepoMeta.salt) }
+
+    @discardableResult
+    private func ensureRepoSalt() -> String {
+        if let salt = repoSalt { return salt }
+        let salt = Repo.newSaltHex()
+        index?.setMeta(RepoMeta.salt, salt)
+        return salt
     }
 
     /// Stable random ID for THIS install. Journals carry it, which is how a
@@ -672,6 +700,12 @@ final class BackupEngine: ObservableObject {
         var blocked = 0
         for record in records where !record.uuid.isEmpty {
             if Task.isCancelled { break }
+            // Dedup guard: identical content shares one blob. If a live twin
+            // still references it, drop only this record — never the blob.
+            if index.blobSharedByLive(record.uuid, excluding: record.localIdentifier) {
+                freed.append(record)
+                continue
+            }
             let key = client.fullKey(for: Repo.objectKey(uuid: record.uuid))
             do {
                 let versions = try await client.listVersions(forKey: key)
@@ -892,7 +926,10 @@ final class BackupEngine: ObservableObject {
             let entries = try await listMetadata(client: client)
             if entries.isEmpty {
                 // Virgin bucket/folder: found our repository with checkpoint 1.
+                // The salt must exist BEFORE the checkpoint so the snapshot
+                // carries it.
                 appendLog("Initializing repository…", .info)
+                ensureRepoSalt()
                 return await writeCheckpoint(generation: 1)
             }
             // Existing repository, and this install has no position in it.
@@ -956,6 +993,7 @@ final class BackupEngine: ObservableObject {
                 applied += 1
             }
             setRepoPosition(generation: gen, nextSeq: (seqs.max() ?? 0) + 1, lastHash: lastHash)
+            ensureRepoSalt()   // pre-salt repos: mint one now (rides the next checkpoint)
             repoConflict = nil
             pendingAttach = nil
             refreshCounts()
@@ -1163,7 +1201,7 @@ final class BackupEngine: ObservableObject {
         appendLog("Backup started.", .info)
 
         let processor = AssetProcessor(photos: photos, client: client, recipients: recipients,
-                                       tempDir: tempDir)
+                                       tempDir: tempDir, saltHex: ensureRepoSalt())
 
         let draining = drainingTask
         drainingTask = nil
@@ -1272,7 +1310,6 @@ final class BackupEngine: ObservableObject {
         let bytesPerSecond = totalBudget > 0 ? totalBudget / Double(workerTarget) : 0
         let includePhotos = settings.includePhotos
         let includeVideos = settings.includeVideos
-        let verifyFirst = settings.verifyRemoteBeforeUpload
         // Live worker count: refreshed at every refill, so moving the slider
         // mid-run takes effect as files finish — more lanes spawn up to the new
         // target, or excess lanes drain away.
@@ -1313,8 +1350,7 @@ final class BackupEngine: ObservableObject {
                 inFlight.insert(record.localIdentifier)
                 attempted.insert(record.localIdentifier)
                 group.addTask { [weak self] in
-                    await self?.processOne(record, processor: processor,
-                                           verifyFirst: verifyFirst, bytesPerSecond: bytesPerSecond)
+                    await self?.processOne(record, processor: processor, bytesPerSecond: bytesPerSecond)
                     return record.localIdentifier
                 }
                 return true
@@ -1366,12 +1402,8 @@ final class BackupEngine: ObservableObject {
     }
 
     private func processOne(_ record: AssetRecord, processor: AssetProcessor,
-                            verifyFirst: Bool, bytesPerSecond: Double) async {
+                            bytesPerSecond: Double) async {
         guard let index else { return }
-        var record = record
-        // Rows imported from a checkpoint written by an older install could
-        // lack a blob name; mint one so the upload has a stable target.
-        if record.uuid.isEmpty { record.uuid = UUID().uuidString.lowercased() }
         let rid = record.localIdentifier
         beginSlot(record)
         do {
@@ -1381,11 +1413,11 @@ final class BackupEngine: ObservableObject {
             uploaded.lastError = nil
             index.upsert(uploaded)
 
-            // A record requeued by Verify has a size/checksum mismatch — the
-            // HEAD shortcut would just re-mark the bad object as fine.
-            let effectiveVerifyFirst = verifyFirst && !(record.lastError?.hasPrefix("Verify:") ?? false)
+            // A record requeued by Verify has a size mismatch — the HEAD-skip
+            // would just re-mark the bad blob as fine, so force the upload.
+            let forceUpload = record.lastError?.hasPrefix("Verify:") ?? false
             let result = try await processor.process(
-                record, verifyFirst: effectiveVerifyFirst, bytesPerSecond: bytesPerSecond,
+                record, forceUpload: forceUpload, bytesPerSecond: bytesPerSecond,
                 onMeta: { filename, size in
                     Task { @MainActor in self.updateSlot(rid, filename: filename, byteSize: size) }
                 },
@@ -1407,11 +1439,12 @@ final class BackupEngine: ObservableObject {
             // the journal entry follows at the next flush (upload-before-
             // commit; a crash in between strands only an ignorable orphan).
             uploaded.state = .uploaded
+            uploaded.uuid = result.uuid          // salted content address
             uploaded.filename = result.filename
             uploaded.byteSize = result.encryptedBytes
             uploaded.uploadedAt = Date()
             uploaded.plaintextHash = result.plaintextHash
-            uploaded.ciphertextHash = result.ciphertextHash
+            uploaded.ciphertextHash = result.ciphertextHash.isEmpty ? nil : result.ciphertextHash
             uploaded.journaled = false
             index.upsert(uploaded)
 

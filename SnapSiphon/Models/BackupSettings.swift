@@ -28,11 +28,7 @@ struct BackupSettings: Codable, Equatable {
     var runInLowPowerMode: Bool = false
 
     // Housekeeping
-    var verifyRemoteBeforeUpload: Bool = false  // HEAD each object before PUT (slower, safer)
     var autoStartOnLaunch: Bool = false
-    /// Fast scans only look at photos newer than the last-scanned high-water mark.
-    /// Turn off (or run a Deep scan) to always re-check the whole library.
-    var incrementalScan: Bool = true
 
     /// Opportunistic background backups via BGProcessingTask — iOS grants short
     /// windows (typically overnight, charging, on Wi-Fi). Best-effort by design.

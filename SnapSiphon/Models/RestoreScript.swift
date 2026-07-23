@@ -264,12 +264,14 @@ def main():
         download(gens[gen][0], ck_enc)
         last_hash = hashlib.sha256(ck_enc.read_bytes()).hexdigest()
         decrypt(ck_enc, ck_db)
-        items = {}   # uuid -> {filename, state, hash}
+        # Keyed by localIdentifier, NOT blob name: blobs are content-addressed,
+        # so two identical files share one blob but restore as two files.
+        items = {}   # localIdentifier -> {uuid, filename, state, hash}
         con = sqlite3.connect(ck_db)
-        for u, state, filename, plain in con.execute(
-                "SELECT uuid, state, filename, plaintextHash FROM assets WHERE uuid != ''"):
+        for lid, u, state, filename, plain in con.execute(
+                "SELECT localIdentifier, uuid, state, filename, plaintextHash FROM assets WHERE uuid != ''"):
             if state in ("uploaded", "deleted"):
-                items[u] = {"filename": filename or "", "state": state, "hash": plain}
+                items[lid] = {"uuid": u, "filename": filename or "", "state": state, "hash": plain}
         con.close()
 
         # ---- 3. Replay journals, verifying the tamper-evidence chain ----
@@ -286,18 +288,20 @@ def main():
             last_hash = hashlib.sha256(raw).hexdigest()
             for e in j.get("entries", []):
                 op, u = e.get("op"), e.get("uuid")
+                lid = e.get("localIdentifier") or ("blob-" + u)
                 if op in ("add", "update", "restore"):
-                    prev = items.get(u, {})
-                    items[u] = {"filename": e.get("filename") or prev.get("filename", ""),
-                                "state": "uploaded",
-                                "hash": e.get("plaintextHash") or prev.get("hash")}
-                elif op == "delete" and u in items:
-                    items[u]["state"] = "deleted"
+                    prev = items.get(lid, {})
+                    items[lid] = {"uuid": u,
+                                  "filename": e.get("filename") or prev.get("filename", ""),
+                                  "state": "uploaded",
+                                  "hash": e.get("plaintextHash") or prev.get("hash")}
+                elif op == "delete" and lid in items:
+                    items[lid]["state"] = "deleted"
                 elif op == "purge":
-                    items.pop(u, None)   # blob physically gone
+                    items.pop(lid, None)   # blob (or its last reference) gone
 
-        dele = {u: it for u, it in items.items() if it["state"] == "deleted"}
-        todo = {u: it for u, it in items.items() if it["state"] == "uploaded"}
+        dele = {k: it for k, it in items.items() if it["state"] == "deleted"}
+        todo = {k: it for k, it in items.items() if it["state"] == "uploaded"}
         if restore_all:
             todo.update(dele)
             print(f"{len(todo)} items to restore (--all: including {len(dele)} deleted-but-unpurged)")
@@ -306,11 +310,12 @@ def main():
 
         used, done, failed = {}, 0, 0
         ordered = sorted(todo.items(), key=lambda kv: (kv[1]["filename"], kv[0]))
-        for i, (u, it) in enumerate(ordered, 1):
+        for i, (lid, it) in enumerate(ordered, 1):
+            u = it["uuid"]
             name = it["filename"] or u
-            if used.get(name) not in (None, u):             # filename collision
-                name = u[:8] + "-" + name
-            used[name] = u
+            if used.get(name) not in (None, lid):           # filename collision
+                name = hashlib.sha256(lid.encode()).hexdigest()[:8] + "-" + name
+            used[name] = lid
             target = out / name
             if target.exists() and target.stat().st_size > 0:
                 continue                                    # resume: already restored

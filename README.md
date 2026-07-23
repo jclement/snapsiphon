@@ -10,8 +10,10 @@ Polished and nerdy. Your keys, your bucket, zero trust in the provider.
 SnapSiphon walks your photo library, encrypts every original **on-device** with
 [age](https://age-encryption.org), and uploads the ciphertext to an
 S3-compatible bucket you control. The storage provider never sees a decrypted
-byte — or a filename, or even a content hash: blobs are stored under purely
-random names, and an encrypted checkpoint + journal repository maps them back.
+byte — or a filename, or even a recognizable content hash: blobs are named by
+a **salted content address** (HMAC of the file's hash, keyed with a secret
+per-repository salt), and an encrypted checkpoint + journal repository maps
+them back. Deterministic for dedup and idempotent uploads; opaque to outsiders.
 
 - **End-to-end encryption with age.** Paste an `age1…` public key you already
   own (SnapSiphon can then *encrypt but never decrypt* — the safest mode), or
@@ -22,7 +24,7 @@ random names, and an encrypted checkpoint + journal repository maps them back.
   **Cloudflare R2**, plus a custom endpoint. Requests are signed with
   AWS Signature V4; credentials live only in the iOS Keychain.
 - **The bucket is the source of truth.** The repository layout is
-  `objects/<random-uuid>` for blobs plus `checkpoints/NNNNNN/` generations, each
+  `objects/<salted-content-address>` for blobs plus `checkpoints/NNNNNN/` generations, each
   holding an encrypted SQLite snapshot (`checkpoint.age`) and append-only
   encrypted journals of every change (adds, deletions, purges). Journals chain
   by ciphertext hash (tamper-evident), blobs upload **before** their journal
@@ -36,9 +38,10 @@ random names, and an encrypted checkpoint + journal repository maps them back.
 - **Lots of knobs — all enforced.** Photos/videos/favorites filters,
   parallel-upload count, **mid-stream speed limit** (a throttled bound-stream
   body, not just a per-file average), **Wi-Fi-only** and **pause-on-low-battery**
-  (the run loop parks on a closed gate and resumes automatically), keep-screen-on,
-  and **verify-before-upload** (HEAD-skip objects already in
-  the bucket).
+  (the run loop parks on a closed gate and resumes automatically), and
+  keep-screen-on. Scans are incremental and self-healing (a library/index
+  count mismatch triggers a full re-check automatically); uploads HEAD-skip
+  blobs that already exist (dedup + crash recovery) with no knob to remember.
 - **Multiple recipients, incl. hardware keys.** Encrypts to every recipient at
   once (any one decrypts). Native X25519 (`age1…`) plus **Secure Enclave**
   (`age1se1…`) and **YubiKey** (`age1yubikey1…`) plugin recipients via the
