@@ -5,36 +5,31 @@ import CryptoKit
 /// Keychain (see `S3CredentialStore`); this struct carries the non-secret parts
 /// plus, transiently, the loaded credentials while a client is alive.
 struct S3Config: Codable, Equatable {
+    /// Legacy provider presets — retained only so previously-stored configs
+    /// still decode. The UI is now provider-agnostic; the one real behavioural
+    /// difference (path-style addressing) is an explicit setting.
     enum Provider: String, Codable, CaseIterable, Identifiable {
         case backblazeB2
         case cloudflareR2
         case custom
 
         var id: String { rawValue }
-        var title: String {
-            switch self {
-            case .backblazeB2: return "Backblaze B2"
-            case .cloudflareR2: return "Cloudflare R2"
-            case .custom: return "Custom S3"
-            }
-        }
         var usesPathStyle: Bool { self == .cloudflareR2 || self == .custom }
-        var defaultRegion: String {
-            switch self {
-            case .cloudflareR2: return "auto"
-            case .backblazeB2: return "us-west-004"
-            case .custom: return "us-east-1"
-            }
-        }
     }
 
-    var provider: Provider = .backblazeB2
+    var provider: Provider = .custom
     /// Host only, e.g. `s3.us-west-004.backblazeb2.com` or
     /// `<accountid>.r2.cloudflarestorage.com`.
     var endpoint: String = ""
     var region: String = ""
     var bucket: String = ""
     var prefix: String = "SnapSiphon"
+    /// Path-style addressing (https://endpoint/bucket/key) vs virtual-hosted
+    /// (https://bucket.endpoint/key). Optional so configs saved before this
+    /// field existed still decode; falls back to the legacy provider's rule.
+    var pathStyle: Bool? = nil
+
+    var usesPathStyle: Bool { pathStyle ?? provider.usesPathStyle }
 
     var isComplete: Bool {
         !endpoint.isEmpty && !bucket.isEmpty && !region.isEmpty
@@ -89,7 +84,7 @@ final class S3Client {
             .map { SigV4.uriEncode(String($0), encodeSlash: true) }
             .joined(separator: "/")
         let urlString: String
-        if config.provider.usesPathStyle {
+        if config.usesPathStyle {
             urlString = "https://\(config.endpoint)/\(config.bucket)/\(encodedKey)"
         } else {
             urlString = "https://\(config.bucket).\(config.endpoint)/\(encodedKey)"
@@ -146,7 +141,7 @@ final class S3Client {
     /// each version, not just adding a hide-marker.
     func listVersions(forKey key: String, now: Date = Date()) async throws -> [ObjectVersion] {
         var components: URLComponents
-        if config.provider.usesPathStyle {
+        if config.usesPathStyle {
             components = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
         } else {
             components = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!
@@ -230,7 +225,7 @@ final class S3Client {
     /// 10k-object archive, no per-object HEADs needed.
     func listObjects(continuationToken: String? = nil, now: Date = Date()) async throws -> (objects: [RemoteObject], next: String?) {
         var components: URLComponents
-        if config.provider.usesPathStyle {
+        if config.usesPathStyle {
             components = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
         } else {
             components = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!

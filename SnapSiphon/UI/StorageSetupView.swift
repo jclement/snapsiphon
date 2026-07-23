@@ -3,35 +3,37 @@ import SwiftUI
 struct StorageSetupView: View {
     @EnvironmentObject var engine: BackupEngine
 
-    /// Edits happen on a local draft, committed only by Save. The config used
-    /// to bind straight to engine.s3Config, which persisted on every keystroke —
-    /// meaning the destination could be silently redirected without ever
-    /// pressing Save. Nothing sticks until an explicit, gated commit now.
+    /// Edits happen on a local draft, committed only by Save & Test (or the
+    /// explicit save-anyway path). Nothing persists mid-edit.
     @State private var draft = S3Config()
     @State private var loaded = false
     @State private var accessKeyID = ""
     @State private var secretKey = ""
     @State private var testing = false
-    @State private var testResult: TestResult?
+    @State private var status: Status?
+    @State private var askSaveAnyway: String?   // holds the failure message
 
-    enum TestResult { case ok, fail(String) }
+    enum Status { case saved, savedUntested }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                SectionHeader(caption: "S3-compatible", title: "Storage")
-
-                providerPicker
+                SectionHeader(caption: "Any S3-compatible provider", title: "Storage")
 
                 Card {
                     VStack(alignment: .leading, spacing: 14) {
-                        FieldRow(label: "Endpoint host", placeholder: endpointPlaceholder,
+                        FieldRow(label: "Endpoint host", placeholder: "s3.us-west-004.backblazeb2.com",
                                  text: $draft.endpoint, mono: true)
-                        FieldRow(label: "Region", placeholder: draft.provider.defaultRegion,
+                        FieldRow(label: "Region", placeholder: "us-west-004",
                                  text: $draft.region, mono: true)
                         FieldRow(label: "Bucket", placeholder: "my-photos", text: $draft.bucket, mono: true)
                         FieldRow(label: "Key prefix (folder)", placeholder: "SnapSiphon",
                                  text: $draft.prefix, mono: true)
+                        Divider().overlay(Theme.hairline)
+                        ToggleRow(title: "Path-style addressing",
+                                  subtitle: "Requests go to endpoint/bucket/… instead of bucket.endpoint/…. Needed for MinIO and most self-hosted servers; leave off for B2, AWS, Wasabi. R2 uses on.",
+                                  isOn: Binding(get: { draft.usesPathStyle },
+                                                set: { draft.pathStyle = $0 }))
                     }
                 }
 
@@ -45,21 +47,18 @@ struct StorageSetupView: View {
                     }
                 }
 
-                if let result = testResult {
-                    testBanner(result)
+                if let status {
+                    statusBanner(status)
                 }
 
-                VStack(spacing: 12) {
-                    PrimaryButton(title: "Save", systemImage: "checkmark",
-                                  enabled: draft.isComplete) {
-                        commit()
-                    }
-                    GhostButton(title: testing ? "Testing…" : "Save & test connection",
-                                systemImage: "antenna.radiowaves.left.and.right", tint: Theme.teal) {
-                        commit()
-                        Task { await runTest() }
-                    }
+                PrimaryButton(title: testing ? "Testing…" : "Save & Test",
+                              systemImage: testing ? "hourglass" : "checkmark.seal",
+                              enabled: draft.isComplete && !testing) {
+                    Task { await saveAndTest() }
                 }
+
+                providerCheatSheet
+                bucketGuidance
             }
             .padding(16)
             .containerRelativeFrame(.horizontal)
@@ -67,64 +66,39 @@ struct StorageSetupView: View {
         .background(Theme.canvas.ignoresSafeArea())
         .navigationTitle("Storage")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear(perform: prefillCredentials)
-    }
-
-    private var providerPicker: some View {
-        HStack(spacing: 10) {
-            ForEach(S3Config.Provider.allCases) { provider in
-                Button {
-                    draft.provider = provider
-                    if draft.region.isEmpty { draft.region = provider.defaultRegion }
-                } label: {
-                    Text(provider.title)
-                        .font(Theme.rounded(13, weight: .semibold))
-                        .frame(maxWidth: .infinity).padding(.vertical, 12)
-                        .foregroundStyle(draft.provider == provider ? .black : Theme.textSecondary)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(draft.provider == provider ? AnyShapeStyle(Theme.brandGradient) : AnyShapeStyle(Theme.surfaceHi)))
-                }
+        .onAppear(perform: prefill)
+        .alert("Connection failed — save anyway?",
+               isPresented: Binding(get: { askSaveAnyway != nil },
+                                    set: { if !$0 { askSaveAnyway = nil } })) {
+            Button("Save anyway") {
+                commit()
+                status = .savedUntested
+                askSaveAnyway = nil
             }
+            Button("Keep editing", role: .cancel) { askSaveAnyway = nil }
+        } message: {
+            Text(askSaveAnyway ?? "")
         }
     }
 
-    private var endpointPlaceholder: String {
-        switch draft.provider {
-        case .backblazeB2: return "s3.us-west-004.backblazeb2.com"
-        case .cloudflareR2: return "<account>.r2.cloudflarestorage.com"
-        case .custom: return "s3.example.com"
+    // MARK: Save & Test — one button: test the draft first, commit on success
+
+    private func saveAndTest() async {
+        testing = true
+        status = nil
+        defer { testing = false }
+        let creds = S3Credentials(accessKeyID: accessKeyID, secretAccessKey: secretKey)
+        let client = S3Client(config: draft, credentials: creds)
+        do {
+            try await client.testConnection()
+            commit()
+            status = .saved
+        } catch {
+            // Nothing was saved — offer to save anyway (e.g. setting up offline).
+            askSaveAnyway = error.localizedDescription
         }
     }
 
-    private func testBanner(_ result: TestResult) -> some View {
-        Card {
-            switch result {
-            case .ok:
-                Label("Connected — bucket reachable and credentials valid.", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 13)).foregroundStyle(.green)
-            case .fail(let message):
-                VStack(alignment: .leading, spacing: 4) {
-                    Label("Connection failed", systemImage: "xmark.octagon.fill")
-                        .font(Theme.rounded(14, weight: .semibold)).foregroundStyle(.red)
-                    Text(message).font(Theme.mono(11)).foregroundStyle(Theme.textSecondary)
-                }
-            }
-        }
-    }
-
-    private func prefillCredentials() {
-        guard !loaded else { return }
-        loaded = true
-        draft = engine.s3Config
-        if draft.region.isEmpty { draft.region = draft.provider.defaultRegion }
-        if let creds = S3CredentialStore.load() {
-            accessKeyID = creds.accessKeyID
-            secretKey = creds.secretAccessKey
-        }
-    }
-
-    /// Commit the draft: config becomes live, credentials go to the Keychain.
     private func commit() {
         engine.s3Config = draft
         if !accessKeyID.isEmpty && !secretKey.isEmpty {
@@ -132,14 +106,108 @@ struct StorageSetupView: View {
         }
     }
 
-    private func runTest() async {
-        testing = true
-        testResult = nil
-        let result = await engine.testConnection()
-        testing = false
-        switch result {
-        case .success: testResult = .ok
-        case .failure(let error): testResult = .fail(error.localizedDescription)
+    private func prefill() {
+        guard !loaded else { return }
+        loaded = true
+        draft = engine.s3Config
+        if let creds = S3CredentialStore.load() {
+            accessKeyID = creds.accessKeyID
+            secretKey = creds.secretAccessKey
+        }
+    }
+
+    private func statusBanner(_ status: Status) -> some View {
+        Card {
+            switch status {
+            case .saved:
+                Label("Saved — bucket reachable and credentials valid.", systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 13)).foregroundStyle(.green)
+            case .savedUntested:
+                Label("Saved without a successful connection test — backups will keep retrying, but double-check the settings.",
+                      systemImage: "exclamationmark.circle.fill")
+                    .font(.system(size: 13)).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    // MARK: Provider cheat sheet
+
+    private struct ProviderHint: Identifiable {
+        let id: String
+        let endpoint: String
+        let region: String
+        let pathStyle: String
+        let note: String
+    }
+
+    private static let hints: [ProviderHint] = [
+        .init(id: "Backblaze B2", endpoint: "s3.us-west-004.backblazeb2.com",
+              region: "us-west-004", pathStyle: "off",
+              note: "Endpoint is shown on your bucket's page; the region is the middle of it. Turn on Object Lock when creating the bucket for a tamper-proof archive."),
+        .init(id: "Cloudflare R2", endpoint: "<accountid>.r2.cloudflarestorage.com",
+              region: "auto", pathStyle: "on",
+              note: "Account ID is in the R2 dashboard. Region is literally the word auto."),
+        .init(id: "AWS S3", endpoint: "s3.us-east-1.amazonaws.com",
+              region: "us-east-1", pathStyle: "off",
+              note: "Use the region your bucket lives in, in both fields."),
+        .init(id: "Wasabi", endpoint: "s3.us-west-1.wasabisys.com",
+              region: "us-west-1", pathStyle: "off",
+              note: "Region matches the endpoint."),
+        .init(id: "MinIO / self-hosted", endpoint: "minio.example.com",
+              region: "us-east-1", pathStyle: "on",
+              note: "Any HTTPS S3-compatible server works. Region is whatever your server expects (often us-east-1)."),
+    ]
+
+    private var providerCheatSheet: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("PROVIDER CHEAT SHEET").font(Theme.mono(11, weight: .medium)).tracking(1.5)
+                .foregroundStyle(Theme.teal)
+            Card {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Self.hints) { hint in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(hint.id).font(Theme.rounded(14, weight: .semibold))
+                                .foregroundStyle(Theme.textPrimary)
+                            Text("endpoint \(hint.endpoint) · region \(hint.region) · path-style \(hint.pathStyle)")
+                                .font(Theme.mono(11)).foregroundStyle(Theme.teal)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(hint.note).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                        }
+                        .padding(.vertical, 8)
+                        if hint.id != Self.hints.last?.id {
+                            Divider().overlay(Theme.hairline)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Bucket guidance
+
+    private var bucketGuidance: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("SETTING UP A GOOD BUCKET").font(Theme.mono(11, weight: .medium)).tracking(1.5)
+                .foregroundStyle(Theme.teal)
+            Card {
+                VStack(alignment: .leading, spacing: 10) {
+                    guidanceRow("lock.shield.fill", .green,
+                                "Append-only is the sweet spot: SnapSiphon never needs delete permission unless you turn on \"Purge deleted backups\". Use an application key with only read/write/list and ransomware or a stolen unlocked phone can't destroy the archive. Deletions are still tracked in the encrypted manifest.")
+                    guidanceRow("clock.badge.checkmark.fill", .cyan,
+                                "Object Lock (B2) / retention makes it tamper-proof even with delete rights — nothing can be removed until the lock expires. Pairs well with the purge grace period.")
+                    guidanceRow("arrow.triangle.2.circlepath", Theme.violet,
+                                "Keep all versions (B2's default): an accidental overwrite is always recoverable. Skip lifecycle auto-expiry rules — this is a keep-forever archive.")
+                    guidanceRow("key.fill", .orange,
+                                "Scope the key to one bucket: a dedicated application key that can only touch this bucket, not your whole account.")
+                }
+            }
+        }
+    }
+
+    private func guidanceRow(_ icon: String, _ color: Color, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon).font(.system(size: 14)).foregroundStyle(color).frame(width: 20)
+            Text(text).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
         }
     }
 }

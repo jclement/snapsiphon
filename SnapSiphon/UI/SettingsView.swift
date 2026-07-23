@@ -5,6 +5,7 @@ struct SettingsView: View {
     // Observe directly so the recipient count refreshes the moment a key is
     // added/removed (SettingsView otherwise only observes `engine`).
     @ObservedObject private var keyManager = AgeKeyManager.shared
+    @ObservedObject private var premium = PremiumStore.shared
     /// Identifiable wrapper so the viewer sheet is item-driven — presenting via
     /// a separate Bool raced the @State script and could show an empty sheet
     /// (grey screen) when the closure evaluated before the script landed.
@@ -112,7 +113,7 @@ struct SettingsView: View {
                                   isOn: $engine.settings.encryptFilenames)
                         Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Verify before upload",
-                                  subtitle: "HEAD-check each object first. Safer, slower.",
+                                  subtitle: "Checks the bucket for each file before encrypting/uploading, and skips ones already there. Turn on after a reinstall, a phone restore, or a crash mid-backup — anytime the local index might disagree with the bucket. Costs one cheap request per file.",
                                   isOn: $engine.settings.verifyRemoteBeforeUpload)
                     }
 
@@ -248,9 +249,13 @@ struct SettingsView: View {
                     }
 
                     knobGroup("Automation") {
-                        ToggleRow(title: "Back up in the background",
-                                  subtitle: "iOS grants short windows (usually overnight, charging, on Wi-Fi) to upload new photos while the app is closed. Best-effort by design.",
-                                  isOn: $engine.settings.backgroundBackup)
+                        if premium.isUnlocked {
+                            ToggleRow(title: "Back up in the background",
+                                      subtitle: "iOS grants short windows (usually overnight, charging, on Wi-Fi) to upload new photos while the app is closed. Best-effort by design.",
+                                      isOn: $engine.settings.backgroundBackup)
+                        } else {
+                            premiumUpsell
+                        }
                         Divider().overlay(Theme.hairline)
                         SliderRow(title: "Remind me",
                                   subtitle: "Notify if no backup has run for this many days. Tapping the notification opens the app (pairs well with auto back up).",
@@ -345,6 +350,47 @@ struct SettingsView: View {
 
     /// "SnapSiphon v0.2.1 (202607221530 · abc1234) · …" — version/build/hash are
     /// injected by scripts/release.sh; dev builds show v0.0.0 (1 · dev).
+    /// Premium unlock row shown in place of the background-backup toggle.
+    private var premiumUpsell: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "lock.fill").foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Back up in the background").font(Theme.rounded(16, weight: .medium))
+                        .foregroundStyle(Theme.textPrimary)
+                    Text("Uploads new photos overnight while the app is closed — a one-time \(premium.displayPrice) upgrade. Everything else is free forever.")
+                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                }
+            }
+            HStack(spacing: 10) {
+                Button {
+                    Task {
+                        await premium.purchase()
+                        if premium.isUnlocked { engine.scheduleBackgroundBackup() }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        if premium.purchasing { ProgressView().tint(.black) }
+                        Text(premium.purchasing ? "Purchasing…" : "Unlock · \(premium.displayPrice)")
+                            .font(Theme.rounded(14, weight: .semibold))
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .foregroundStyle(.black)
+                    .background(Capsule().fill(Theme.brandGradient))
+                }
+                .disabled(premium.purchasing)
+                Button {
+                    Task { await premium.restore() }
+                } label: {
+                    Text("Restore").font(Theme.rounded(14, weight: .medium)).foregroundStyle(Theme.teal)
+                }
+            }
+            if let err = premium.lastError {
+                Text(err).font(Theme.mono(11)).foregroundStyle(.red)
+            }
+        }
+    }
+
     static let versionFooter: String = {
         let info = Bundle.main
         let v = info.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
@@ -369,7 +415,7 @@ struct SettingsView: View {
             NavigationLink { StorageSetupView() } label: {
                 setupRow(icon: "externaldrive.connected.to.line.below.fill",
                          title: "Storage bucket",
-                         subtitle: engine.s3Config.isComplete ? "\(engine.s3Config.provider.title) · \(engine.s3Config.bucket)" : "Not set",
+                         subtitle: engine.s3Config.isComplete ? "\(engine.s3Config.bucket) @ \(engine.s3Config.endpoint)" : "Not set",
                          ok: engine.s3Config.isComplete && S3CredentialStore.hasCredentials)
             }
         }

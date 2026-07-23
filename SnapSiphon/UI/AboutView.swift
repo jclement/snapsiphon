@@ -46,6 +46,17 @@ struct AboutView: View {
                     """)
                 }
 
+                card("Setting up storage") {
+                    Text("""
+                    Any S3-compatible provider works — Backblaze B2, Cloudflare R2, AWS, Wasabi, MinIO… The Storage screen has a per-provider cheat sheet for endpoints and regions. What makes a *great* bucket:
+
+                    • **Append-only key** — SnapSiphon only needs read/write/list (delete is only used by the optional "Purge deleted backups"). A key that can't delete means malware or a stolen phone can't destroy the archive.
+                    • **Object Lock / retention** (B2) — makes objects immutable until the lock expires. Tamper-proof, even with delete rights.
+                    • **Keep all versions, no lifecycle expiry** — this is a forever archive; nothing should age out on its own.
+                    • **One bucket, one key** — scope the application key to just this bucket.
+                    """)
+                }
+
                 card("Credits") {
                     Text("""
                     • [age encryption](https://age-encryption.org) — format by Filippo Valsorda (C2SP spec).

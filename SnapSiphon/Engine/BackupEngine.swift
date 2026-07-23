@@ -192,7 +192,8 @@ final class BackupEngine: ObservableObject {
     nonisolated private func handleBackgroundTask(_ task: BGProcessingTask) {
         Task { @MainActor in
             self.scheduleBackgroundBackup()   // chain the next window first
-            guard self.settings.backgroundBackup, self.isConfigured, self.runTask == nil else {
+            guard self.settings.backgroundBackup, PremiumStore.shared.isUnlocked,
+                  self.isConfigured, self.runTask == nil else {
                 task.setTaskCompleted(success: true)
                 return
             }
@@ -213,7 +214,7 @@ final class BackupEngine: ObservableObject {
     /// Ask iOS for a future processing window (requires power + network, at
     /// least 30 min out). iOS decides when — typically overnight on charge.
     func scheduleBackgroundBackup() {
-        guard settings.backgroundBackup, isConfigured else { return }
+        guard settings.backgroundBackup, PremiumStore.shared.isUnlocked, isConfigured else { return }
         let request = BGProcessingTaskRequest(identifier: Self.bgTaskID)
         request.requiresNetworkConnectivity = true
         request.requiresExternalPower = true
