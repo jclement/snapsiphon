@@ -40,6 +40,17 @@ final class SQLiteDatabase {
         sqlite3_step(stmt)
     }
 
+    /// Like exec, but surfaces failures (used for VACUUM INTO snapshots where
+    /// silent failure would mean an empty checkpoint).
+    func execThrowing(_ sql: String, _ params: [SQLiteValue] = []) throws {
+        let stmt = try prepare(sql, params)
+        defer { sqlite3_finalize(stmt) }
+        let rc = sqlite3_step(stmt)
+        guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
+            throw DBError.step(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     /// Run a query and map each row.
     func query<T>(_ sql: String, _ params: [SQLiteValue] = [], _ map: (Row) -> T) throws -> [T] {
         let stmt = try prepare(sql, params)

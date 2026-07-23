@@ -96,10 +96,16 @@ final class PhotoLibrary {
     /// Cheap library totals by media type — PhotoKit keeps these counts, so no
     /// enumeration or resource lookups are needed. This is our denominator for
     /// "% of photos / videos backed up" (we can't cheaply know total *bytes*).
-    func libraryCounts() -> (photos: Int, videos: Int) {
+    /// `since` mirrors the backup-cutoff setting so the ring/banner denominator
+    /// matches what the backup will actually cover.
+    func libraryCounts(since: Date? = nil) -> (photos: Int, videos: Int) {
         func count(_ type: PHAssetMediaType) -> Int {
             let o = PHFetchOptions()
-            o.predicate = NSPredicate(format: "mediaType == %d", type.rawValue)
+            var predicates = [NSPredicate(format: "mediaType == %d", type.rawValue)]
+            if let since {
+                predicates.append(NSPredicate(format: "creationDate >= %@", since as NSDate))
+            }
+            o.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
             return PHAsset.fetchAssets(with: o).count
         }
         return (count(.image), count(.video))

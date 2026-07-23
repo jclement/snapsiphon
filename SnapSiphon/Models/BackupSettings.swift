@@ -8,6 +8,10 @@ struct BackupSettings: Codable, Equatable {
     var includePhotos: Bool = true
     var includeVideos: Bool = true
     var favoritesOnly: Bool = false
+    /// Only back up content captured on/after this date (nil = everything).
+    /// For testing against a slice of a huge library, or when older content is
+    /// already safe in a pre-existing backup.
+    var backupCutoff: Date? = nil
 
     // Concurrency & throughput
     var parallelUploads: Int = 3            // 1…8
@@ -36,11 +40,6 @@ struct BackupSettings: Codable, Equatable {
 
     /// Local-notification reminder when no backup has run for N days (0 = off).
     var reminderDays: Int = 0
-
-    /// Keep an encrypted `manifest.age` in the bucket (key → original filename
-    /// map) so a bucket-only restore can rename everything back. Refreshed after
-    /// each run that uploads something.
-    var keepBucketManifest: Bool = true
 
     /// Whether to physically purge deleted photos' blobs (best-effort, after
     /// the grace period, Object Lock permitting). Deletions are ALWAYS marked

@@ -19,8 +19,10 @@ enum RestoreScript {
 #!/usr/bin/env python3
 """SnapSiphon disaster-recovery restore.
 
-Downloads every backed-up photo/video from the bucket, decrypts it with age,
-and renames it back to its original filename using the encrypted manifest.
+Reads the repository's newest checkpoint (an encrypted SQLite snapshot) and
+replays every journal after it — verifying the tamper-evidence chain — then
+downloads each blob from objects/, decrypts it with age, checks its integrity
+hash, and renames it back to its original filename.
 
     python3 restore.py [output-dir]      # default: ./SnapSiphonRestore
     python3 restore.py --all             # ALSO restore deleted-but-unpurged items
@@ -31,7 +33,8 @@ Python `cryptography` package (pip3 install cryptography) as a fallback.
 ⚠️  This file contains live bucket credentials and an age secret key.
     Store it like a password. Anyone holding it can read your entire archive.
 """
-import base64, datetime, hashlib, hmac, json, os, pathlib, shutil, subprocess, sys, tempfile
+import base64, datetime, hashlib, hmac, json, os, pathlib, re, shutil, sqlite3
+import subprocess, sys, tempfile
 import urllib.parse, urllib.request, xml.etree.ElementTree as ET
 
 ENDPOINT   = "\#(config.endpoint)"
@@ -236,53 +239,103 @@ def main():
     if AGE_SECRET.startswith("PASTE-"):
         sys.exit("Edit this script and fill in AGE_SECRET with your age secret key.")
 
-    with tempfile.TemporaryDirectory() as tmp:
+    base = (PREFIX + "/" if PREFIX else "")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir)
         decrypt = make_decryptor(tmp)
 
-        mprefix = (PREFIX + "/" if PREFIX else "") + "manifests/"
-        manifests = sorted(list_keys(mprefix))
-        if not manifests:
-            sys.exit(f"No manifests found under {mprefix} — nothing to restore.")
-        latest = manifests[-1]
-        print(f"Using manifest {latest}")
-        mblob = pathlib.Path(tmp) / "manifest.age"
-        mjson = pathlib.Path(tmp) / "manifest.json"
-        download(latest, mblob)
-        decrypt(mblob, mjson)
-        manifest = json.loads(mjson.read_text())
+        # ---- 1. Find the newest complete generation under checkpoints/ ----
+        gens = {}
+        for k in list_keys(base + "checkpoints/"):
+            m = re.match(re.escape(base) + r"checkpoints/(\d+)/(checkpoint|journal(\d+))\.age$", k)
+            if not m:
+                continue
+            seq = 0 if m.group(2) == "checkpoint" else int(m.group(3))
+            gens.setdefault(int(m.group(1)), {})[seq] = k
+        complete = [g for g, files in gens.items() if 0 in files]
+        if not complete:
+            sys.exit(f"No checkpoint found under {base}checkpoints/ — nothing to restore.")
+        gen = max(complete)
+        seqs = sorted(s for s in gens[gen] if s > 0)
+        print(f"Generation {gen}: checkpoint + {len(seqs)} journal(s)")
 
-        deleted = set(manifest.get("deletedKeys", []))
+        # ---- 2. Load the checkpoint (an encrypted SQLite snapshot) ----
+        ck_enc, ck_db = tmp / "ckpt.age", tmp / "ckpt.sqlite"
+        download(gens[gen][0], ck_enc)
+        last_hash = hashlib.sha256(ck_enc.read_bytes()).hexdigest()
+        decrypt(ck_enc, ck_db)
+        items = {}   # uuid -> {filename, state, hash}
+        con = sqlite3.connect(ck_db)
+        for u, state, filename, plain in con.execute(
+                "SELECT uuid, state, filename, plaintextHash FROM assets WHERE uuid != ''"):
+            if state in ("uploaded", "deleted"):
+                items[u] = {"filename": filename or "", "state": state, "hash": plain}
+        con.close()
+
+        # ---- 3. Replay journals, verifying the tamper-evidence chain ----
+        for seq in seqs:
+            j_enc, j_json = tmp / f"j{seq}.age", tmp / f"j{seq}.json"
+            download(gens[gen][seq], j_enc)
+            raw = j_enc.read_bytes()
+            decrypt(j_enc, j_json)
+            j = json.loads(j_json.read_text())
+            if j.get("prevHash") != last_hash:
+                print(f"WARNING: journal {seq} does not chain to its predecessor — "
+                      "the repository history has been altered or partially deleted. "
+                      "Restoring what's here anyway.", file=sys.stderr)
+            last_hash = hashlib.sha256(raw).hexdigest()
+            for e in j.get("entries", []):
+                op, u = e.get("op"), e.get("uuid")
+                if op in ("add", "update", "restore"):
+                    prev = items.get(u, {})
+                    items[u] = {"filename": e.get("filename") or prev.get("filename", ""),
+                                "state": "uploaded",
+                                "hash": e.get("plaintextHash") or prev.get("hash")}
+                elif op == "delete" and u in items:
+                    items[u]["state"] = "deleted"
+                elif op == "purge":
+                    items.pop(u, None)   # blob physically gone
+
+        dele = {u: it for u, it in items.items() if it["state"] == "deleted"}
+        todo = {u: it for u, it in items.items() if it["state"] == "uploaded"}
         if restore_all:
-            items = manifest["items"] + manifest.get("deleted", [])
-            print(f"{len(items)} items to restore (--all: including {len(deleted)} deleted-but-unpurged)")
+            todo.update(dele)
+            print(f"{len(todo)} items to restore (--all: including {len(dele)} deleted-but-unpurged)")
         else:
-            items = [i for i in manifest["items"] if i["key"] not in deleted]
-            print(f"{len(items)} items to restore ({len(deleted)} deleted, skipped — rerun with --all to include)")
+            print(f"{len(todo)} items to restore ({len(dele)} deleted, skipped — rerun with --all to include)")
 
         used, done, failed = {}, 0, 0
-        for i, item in enumerate(items, 1):
-            name = item["filename"] or (item["key"].split("/")[-1].removesuffix(".age"))
-            if used.get(name) not in (None, item["key"]):   # filename collision
-                name = hashlib.sha256(item["key"].encode()).hexdigest()[:8] + "-" + name
-            used[name] = item["key"]
+        ordered = sorted(todo.items(), key=lambda kv: (kv[1]["filename"], kv[0]))
+        for i, (u, it) in enumerate(ordered, 1):
+            name = it["filename"] or u
+            if used.get(name) not in (None, u):             # filename collision
+                name = u[:8] + "-" + name
+            used[name] = u
             target = out / name
             if target.exists() and target.stat().st_size > 0:
                 continue                                    # resume: already restored
-            blob = pathlib.Path(tmp) / "blob.age"
+            blob = tmp / "blob.age"
             part = target.with_name(target.name + ".part")
             try:
-                download(item["key"], blob)
+                download(base + "objects/" + u, blob)
                 # Decrypt to a temp name and rename only on success, so an
                 # interrupted/failed decrypt can't leave a partial file that the
                 # resume check above would silently accept as restored.
                 decrypt(blob, part)
+                if it.get("hash"):                          # end-to-end integrity
+                    h = hashlib.sha256()
+                    with open(part, "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                    if h.hexdigest() != it["hash"]:
+                        raise ValueError("decrypted file fails its integrity hash")
                 os.replace(part, target)
                 done += 1
-                print(f"[{i}/{len(items)}] {name}")
+                print(f"[{i}/{len(todo)}] {name}")
             except Exception as e:                          # keep going; report at end
                 part.unlink(missing_ok=True)
                 failed += 1
-                print(f"[{i}/{len(items)}] FAILED {item['key']}: {e}", file=sys.stderr)
+                print(f"[{i}/{len(todo)}] FAILED {u}: {e}", file=sys.stderr)
     print(f"Done: {done} restored, {failed} failed → {out}")
 
 if __name__ == "__main__":

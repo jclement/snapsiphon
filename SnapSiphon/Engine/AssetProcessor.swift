@@ -21,9 +21,18 @@ struct AssetProcessor {
         var encryptedBytes: Int64
         var originalBytes: Int64
         var filename: String
-        var remoteKey: String
-        var md5Hex: String?
+        var plaintextHash: String
+        var ciphertextHash: String
         var alreadyPresent: Bool
+    }
+
+    /// Hashes produced in the single encrypt pass: sha256 of the source (for
+    /// restore-time verification), sha256 of the ciphertext (for repository
+    /// verification), and MD5 of the ciphertext (Content-MD5 upload integrity).
+    struct EncryptDigests {
+        var plaintextSHA256: String
+        var ciphertextSHA256: String
+        var ciphertextMD5Base64: String
     }
 
     func process(_ record: AssetRecord,
@@ -33,6 +42,8 @@ struct AssetProcessor {
                  onPhase: ((Phase) -> Void)? = nil,
                  onRetry: ((Int, Swift.Error) -> Void)? = nil,
                  progress: @escaping (Double) -> Void) async throws -> Result {
+        let key = client.fullKey(for: Repo.objectKey(uuid: record.uuid))
+
         let token = UUID().uuidString
         let originalURL = tempDir.appendingPathComponent("\(token).orig")
         let encryptedURL = tempDir.appendingPathComponent("\(token).age")
@@ -41,61 +52,58 @@ struct AssetProcessor {
             try? FileManager.default.removeItem(at: encryptedURL)
         }
 
-        // 1. Export the untouched original. This is where we learn the real
-        //    filename + extension (both key schemes need the extension, so the
-        //    key can only be resolved here, not at scan time).
+        // 1. Export the untouched original (learns the real filename/size,
+        //    deferred from scan time).
         onPhase?(.exporting)
         let exported = try await photos.exportOriginal(localIdentifier: record.localIdentifier, to: originalURL)
         onMeta?(exported.filename, exported.byteSize)
 
-        let key = client.fullKey(for: Self.remoteKey(
-            localIdentifier: record.localIdentifier, filename: exported.filename,
-            createdAt: record.createdAt, mediaType: record.mediaType))
-
-        // 2. Optionally skip if already present — this still saves the (large)
-        //    encrypt + upload, though the export above already happened.
+        // 2. Optionally skip if this asset's blob already exists (same UUID —
+        //    a previous attempt whose success we failed to record).
         if verifyFirst, try await S3Client.withRetries(onRetry: onRetry, { try await client.headObject(key: key) }) {
             return Result(encryptedBytes: record.byteSize, originalBytes: exported.byteSize,
-                          filename: exported.filename, remoteKey: key, md5Hex: record.md5,
+                          filename: exported.filename,
+                          plaintextHash: record.plaintextHash ?? "",
+                          ciphertextHash: record.ciphertextHash ?? "",
                           alreadyPresent: true)
         }
 
-        // 3. Encrypt to age, streaming chunk by chunk. We compute the ciphertext's
-        //    MD5 in the same pass for the Content-MD5 header (Object-Lock buckets
-        //    require it) and keep the hex form for later ETag verification.
+        // 3. Encrypt to age, streaming chunk by chunk, computing all three
+        //    digests in the same pass.
         onPhase?(.encrypting)
-        let digest = try Self.encryptFile(at: originalURL, to: encryptedURL, recipients: recipients)
+        let digests = try Self.encryptFile(at: originalURL, to: encryptedURL, recipients: recipients)
         let size = (try? FileManager.default.attributesOfItem(atPath: encryptedURL.path)[.size] as? Int64) ?? nil
 
-        // 4. Upload the ciphertext (throttled when a speed limit is set).
-        //    Retried on transient errors (B2's 5xx "InternalError" incidents are
-        //    documented as retry-with-backoff) — the encrypted temp is already on
-        //    disk, so a retry costs no re-export or re-encrypt.
+        // 4. Upload the ciphertext (throttled when a speed limit is set;
+        //    retried on transient errors — the encrypted temp is on disk, so a
+        //    retry costs no re-export or re-encrypt).
         onPhase?(.uploading)
         try await S3Client.withRetries(onRetry: onRetry) {
             try await client.putObject(fileURL: encryptedURL, key: key,
                                        contentType: "application/age",
-                                       contentMD5: digest.base64EncodedString(),
+                                       contentMD5: digests.ciphertextMD5Base64,
                                        bytesPerSecond: bytesPerSecond,
                                        progress: progress)
         }
-        let md5Hex = digest.map { String(format: "%02x", $0) }.joined()
         return Result(encryptedBytes: size ?? 0, originalBytes: exported.byteSize,
-                      filename: exported.filename, remoteKey: key, md5Hex: md5Hex,
+                      filename: exported.filename,
+                      plaintextHash: digests.plaintextSHA256,
+                      ciphertextHash: digests.ciphertextSHA256,
                       alreadyPresent: false)
     }
 
-    /// Stream `source` through the age encryptor into `destination`, returning
-    /// the raw MD5 digest of the ciphertext (base64 it for `Content-MD5`, hex it
-    /// for ETag comparison in verify).
+    /// Stream `source` through the age encryptor into `destination`.
     @discardableResult
-    static func encryptFile(at source: URL, to destination: URL, recipients: [Age.Recipient]) throws -> Data {
+    static func encryptFile(at source: URL, to destination: URL,
+                            recipients: [Age.Recipient]) throws -> EncryptDigests {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
         FileManager.default.createFile(atPath: destination.path, contents: nil)
         let output = try FileHandle(forWritingTo: destination)
         defer { try? output.close() }
 
+        var plainSHA = SHA256()
+        var cipherSHA = SHA256()
         var md5 = Insecure.MD5()
         let encryptor = try Age.Encryptor(recipients: recipients)
         while true {
@@ -105,51 +113,26 @@ struct AssetProcessor {
             let done = try autoreleasepool { () -> Bool in
                 let chunk = try input.read(upToCount: Age.chunkSize) ?? Data()
                 if chunk.isEmpty { return true }
+                plainSHA.update(data: chunk)
                 let out = try encryptor.update(chunk)
-                if !out.isEmpty { try output.write(contentsOf: out); md5.update(data: out) }
+                if !out.isEmpty {
+                    try output.write(contentsOf: out)
+                    cipherSHA.update(data: out)
+                    md5.update(data: out)
+                }
                 return false
             }
             if done { break }
         }
         let tail = try encryptor.finalize()
-        if !tail.isEmpty { try output.write(contentsOf: tail); md5.update(data: tail) }
-        return Data(md5.finalize())
-    }
-
-    /// The object name for an asset: `ab/<sha256-of-asset-id>.<ext>.age`.
-    /// Deterministic from the stable local identifier (re-runs overwrite the
-    /// same object; collisions impossible), private (the bucket never sees real
-    /// names — the encrypted manifest carries them), with the extension kept so
-    /// object types are recognisable at a glance.
-    static func remoteKey(localIdentifier: String, filename: String, createdAt: Date?,
-                          mediaType: AssetRecord.MediaType) -> String {
-        let ext = fileExtension(filename: filename, mediaType: mediaType)
-        let hex = identifierHash(localIdentifier)
-        return "\(hex.prefix(2))/\(hex).\(ext).age"
-    }
-
-    /// The stable hash used as an asset's object name — exposed so the adopt
-    /// feature can match bucket objects back to library assets.
-    static func identifierHash(_ localIdentifier: String) -> String {
-        SHA256.hash(data: Data(localIdentifier.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// Lowercased extension from the filename, falling back to a media-type guess.
-    static func fileExtension(filename: String, mediaType: AssetRecord.MediaType) -> String {
-        let ext = (filename as NSString).pathExtension.lowercased()
-        if !ext.isEmpty { return ext }
-        switch mediaType {
-        case .photo: return "jpg"
-        case .video: return "mov"
-        case .other: return "bin"
+        if !tail.isEmpty {
+            try output.write(contentsOf: tail)
+            cipherSHA.update(data: tail)
+            md5.update(data: tail)
         }
+        return EncryptDigests(
+            plaintextSHA256: plainSHA.finalize().map { String(format: "%02x", $0) }.joined(),
+            ciphertextSHA256: cipherSHA.finalize().map { String(format: "%02x", $0) }.joined(),
+            ciphertextMD5Base64: Data(md5.finalize()).base64EncodedString())
     }
-
-    private static let folderFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy/MM"
-        return f
-    }()
 }

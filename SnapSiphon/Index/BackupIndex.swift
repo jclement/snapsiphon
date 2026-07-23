@@ -1,41 +1,69 @@
 import Foundation
 
-/// The local source of truth for what has been backed up: a SQLite table of
-/// `AssetRecord`s. Scans load the full identifier set into memory in one query
-/// (cheap even at 100k assets), so no probabilistic pre-filter is needed. All
-/// access is serialized on a private queue so callers can hit it from any
-/// actor/task.
+/// The local cache of repository state: a SQLite table of `AssetRecord`s plus
+/// a small meta table tracking the journal chain position. NOT the source of
+/// truth — the bucket's checkpoint + journals are; this database can be
+/// rebuilt from them at any time (`importSnapshot` + `apply(journal:)`).
+/// All access is serialized on a private queue.
 final class BackupIndex {
     private let db: SQLiteDatabase
+    private let dbURL: URL
     private let queue = DispatchQueue(label: "ca.straybits.snapsiphon.index")
 
     init(directory: URL) throws {
-        let dbURL = directory.appendingPathComponent("index.sqlite")
+        self.dbURL = directory.appendingPathComponent("index.sqlite")
         self.db = try SQLiteDatabase(path: dbURL.path)
-        // Clean up the bloom filter file from earlier versions.
+        // Clean up files from earlier formats.
         try? FileManager.default.removeItem(at: directory.appendingPathComponent("bloom.filter"))
+
+        // Format v2 (checkpoint/journal repo). Pre-repo caches are dropped —
+        // the schema changed shape and the cache is rebuildable.
+        let legacy = db.scalarInt(
+            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='remoteKey';")
+        if legacy > 0 { db.exec("DROP TABLE assets;") }
+
         db.exec("""
             CREATE TABLE IF NOT EXISTS assets (
                 localIdentifier TEXT PRIMARY KEY,
-                remoteKey TEXT NOT NULL,
+                uuid TEXT NOT NULL,
                 state TEXT NOT NULL,
                 mediaType TEXT NOT NULL,
                 filename TEXT NOT NULL,
                 byteSize INTEGER NOT NULL,
                 createdAt REAL,
                 uploadedAt REAL,
-                lastError TEXT
+                lastError TEXT,
+                plaintextHash TEXT,
+                ciphertextHash TEXT,
+                journaled INTEGER NOT NULL DEFAULT 0,
+                deletedAt REAL
             );
         """)
         db.exec("CREATE INDEX IF NOT EXISTS idx_state ON assets(state);")
-        // Migration: tombstone timestamp for delete grace-period logic. Harmless
-        // duplicate-column error on already-migrated DBs (exec ignores it).
-        db.exec("ALTER TABLE assets ADD COLUMN deletedAt REAL;")
-        db.exec("ALTER TABLE assets ADD COLUMN md5 TEXT;")
-        // Crash recovery: anything mid-flight when the process died goes back to
-        // pending, so the next run retries it (deterministic keys mean a re-upload
-        // just overwrites the same object — no duplicates).
+        db.exec("CREATE INDEX IF NOT EXISTS idx_journaled ON assets(journaled);")
+        db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")
+        // Crash recovery: mid-flight rows go back to pending (blobs from a PUT
+        // that finished without being recorded are ignorable orphans).
         db.exec("UPDATE assets SET state='pending' WHERE state='uploading';")
+    }
+
+    // MARK: Meta (journal chain position)
+
+    func metaValue(_ key: String) -> String? {
+        queue.sync {
+            (try? db.query("SELECT value FROM meta WHERE key=?;", [.text(key)]) { $0.text(0) })?.first
+        }
+    }
+
+    func setMeta(_ key: String, _ value: String?) {
+        queue.sync {
+            if let value {
+                db.exec("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
+                        [.text(key), .text(value)])
+            } else {
+                db.exec("DELETE FROM meta WHERE key=?;", [.text(key)])
+            }
+        }
     }
 
     // MARK: Upserts
@@ -44,16 +72,18 @@ final class BackupIndex {
         queue.sync {
             db.exec("""
                 INSERT INTO assets
-                    (localIdentifier, remoteKey, state, mediaType, filename, byteSize, createdAt, uploadedAt, lastError, md5)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (localIdentifier, uuid, state, mediaType, filename, byteSize, createdAt, uploadedAt, lastError, plaintextHash, ciphertextHash, journaled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(localIdentifier) DO UPDATE SET
-                    remoteKey=excluded.remoteKey, state=excluded.state, mediaType=excluded.mediaType,
+                    uuid=excluded.uuid, state=excluded.state, mediaType=excluded.mediaType,
                     filename=excluded.filename, byteSize=excluded.byteSize, createdAt=excluded.createdAt,
-                    uploadedAt=excluded.uploadedAt, lastError=excluded.lastError, md5=excluded.md5;
+                    uploadedAt=excluded.uploadedAt, lastError=excluded.lastError,
+                    plaintextHash=excluded.plaintextHash, ciphertextHash=excluded.ciphertextHash,
+                    journaled=excluded.journaled;
                 """,
                 [
                     .text(record.localIdentifier),
-                    .text(record.remoteKey),
+                    .text(record.uuid),
                     .text(record.state.rawValue),
                     .text(record.mediaType.rawValue),
                     .text(record.filename),
@@ -61,15 +91,10 @@ final class BackupIndex {
                     .date(record.createdAt),
                     .date(record.uploadedAt),
                     .optText(record.lastError),
-                    .optText(record.md5),
+                    .optText(record.plaintextHash),
+                    .optText(record.ciphertextHash),
+                    .int(record.journaled ? 1 : 0),
                 ])
-        }
-    }
-
-    func markUploaded(_ localIdentifier: String, uploadedAt: Date) {
-        queue.sync {
-            db.exec("UPDATE assets SET state='uploaded', uploadedAt=?, lastError=NULL WHERE localIdentifier=?;",
-                    [.date(uploadedAt), .text(localIdentifier)])
         }
     }
 
@@ -86,7 +111,85 @@ final class BackupIndex {
         }
     }
 
-    // MARK: Aggregate stats
+    // MARK: Journal bookkeeping
+
+    /// Rows whose latest change hasn't been committed to a bucket journal yet.
+    func unjournaledRecords() -> [AssetRecord] {
+        queue.sync {
+            (try? db.query(
+                "SELECT * FROM assets WHERE journaled=0 AND state IN ('uploaded','deleted') ORDER BY uploadedAt;",
+                [], Self.mapRow)) ?? []
+        }
+    }
+
+    func markJournaled(_ localIdentifiers: [String]) {
+        queue.sync {
+            for id in localIdentifiers {
+                db.exec("UPDATE assets SET journaled=1 WHERE localIdentifier=?;", [.text(id)])
+            }
+        }
+    }
+
+    func unjournaledCount() -> Int {
+        queue.sync {
+            Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE journaled=0 AND state IN ('uploaded','deleted');"))
+        }
+    }
+
+    /// Every blob UUID any row still references (uploaded, deleted-but-
+    /// unpurged, or in flight) — the complement of "orphan" for Verify.
+    func referencedUUIDs() -> Set<String> {
+        queue.sync {
+            Set((try? db.query("SELECT uuid FROM assets WHERE uuid != '';", []) { $0.text(0) }) ?? [])
+        }
+    }
+
+    // MARK: State transitions
+
+    func markDeleted(_ localIdentifier: String, at date: Date) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='deleted', deletedAt=?, journaled=0 WHERE localIdentifier=? AND state != 'deleted';",
+                    [.date(date), .text(localIdentifier)])
+        }
+    }
+
+    func resurrect(_ localIdentifier: String) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='uploaded', deletedAt=NULL, journaled=0 WHERE localIdentifier=? AND state='deleted';",
+                    [.text(localIdentifier)])
+        }
+    }
+
+    func tombstonedIdentifiers() -> Set<String> {
+        queue.sync {
+            Set((try? db.query("SELECT localIdentifier FROM assets WHERE state='deleted';", []) { $0.text(0) }) ?? [])
+        }
+    }
+
+    /// Tombstones past the grace cutoff, eligible for physical purge.
+    func purgeableRecords(before cutoff: Date) -> [AssetRecord] {
+        queue.sync {
+            (try? db.query(
+                "SELECT * FROM assets WHERE state='deleted' AND deletedAt IS NOT NULL AND deletedAt <= ?;",
+                [.date(cutoff)], Self.mapRow)) ?? []
+        }
+    }
+
+    /// Drop a record entirely (purged blob, or pending item whose asset vanished).
+    func hardDeleteRecord(_ localIdentifier: String) {
+        queue.sync {
+            db.exec("DELETE FROM assets WHERE localIdentifier=?;", [.text(localIdentifier)])
+        }
+    }
+
+    func requeue(_ localIdentifier: String, reason: String) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='pending', lastError=? WHERE localIdentifier=?;",
+                    [.text(reason), .text(localIdentifier)])
+        }
+    }
+
+    // MARK: Aggregates & queries (cache reads)
 
     struct Counts {
         var total = 0
@@ -110,7 +213,6 @@ final class BackupIndex {
         }
     }
 
-    /// Uploaded counts and stored bytes split by media type, for the ring.
     func uploadedByType() -> (photos: Int, videos: Int, photoBytes: Int64, videoBytes: Int64) {
         queue.sync {
             let p = db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='uploaded' AND mediaType='photo';")
@@ -129,28 +231,17 @@ final class BackupIndex {
         }
     }
 
-    /// Every uploaded record, for building the restore manifest.
     func allUploaded() -> [AssetRecord] {
         queue.sync {
             (try? db.query("SELECT * FROM assets WHERE state='uploaded' ORDER BY uploadedAt;", [], Self.mapRow)) ?? []
         }
     }
 
-    /// A random sample of uploaded records, for spot-check verification.
-    func randomUploaded(limit: Int) -> [AssetRecord] {
+    func uploadedKeyPairs() -> [(id: String, uuid: String)] {
         queue.sync {
-            (try? db.query(
-                "SELECT * FROM assets WHERE state='uploaded' ORDER BY RANDOM() LIMIT ?;",
-                [.int(Int64(limit))], Self.mapRow)) ?? []
-        }
-    }
-
-    /// Send a record back to the upload queue (verification found it missing or
-    /// mismatched in the bucket — a re-upload heals it).
-    func requeue(_ localIdentifier: String, reason: String) {
-        queue.sync {
-            db.exec("UPDATE assets SET state='pending', lastError=? WHERE localIdentifier=?;",
-                    [.text(reason), .text(localIdentifier)])
+            (try? db.query("SELECT localIdentifier, uuid FROM assets WHERE state='uploaded';", []) {
+                (id: $0.text(0), uuid: $0.text(1))
+            }) ?? []
         }
     }
 
@@ -162,95 +253,74 @@ final class BackupIndex {
         }
     }
 
-    /// Every indexed local identifier, loaded in one query. The scan holds this
-    /// in memory so it can skip already-known assets without a per-asset DB hit.
     func allIdentifiers() -> Set<String> {
         queue.sync {
-            let rows = (try? db.query("SELECT localIdentifier FROM assets;", []) { $0.text(0) }) ?? []
-            return Set(rows)
-        }
-    }
-
-    /// (id, remoteKey) for every uploaded object — used to reconcile against the
-    /// live library when propagating deletes.
-    func uploadedKeyPairs() -> [(id: String, remoteKey: String)] {
-        queue.sync {
-            (try? db.query("SELECT localIdentifier, remoteKey FROM assets WHERE state='uploaded';", []) {
-                (id: $0.text(0), remoteKey: $0.text(1))
-            }) ?? []
-        }
-    }
-
-    /// Logically delete: keep the row as a tombstone (state='deleted') stamped
-    /// with the deletion time, so the manifest records it and the grace period
-    /// can be enforced before any physical purge.
-    func markDeleted(_ localIdentifier: String, at date: Date) {
-        queue.sync {
-            db.exec("UPDATE assets SET state='deleted', deletedAt=? WHERE localIdentifier=? AND state != 'deleted';",
-                    [.date(date), .text(localIdentifier)])
-        }
-    }
-
-    /// Bring a tombstoned asset back to life — used when a deleted photo
-    /// reappears in the library (e.g. iCloud restored after an accidental erase).
-    func resurrect(_ localIdentifier: String) {
-        queue.sync {
-            db.exec("UPDATE assets SET state='uploaded', deletedAt=NULL WHERE localIdentifier=? AND state='deleted';",
-                    [.text(localIdentifier)])
-        }
-    }
-
-    /// Local identifiers currently tombstoned (to detect resurrections).
-    func tombstonedIdentifiers() -> Set<String> {
-        queue.sync {
-            let rows = (try? db.query("SELECT localIdentifier FROM assets WHERE state='deleted';", []) { $0.text(0) }) ?? []
-            return Set(rows)
-        }
-    }
-
-    /// Object keys of everything logically deleted — the manifest's tombstone list.
-    func deletedKeys() -> [String] {
-        queue.sync {
-            (try? db.query("SELECT remoteKey FROM assets WHERE state='deleted';", []) { $0.text(0) }) ?? []
-        }
-    }
-
-    /// Full records for tombstoned assets, so the manifest can carry their
-    /// metadata for disaster (`--all`) restores until the blob is purged.
-    func deletedRecords() -> [AssetRecord] {
-        queue.sync {
-            (try? db.query("SELECT * FROM assets WHERE state='deleted' ORDER BY uploadedAt;", [], Self.mapRow)) ?? []
-        }
-    }
-
-    /// Tombstones whose grace period has elapsed and are eligible for physical
-    /// purge (returns their object keys).
-    func purgeableKeys(before cutoff: Date) -> [String] {
-        queue.sync {
-            (try? db.query(
-                "SELECT remoteKey FROM assets WHERE state='deleted' AND deletedAt IS NOT NULL AND deletedAt <= ?;",
-                [.date(cutoff)]) { $0.text(0) }) ?? []
-        }
-    }
-
-    /// Drop a record entirely (used for pending items whose asset was deleted
-    /// before ever uploading — nothing exists remotely to track or tombstone).
-    func hardDeleteRecord(_ localIdentifier: String) {
-        queue.sync {
-            db.exec("DELETE FROM assets WHERE localIdentifier=?;", [.text(localIdentifier)])
-        }
-    }
-
-    /// Permanently drop a tombstone once its object is confirmed gone from the bucket.
-    func hardDelete(remoteKey: String) {
-        queue.sync {
-            db.exec("DELETE FROM assets WHERE remoteKey=? AND state='deleted';", [.text(remoteKey)])
+            Set((try? db.query("SELECT localIdentifier FROM assets;", []) { $0.text(0) }) ?? [])
         }
     }
 
     func reset() {
         queue.sync {
             db.exec("DELETE FROM assets;")
+            db.exec("DELETE FROM meta;")
+        }
+    }
+
+    // MARK: Snapshot (checkpoint) export / import
+
+    /// Write a consistent snapshot of this database to `url` (VACUUM INTO).
+    /// The encrypted result IS the checkpoint — local cache and checkpoint
+    /// share one schema by construction.
+    func snapshot(to url: URL) throws {
+        try? FileManager.default.removeItem(at: url)
+        try queue.sync {
+            try db.execThrowing("VACUUM INTO '\(url.path.replacingOccurrences(of: "'", with: "''"))';")
+        }
+    }
+
+    /// Replace this database's contents with a decrypted checkpoint snapshot.
+    func importSnapshot(from url: URL) throws {
+        let snap = try SQLiteDatabase(path: url.path)
+        let rows = try snap.query("SELECT * FROM assets;", [], Self.mapRow)
+        let metaRows: [(String, String)] = (try? snap.query("SELECT key, value FROM meta;", []) {
+            ($0.text(0), $0.text(1))
+        }) ?? []
+        queue.sync {
+            db.exec("DELETE FROM assets;")
+            db.exec("DELETE FROM meta;")
+        }
+        for r in rows { upsert(r) }
+        for (k, v) in metaRows { setMeta(k, v) }
+    }
+
+    /// Apply one journal's entries on top of current state (repo replay).
+    func apply(journal: Repo.Journal) {
+        let iso = ISO8601DateFormatter()
+        for e in journal.entries {
+            switch e.op {
+            case .add, .update, .restore:
+                let rec = AssetRecord(
+                    localIdentifier: e.localIdentifier ?? "remote-\(e.uuid)",
+                    uuid: e.uuid,
+                    state: .uploaded,
+                    mediaType: AssetRecord.MediaType(rawValue: e.mediaType ?? "") ?? .other,
+                    filename: e.filename ?? "",
+                    byteSize: e.size ?? 0,
+                    createdAt: e.createdAt.flatMap { iso.date(from: $0) },
+                    uploadedAt: iso.date(from: e.at),
+                    lastError: nil,
+                    plaintextHash: e.plaintextHash,
+                    ciphertextHash: e.ciphertextHash,
+                    journaled: true)
+                upsert(rec)
+            case .delete:
+                if let id = e.localIdentifier {
+                    markDeleted(id, at: iso.date(from: e.at) ?? Date())
+                    markJournaled([id])
+                }
+            case .purge:
+                if let id = e.localIdentifier { hardDeleteRecord(id) }
+            }
         }
     }
 
@@ -259,7 +329,7 @@ final class BackupIndex {
     private static func mapRow(_ r: SQLiteDatabase.Row) -> AssetRecord {
         AssetRecord(
             localIdentifier: r.text(0),
-            remoteKey: r.text(1),
+            uuid: r.text(1),
             state: AssetState(rawValue: r.text(2)) ?? .pending,
             mediaType: AssetRecord.MediaType(rawValue: r.text(3)) ?? .other,
             filename: r.text(4),
@@ -267,6 +337,8 @@ final class BackupIndex {
             createdAt: r.dateOrNil(6),
             uploadedAt: r.dateOrNil(7),
             lastError: r.textOrNil(8),
-            md5: r.textOrNil(10))   // col 9 = deletedAt, col 10 = md5 (migration order)
+            plaintextHash: r.textOrNil(9),
+            ciphertextHash: r.textOrNil(10),
+            journaled: r.int(11) == 1)
     }
 }

@@ -16,8 +16,9 @@ struct SettingsView: View {
 
     @State private var showRestoreScriptWarning = false
     @State private var restoreScript: ScriptDocument?
-    @State private var writingManifest = false
-    @State private var manifestStatus: String?
+    @State private var compacting = false
+    @State private var reloadingIndex = false
+    @State private var showReloadConfirm = false
 
     var body: some View {
         NavigationStack {
@@ -76,6 +77,28 @@ struct SettingsView: View {
                         Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Favorites only", subtitle: "Skip anything you haven't hearted.",
                                   isOn: $engine.settings.favoritesOnly)
+                        Divider().overlay(Theme.hairline)
+                        ToggleRow(title: "Only content after a date",
+                                  subtitle: "Skip everything captured before a cutoff — handy for testing on a slice of a huge library, or when older content already lives in another backup. Older items are also left out of the progress ring.",
+                                  isOn: Binding(
+                                    get: { engine.settings.backupCutoff != nil },
+                                    set: { on in
+                                        engine.settings.backupCutoff = on
+                                            ? (engine.settings.backupCutoff
+                                               ?? Calendar.current.date(byAdding: .month, value: -2, to: Calendar.current.startOfDay(for: Date())))
+                                            : nil
+                                    }))
+                        if let cutoff = engine.settings.backupCutoff {
+                            DatePicker("Back up from",
+                                       selection: Binding(
+                                        get: { cutoff },
+                                        set: { engine.settings.backupCutoff = Calendar.current.startOfDay(for: $0) }),
+                                       in: ...Date(),
+                                       displayedComponents: .date)
+                                .font(Theme.rounded(15, weight: .medium))
+                                .foregroundStyle(Theme.textPrimary)
+                                .tint(Theme.teal)
+                        }
                     }
 
                     knobGroup("Speed & concurrency") {
@@ -115,11 +138,11 @@ struct SettingsView: View {
                     }
 
                     knobGroup("Deletions") {
-                        Text("Photos you delete on-device are always marked deleted in the encrypted manifest, so restores skip them (a disaster restore can still recover un-purged ones with --all).")
+                        Text("Photos you delete on-device are always recorded as deleted in the encrypted journal, so restores skip them (a disaster restore can still recover un-purged ones with --all).")
                             .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                         Divider().overlay(Theme.hairline)
-                        ToggleRow(title: "Purge deleted backups",
-                                  subtitle: "Also free the storage: best-effort removal of deleted photos' blobs after the grace period. Off = blobs are kept forever (marked only).",
+                        ToggleRow(title: "Purge deleted backups automatically",
+                                  subtitle: "Garbage-collect on every sync: best-effort removal of deleted photos' blobs after the grace period. Off = blobs are kept forever (marked only). Needs a key with delete permission — pointless on append-only buckets until retention expires.",
                                   isOn: $engine.settings.propagateDeletes)
                         if engine.settings.propagateDeletes {
                             Divider().overlay(Theme.hairline)
@@ -132,49 +155,106 @@ struct SettingsView: View {
                             HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: "info.circle.fill")
                                     .foregroundStyle(Theme.teal).font(.system(size: 13))
-                                Text("Blobs are freed only after the grace period AND once Object Lock retention expires, whichever is longer. Photos that reappear are un-marked automatically. A purged blob also drops out of the manifest.")
+                                Text("Blobs are freed only after the grace period AND once Object Lock retention expires, whichever is longer. Photos that reappear are un-marked automatically. A purge is journaled too, so restores know the blob is gone.")
                                     .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                             }
                             .padding(10)
                             .background(RoundedRectangle(cornerRadius: 10).fill(Theme.teal.opacity(0.10)))
                         }
-                    }
-
-                    knobGroup("Restore manifest") {
-                        ToggleRow(title: "Keep encrypted manifest",
-                                  subtitle: "Store an age-encrypted key→filename map in the bucket so a bucket-only restore can rename everything back.",
-                                  isOn: $engine.settings.keepBucketManifest)
                         Divider().overlay(Theme.hairline)
                         Button {
-                            Task {
-                                writingManifest = true
-                                manifestStatus = nil
-                                switch await engine.writeManifest() {
-                                case .success(let r):
-                                    manifestStatus = "✓ Wrote \(Format.count(r.count)) item\(r.count == 1 ? "" : "s") · \(Format.bytes(r.bytes)) encrypted"
-                                case .failure(let error):
-                                    manifestStatus = "✗ \(error.localizedDescription)"
-                                }
-                                writingManifest = false
-                            }
+                            Task { await engine.garbageCollectNow() }
                         } label: {
                             HStack {
-                                if writingManifest {
-                                    ProgressView().tint(Theme.teal)
-                                } else {
-                                    Image(systemName: "doc.badge.arrow.up")
+                                Image(systemName: "trash.slash")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Clean up now").font(Theme.rounded(16, weight: .medium))
+                                    Text("One-off garbage collection: free the blobs of deleted photos that are past the grace period, even with automatic purging off. Blobs are deleted first, then the purge is journaled — a crash in between just retries safely on the next cleanup.")
+                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                                 }
-                                Text(writingManifest ? "Writing…" : "Write manifest now")
-                                    .font(Theme.rounded(16, weight: .medium))
                                 Spacer()
                             }
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
-                        .disabled(!engine.isConfigured || engine.phase.isActive || writingManifest)
-                        if let manifestStatus {
-                            Text(manifestStatus)
+                        .disabled(!engine.isConfigured || engine.phase.isActive)
+                        if let status = engine.gcStatus {
+                            Text(status)
                                 .font(Theme.mono(12))
-                                .foregroundStyle(manifestStatus.hasPrefix("✓") ? .green : .red)
+                                .foregroundStyle(status.hasPrefix("✓") ? .green
+                                                 : status.hasPrefix("✗") ? .red : Theme.textSecondary)
+                        }
+                    }
+
+                    knobGroup("Repository") {
+                        Text("Every change is committed to an append-only encrypted journal in the bucket — the journal, not this phone, is the source of truth. Checkpoints compact the history into a fresh snapshot; old generations stay untouched (append-only friendly).")
+                            .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                        Divider().overlay(Theme.hairline)
+                        Button {
+                            Task {
+                                compacting = true
+                                await engine.compactNow()
+                                compacting = false
+                            }
+                        } label: {
+                            HStack {
+                                if compacting {
+                                    ProgressView().tint(Theme.teal)
+                                } else {
+                                    Image(systemName: "archivebox")
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(compacting ? "Writing checkpoint…" : "Write checkpoint now")
+                                        .font(Theme.rounded(16, weight: .medium))
+                                    Text("Commit pending changes and start a fresh generation (a full snapshot). Restores get faster; nothing is deleted.")
+                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                                }
+                                Spacer()
+                            }
+                            .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
+                        }
+                        .disabled(!engine.isConfigured || engine.phase.isActive || compacting)
+                        if let status = engine.checkpointStatus {
+                            Text(status)
+                                .font(Theme.mono(12))
+                                .foregroundStyle(status.hasPrefix("✓") ? .green
+                                                 : status.hasPrefix("✗") ? .red : Theme.textSecondary)
+                        }
+                        Divider().overlay(Theme.hairline)
+                        Button { showReloadConfirm = true } label: {
+                            HStack {
+                                if reloadingIndex {
+                                    ProgressView().tint(Theme.teal)
+                                } else {
+                                    Image(systemName: "arrow.triangle.2.circlepath.doc.on.clipboard")
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(reloadingIndex ? "Reloading…" : "Reload index from repository")
+                                        .font(Theme.rounded(16, weight: .medium))
+                                    Text("Rebuild the local cache from the bucket's newest checkpoint + journals (chain-verified). Use after a reinstall or if the cache is suspect. Requires this phone's key.")
+                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                                }
+                                Spacer()
+                            }
+                            .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
+                        }
+                        .disabled(!engine.isConfigured || engine.phase.isActive || reloadingIndex)
+                        .alert("Replace the local index?", isPresented: $showReloadConfirm) {
+                            Button("Reload from repository", role: .destructive) {
+                                Task {
+                                    reloadingIndex = true
+                                    await engine.restoreIndexFromRepo()
+                                    reloadingIndex = false
+                                }
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("The local cache is replaced by what the repository says. Nothing in the bucket changes. Photos on this phone that were never journaled will re-queue on the next scan.")
+                        }
+                        if let status = engine.attachStatus {
+                            Text(status)
+                                .font(Theme.mono(12))
+                                .foregroundStyle(status.hasPrefix("✓") ? .green
+                                                 : status.hasPrefix("✗") ? .red : Theme.textSecondary)
                         }
                     }
 
@@ -191,7 +271,7 @@ struct SettingsView: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(engine.verifying ? "Verifying…" : "Verify all backups")
                                         .font(Theme.rounded(16, weight: .medium))
-                                    Text("Egress-free: lists the bucket and checks every file exists with the right size and checksum (stored MD5 vs ETag). Anything missing is re-queued.")
+                                    Text("Egress-free: lists the bucket's blobs and checks every backed-up item exists with the expected size. Anything missing or wrong-sized is re-queued.")
                                         .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                                 }
                                 Spacer()
@@ -200,28 +280,6 @@ struct SettingsView: View {
                         }
                         .disabled(!engine.isConfigured || engine.phase.isActive || engine.verifying)
                         if let status = engine.verifyStatus {
-                            Text(status)
-                                .font(Theme.mono(12))
-                                .foregroundStyle(status.hasPrefix("✓") ? .green
-                                                 : status.hasPrefix("✗") ? .red : Theme.textSecondary)
-                        }
-                        Divider().overlay(Theme.hairline)
-                        Button {
-                            Task { await engine.adoptExistingBackups() }
-                        } label: {
-                            HStack {
-                                Image(systemName: "square.and.arrow.down.on.square")
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Adopt existing backups").font(Theme.rounded(16, weight: .medium))
-                                    Text("Fresh install, existing bucket? Match this library against objects already uploaded and index them — no downloads, no re-uploads. (Runs automatically on the first Back Up Now.)")
-                                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
-                                }
-                                Spacer()
-                            }
-                            .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
-                        }
-                        .disabled(!engine.isConfigured || engine.phase.isActive || engine.verifying)
-                        if let status = engine.adoptStatus {
                             Text(status)
                                 .font(Theme.mono(12))
                                 .foregroundStyle(status.hasPrefix("✓") ? .green

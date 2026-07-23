@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import UIKit
+import CryptoKit
 import BackgroundTasks
 import UserNotifications
 
@@ -87,9 +88,16 @@ final class BackupEngine: ObservableObject {
             // next scan re-checks the whole library for them.
             if (settings.includePhotos && !oldValue.includePhotos) ||
                (settings.includeVideos && !oldValue.includeVideos) ||
-               (!settings.favoritesOnly && oldValue.favoritesOnly) {
+               (!settings.favoritesOnly && oldValue.favoritesOnly) ||
+               // Cutoff removed or moved earlier: assets before the old cutoff
+               // are behind the mark and would otherwise never be picked up.
+               (oldValue.backupCutoff != nil &&
+                (settings.backupCutoff == nil || settings.backupCutoff! < oldValue.backupCutoff!)) {
                 scanMark = nil
                 appendLog("Backup filters widened — next scan re-checks the whole library.", .info)
+            }
+            if settings.backupCutoff != oldValue.backupCutoff {
+                Task { await self.refreshLibraryCounts() }
             }
         }
     }
@@ -349,8 +357,13 @@ final class BackupEngine: ObservableObject {
     /// index exists: the index describes the OLD bucket, so surface it loudly
     /// and point at the healing paths instead of quietly lying.
     func noteDestinationChanged() {
-        appendLog("Storage destination changed — the local index still describes the old bucket. Run Verify (re-queues anything missing), Adopt existing backups (if the new bucket already has this archive), or Reset local index for a fresh start.", .warning)
-        manifestDirty = true
+        // Our position in the OLD repository's journal chain means nothing in
+        // the new location — drop it so the next backup re-inspects the folder
+        // (initializing it, or raising the attach prompt if a repo lives there).
+        setRepoPosition(generation: nil, nextSeq: 1, lastHash: "")
+        repoConflict = nil
+        pendingAttach = nil
+        appendLog("Storage destination changed — the local index still describes the old repository. The next backup inspects the new folder; run Verify afterwards to re-queue anything the new bucket is missing, or Reset local index for a fresh start.", .warning)
     }
 
     /// Refresh the library totals by type (cheap PhotoKit counts). Runs off-main
@@ -358,7 +371,8 @@ final class BackupEngine: ObservableObject {
     func refreshLibraryCounts() async {
         if demoMode || !photoAuth.canRead { return }
         let photos = self.photos
-        let counts = await Task.detached(priority: .utility) { photos.libraryCounts() }.value
+        let cutoff = settings.backupCutoff
+        let counts = await Task.detached(priority: .utility) { photos.libraryCounts(since: cutoff) }.value
         libraryPhotos = counts.photos
         libraryVideos = counts.videos
     }
@@ -426,8 +440,12 @@ final class BackupEngine: ObservableObject {
         // on another device can sync in with a creationDate BEHIND the mark and
         // would otherwise be skipped forever. The known-set dedups the overlap,
         // so this costs almost nothing. (Imports older than 48h → Deep scan.)
-        let since: Date? = (deep || !settings.incrementalScan)
+        // The cutoff setting bounds every scan (even deep ones): content older
+        // than it is out of scope by user choice, not covered-and-skipped.
+        let cutoff = settings.backupCutoff
+        let markSince: Date? = (deep || !settings.incrementalScan)
             ? nil : scanMark?.addingTimeInterval(-48 * 3600)
+        let since: Date? = [markSince, cutoff].compactMap { $0 }.max()
         appendLog(deep ? "Deep scan — re-checking the whole library…"
                        : (since == nil ? "Scanning library…" : "Fast scan — checking new photos…"), .info)
 
@@ -457,7 +475,10 @@ final class BackupEngine: ObservableObject {
                 if known.contains(info.localIdentifier) { continue }
                 idx.upsert(AssetRecord(
                     localIdentifier: info.localIdentifier,
-                    remoteKey: "",             // resolved at upload (needs the file extension)
+                    // Random blob name, fixed for the record's whole life — a
+                    // crashed upload retries to the SAME key, so verify-first
+                    // HEADs can spot the finished blob.
+                    uuid: UUID().uuidString.lowercased(),
                     state: .pending,
                     mediaType: info.mediaType,
                     filename: "",             // filled in at upload (deferred PHAssetResource lookup)
@@ -493,24 +514,45 @@ final class BackupEngine: ObservableObject {
         phase = .idle
     }
 
-    // MARK: Fast-scan high-water mark
+    // MARK: Repository chain state
 
-    /// True whenever the archive's contents have changed since the last
-    /// *successful* manifest write. Persisted, so a failed write (or a kill
-    /// mid-run) is retried at the end of the next run even if that run
-    /// uploads nothing.
-    private var manifestDirty: Bool {
-        get { UserDefaults.standard.bool(forKey: "SnapSiphon.manifestDirty") }
-        set { UserDefaults.standard.set(newValue, forKey: "SnapSiphon.manifestDirty") }
+    /// Index-meta keys tracking where this instance believes the bucket's
+    /// journal chain head is. The bucket is the source of truth — these are
+    /// only our cached position in it.
+    private enum RepoMeta {
+        static let generation = "repo.generation"
+        static let nextSeq = "repo.nextSeq"
+        static let lastHash = "repo.lastHash"
     }
 
-    private static let manifestStampFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyyMMdd-HHmmss'Z'"
-        return f
-    }()
+    /// Stable random ID for THIS install. Journals carry it, which is how a
+    /// second device writing to the same folder becomes detectable. It never
+    /// leaves the repository.
+    static var instanceID: String {
+        if let v = UserDefaults.standard.string(forKey: "SnapSiphon.instanceID") { return v }
+        let v = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(v, forKey: "SnapSiphon.instanceID")
+        return v
+    }
+
+    private var repoGeneration: Int? {
+        index?.metaValue(RepoMeta.generation).flatMap(Int.init)
+    }
+    private var repoNextSeq: Int {
+        index?.metaValue(RepoMeta.nextSeq).flatMap(Int.init) ?? 1
+    }
+    private var repoLastHash: String {
+        index?.metaValue(RepoMeta.lastHash) ?? ""
+    }
+    private func setRepoPosition(generation: Int?, nextSeq: Int, lastHash: String) {
+        index?.setMeta(RepoMeta.generation, generation.map(String.init))
+        index?.setMeta(RepoMeta.nextSeq, String(nextSeq))
+        index?.setMeta(RepoMeta.lastHash, lastHash)
+    }
+
+    private static let repoISO = ISO8601DateFormatter()
+
+    // MARK: Fast-scan high-water mark
 
     private static let scanMarkKey = "SnapSiphon.scanMark.v1"
 
@@ -575,13 +617,12 @@ final class BackupEngine: ObservableObject {
         let now = Date()
         for orphan in orphans { index.markDeleted(orphan.id, at: now) }
         if !orphans.isEmpty {
-            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device — marked deleted in the manifest.", .warning)
+            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device — recording tombstone\(orphans.count == 1 ? "" : "s") in the journal.", .warning)
         }
 
         if resurrected > 0 || !orphans.isEmpty {
-            manifestDirty = true
             refreshCounts()
-            if settings.keepBucketManifest { await writeManifest() }
+            await flushJournal()   // tombstones/resurrections are journal ops
         }
 
         // Physical space reclamation is opt-in; marking above is unconditional.
@@ -592,15 +633,46 @@ final class BackupEngine: ObservableObject {
     /// Each is version-deleted; Object Lock rejects any still under retention, so
     /// those stay tombstoned and are retried on a later scan — nothing recent can
     /// be wiped by a bulk mistake.
-    private func purgeTombstones() async {
-        guard let index, let client = makeClient() else { return }
-        let cutoff = Calendar.current.date(byAdding: .day, value: -settings.deleteGraceDays, to: Date()) ?? Date()
-        let keys = index.purgeableKeys(before: cutoff)
-        guard !keys.isEmpty else { return }
+    /// Manual "Clean up now" status (garbage-collection box in Settings).
+    @Published private(set) var gcStatus: String?
 
-        var freed = 0, blocked = 0
-        for key in keys {
+    /// Run garbage collection on demand — even when automatic purging is off.
+    /// Same grace-period rules as the automatic path: recent deletions are the
+    /// accident window and are never touched.
+    func garbageCollectNow() async {
+        guard !phase.isActive, runTask == nil, pipelineTask == nil, !verifying else {
+            gcStatus = "✗ Wait for the current run to finish"
+            return
+        }
+        guard let index else { return }
+        gcStatus = "Cleaning up…"
+        let tombstones = index.tombstonedIdentifiers().count
+        let stats = await purgeTombstones()
+        let waiting = tombstones - stats.freed
+        if tombstones == 0 {
+            gcStatus = "✓ Nothing to clean up — no deleted backups"
+        } else {
+            var parts: [String] = []
+            if stats.freed > 0 { parts.append("freed \(Format.count(stats.freed)) (\(Format.bytes(stats.freedBytes)))") }
+            if stats.blocked > 0 { parts.append("\(stats.blocked) blocked by Object Lock") }
+            let inGrace = waiting - stats.blocked
+            if inGrace > 0 { parts.append("\(inGrace) still inside the grace period") }
+            gcStatus = (stats.freed > 0 ? "✓ " : "") + parts.joined(separator: " · ")
+        }
+    }
+
+    @discardableResult
+    private func purgeTombstones() async -> (freed: Int, freedBytes: Int64, blocked: Int) {
+        guard let index, let client = makeClient() else { return (0, 0, 0) }
+        let cutoff = Calendar.current.date(byAdding: .day, value: -settings.deleteGraceDays, to: Date()) ?? Date()
+        let records = index.purgeableRecords(before: cutoff)
+        guard !records.isEmpty else { return (0, 0, 0) }
+
+        var freed: [AssetRecord] = []
+        var blocked = 0
+        for record in records where !record.uuid.isEmpty {
             if Task.isCancelled { break }
+            let key = client.fullKey(for: Repo.objectKey(uuid: record.uuid))
             do {
                 let versions = try await client.listVersions(forKey: key)
                 var allGone = true
@@ -608,74 +680,358 @@ final class BackupEngine: ObservableObject {
                     do { try await client.deleteObjectVersion(key: key, versionId: v.versionId) }
                     catch { allGone = false }          // locked / retention — retry later
                 }
-                if allGone { index.hardDelete(remoteKey: key); freed += 1 } else { blocked += 1 }
+                if allGone { freed.append(record) } else { blocked += 1 }
             } catch {
                 blocked += 1                            // listing failed — retry later
             }
         }
-        if freed > 0 {
-            manifestDirty = true
-            appendLog("Freed \(freed) deleted backup\(freed == 1 ? "" : "s") from the bucket.", .info)
-            if settings.keepBucketManifest { await writeManifest() }
+        if !freed.isEmpty {
+            // Journal the purges FIRST (so a restore knows the blob is gone),
+            // then drop the cache rows. If the flush fails, rows stay
+            // tombstoned and the purge op is retried next scan — the version
+            // listing comes back empty, which is fine and idempotent.
+            let at = Self.repoISO.string(from: Date())
+            let purgeEntries = freed.map { r in
+                Repo.Entry(op: .purge, uuid: r.uuid, localIdentifier: r.localIdentifier, at: at)
+            }
+            if await flushJournal(extra: purgeEntries) {
+                for r in freed { index.hardDeleteRecord(r.localIdentifier) }
+            }
+            appendLog("Freed \(freed.count) deleted backup\(freed.count == 1 ? "" : "s") from the bucket.", .info)
         }
         if blocked > 0 {
             appendLog("\(blocked) deletion\(blocked == 1 ? "" : "s") still locked — will retry once Object Lock retention expires.", .info)
         }
         refreshCounts()
+        return (freed.count, freed.reduce(0) { $0 + $1.byteSize }, blocked)
     }
 
-    /// Build the encrypted restore manifest and upload it to the bucket as
-    /// `manifest.age`. Encrypted to the same recipients, so the provider still
-    /// sees only ciphertext, but you can `age -d` it to recover every filename.
+    // MARK: Journal & checkpoint (the bucket IS the source of truth)
+
+    /// Set when journaling detects another writer (or a chain anomaly) in the
+    /// repository. Journaling stops until the user resolves it — two devices
+    /// interleaving journals WILL corrupt both backups.
+    @Published private(set) var repoConflict: String?
+    /// Set when Back Up Now finds an existing repository this install has never
+    /// attached to. Upload is blocked until the user picks an option (sheet).
+    @Published var pendingAttach: ExistingRepoInfo?
+    @Published private(set) var attachStatus: String?
+    @Published private(set) var checkpointStatus: String?
+
+    struct ExistingRepoInfo: Identifiable, Equatable {
+        let id = UUID()
+        var generations: Int
+        var journalFiles: Int
+    }
+
+    /// Uncommitted changes before a mid-run journal write (also always flushed
+    /// at the end of every run).
+    private let journalFlushThreshold = 25
+    /// Journals per generation before compacting into a fresh checkpoint.
+    private let journalsPerGeneration = 20
+    private var journalFlushInFlight = false
+
+    /// List every metadata key under checkpoints/, parsed to (gen, seq).
+    private func listMetadata(client: S3Client) async throws -> [(gen: Int, seq: Int)] {
+        var parsed: [(gen: Int, seq: Int)] = []
+        var token: String? = nil
+        let pfx = client.fullKey(for: "")
+        repeat {
+            let page = try await client.listObjects(subPrefix: "checkpoints/", continuationToken: token)
+            for o in page.objects {
+                let rel = o.key.hasPrefix(pfx) ? String(o.key.dropFirst(pfx.count)) : o.key
+                if let p = Repo.parseMetadataKey(rel) { parsed.append(p) }
+            }
+            token = page.next
+        } while token != nil
+        return parsed
+    }
+
+    /// Commit every un-journaled cache change (uploads, tombstones,
+    /// resurrections) plus any `extra` entries (purges) to the next journal
+    /// file in the chain. Returns true when there was nothing to do or the
+    /// write succeeded. Blobs are already uploaded by the time their entries
+    /// are journaled — the upload-before-commit rule.
     @discardableResult
-    func writeManifest() async -> Result<(count: Int, bytes: Int64), Error> {
-        guard let index, let client = makeClient() else { return .failure(S3Error.badConfig) }
+    func flushJournal(extra: [Repo.Entry] = []) async -> Bool {
+        guard let index, let client = makeClient() else { return false }
+        guard repoConflict == nil else { return false }
+        guard let generation = repoGeneration else { return false }   // repo not attached yet
+        guard !journalFlushInFlight else { return true }
+        journalFlushInFlight = true
+        defer { journalFlushInFlight = false }
+
+        let dirty = index.unjournaledRecords()
+        if dirty.isEmpty && extra.isEmpty { return true }
         let recipients = keyManager.recipientObjects
-        guard !recipients.isEmpty else { return .failure(Age.Error.badRecipient) }
+        guard !recipients.isEmpty else { return false }
 
-        let iso = ISO8601DateFormatter()
-        func item(_ r: AssetRecord) -> Manifest.Item {
-            Manifest.Item(key: r.remoteKey, filename: r.filename, mediaType: r.mediaType.rawValue,
-                          storedBytes: r.byteSize,
-                          createdAt: r.createdAt.map { iso.string(from: $0) },
-                          uploadedAt: r.uploadedAt.map { iso.string(from: $0) })
-        }
-        let items = index.allUploaded().map(item)
-        let deletedItems = index.deletedRecords().map(item)
-        let manifest = Manifest(version: 2, generatedAt: iso.string(from: Date()),
-                                bucket: s3Config.bucket, prefix: s3Config.prefix,
-                                count: items.count, items: items,
-                                deletedKeys: deletedItems.map(\.key),
-                                deleted: deletedItems)
-
-        let token = UUID().uuidString
-        let jsonURL = tempDir.appendingPathComponent("\(token).json")
-        let encURL = tempDir.appendingPathComponent("\(token).manifest.age")
-        defer {
-            try? FileManager.default.removeItem(at: jsonURL)
-            try? FileManager.default.removeItem(at: encURL)
-        }
+        // Ownership check: before appending seq N we list our generation's
+        // folder. Anything at seq ≥ N was written by SOMEONE ELSE (or our
+        // position rolled back) — stop journaling and yell.
+        let seq = repoNextSeq
         do {
-            let data = try JSONEncoder().encode(manifest)
-            try data.write(to: jsonURL)
-            let md5 = try AssetProcessor.encryptFile(at: jsonURL, to: encURL, recipients: recipients)
-                .base64EncodedString()
-            // Unique, write-once key: never overwrites (Object-Lock safe), and old
-            // manifests expire under the same lifecycle rule while the newest stays
-            // fresh. Restore lists `manifests/` and takes the last one.
-            let stamp = Self.manifestStampFormatter.string(from: Date())
-            let key = client.fullKey(for: "manifests/manifest-\(stamp).age")
-            let encBytes = (try? FileManager.default.attributesOfItem(atPath: encURL.path)[.size] as? Int64) ?? nil
+            let entries = try await listMetadata(client: client)
+            let maxSeq = entries.filter { $0.gen == generation }.map(\.seq).max() ?? -1
+            if maxSeq >= seq {
+                repoConflict = "Another device appears to be writing to this repository (found journal \(maxSeq) in generation \(generation), expected to write \(seq)). Two writers in one folder WILL corrupt both backups — each device needs its own folder. Change the folder in Storage settings, or use 'Take over repository' if the other device is retired."
+                appendLog(repoConflict!, .error)
+                return false
+            }
+            if maxSeq >= 0 && maxSeq != seq - 1 {
+                appendLog("Repository chain gap: last journal in the bucket is \(maxSeq) but this device expected \(seq - 1). Journals may have been deleted remotely.", .warning)
+            }
+        } catch {
+            appendLog("Journal not written — could not check the repository head: \(error.localizedDescription)", .warning)
+            return false
+        }
+
+        let iso = Self.repoISO
+        let at = iso.string(from: Date())
+        var entries = dirty.map { r in
+            Repo.Entry(op: r.state == .deleted ? .delete : .add,
+                       uuid: r.uuid,
+                       localIdentifier: r.localIdentifier,
+                       filename: r.filename.isEmpty ? nil : r.filename,
+                       mediaType: r.mediaType.rawValue,
+                       size: r.byteSize > 0 ? r.byteSize : nil,
+                       plaintextHash: r.plaintextHash,
+                       ciphertextHash: r.ciphertextHash,
+                       createdAt: r.createdAt.map { iso.string(from: $0) },
+                       at: at)
+        }
+        entries.append(contentsOf: extra)
+        let journal = Repo.Journal(generation: generation, seq: seq, prevHash: repoLastHash,
+                                   device: UIDevice.current.name, instance: Self.instanceID,
+                                   createdAt: at, entries: entries)
+
+        let encURL = tempDir.appendingPathComponent("journal-\(UUID().uuidString).age")
+        defer { try? FileManager.default.removeItem(at: encURL) }
+        do {
+            let data = try Repo.encodeJournal(journal, recipients: recipients)
+            try data.write(to: encURL)
+            let md5 = Data(Insecure.MD5.hash(data: data)).base64EncodedString()
+            let key = client.fullKey(for: Repo.journalKey(gen: generation, seq: seq))
             try await S3Client.withRetries {
                 try await client.putObject(fileURL: encURL, key: key,
                                            contentType: "application/age", contentMD5: md5)
             }
-            manifestDirty = false
-            appendLog("Wrote encrypted manifest — \(items.count) item\(items.count == 1 ? "" : "s"), \(Format.bytes(encBytes ?? 0)) → \(key).", .success)
-            return .success((items.count, encBytes ?? 0))
+            index.markJournaled(dirty.map(\.localIdentifier))
+            setRepoPosition(generation: generation, nextSeq: seq + 1, lastHash: Repo.sha256Hex(data))
+            appendLog("Journal \(generation)/\(seq) committed — \(entries.count) change\(entries.count == 1 ? "" : "s").", .info)
+            // Compaction: enough journals → roll a fresh self-contained
+            // generation (checkpoint carries the whole state).
+            if seq + 1 > journalsPerGeneration {
+                await writeCheckpoint(generation: generation + 1)
+            }
+            return true
         } catch {
-            appendLog("Manifest write failed: \(error.localizedDescription)", .error)
-            return .failure(error)
+            appendLog("Journal write failed (changes stay queued): \(error.localizedDescription)", .error)
+            return false
+        }
+    }
+
+    /// Snapshot the entire cache into an encrypted SQLite checkpoint and start
+    /// generation `generation` with it. The previous generation stays on disk,
+    /// fully self-contained (append-only friendly).
+    @discardableResult
+    private func writeCheckpoint(generation: Int) async -> Bool {
+        guard let index, let client = makeClient() else { return false }
+        let recipients = keyManager.recipientObjects
+        guard !recipients.isEmpty else { return false }
+        let token = UUID().uuidString
+        let dbURL = tempDir.appendingPathComponent("\(token).ckpt.sqlite")
+        let encURL = tempDir.appendingPathComponent("\(token).ckpt.age")
+        defer {
+            try? FileManager.default.removeItem(at: dbURL)
+            try? FileManager.default.removeItem(at: encURL)
+        }
+        do {
+            try index.snapshot(to: dbURL)
+            let digests = try AssetProcessor.encryptFile(at: dbURL, to: encURL, recipients: recipients)
+            let key = client.fullKey(for: Repo.checkpointKey(gen: generation))
+            try await S3Client.withRetries {
+                try await client.putObject(fileURL: encURL, key: key,
+                                           contentType: "application/age",
+                                           contentMD5: digests.ciphertextMD5Base64)
+            }
+            setRepoPosition(generation: generation, nextSeq: 1, lastHash: digests.ciphertextSHA256)
+            appendLog("Checkpoint written — generation \(generation) begins.", .success)
+            return true
+        } catch {
+            appendLog("Checkpoint write failed: \(error.localizedDescription)", .error)
+            return false
+        }
+    }
+
+    /// "Write checkpoint now" — flush pending changes, then compact into a new
+    /// generation regardless of the rollover threshold.
+    func compactNow() async {
+        guard repoConflict == nil else { checkpointStatus = "✗ Resolve the repository conflict first"; return }
+        guard let generation = repoGeneration else { checkpointStatus = "✗ No repository yet — run a backup first"; return }
+        checkpointStatus = "Writing checkpoint…"
+        guard await flushJournal() else { checkpointStatus = "✗ Could not commit pending changes"; return }
+        checkpointStatus = await writeCheckpoint(generation: (repoGeneration ?? generation) + 1)
+            ? "✓ Checkpoint written — repository compacted"
+            : "✗ Checkpoint write failed (see activity log)"
+    }
+
+    /// Called before the first upload of a pipeline. Returns true when the
+    /// repository is ready to receive journals. On a fresh cache pointed at a
+    /// bucket that ALREADY contains a repository, this refuses to proceed and
+    /// raises the attach sheet — silently taking over someone else's chain (or
+    /// double-writing it) is the one unrecoverable mistake this design has.
+    func prepareRepository() async -> Bool {
+        guard index != nil, let client = makeClient() else { return false }
+        if repoConflict != nil {
+            appendLog("Backup blocked — resolve the repository conflict first.", .error)
+            return false
+        }
+        if repoGeneration != nil { return true }   // already attached
+        do {
+            let entries = try await listMetadata(client: client)
+            if entries.isEmpty {
+                // Virgin bucket/folder: found our repository with checkpoint 1.
+                appendLog("Initializing repository…", .info)
+                return await writeCheckpoint(generation: 1)
+            }
+            // Existing repository, and this install has no position in it.
+            let gens = Set(entries.map(\.gen))
+            pendingAttach = ExistingRepoInfo(generations: gens.count,
+                                             journalFiles: entries.filter { $0.seq > 0 }.count)
+            appendLog("This folder already contains a SnapSiphon repository (\(gens.count) generation\(gens.count == 1 ? "" : "s")). Backup is paused until you choose how to attach — see the prompt.", .warning)
+            return false
+        } catch {
+            appendLog("Could not inspect the repository: \(error.localizedDescription)", .error)
+            return false
+        }
+    }
+
+    /// Rebuild the local cache from the bucket: newest complete checkpoint,
+    /// then every journal after it, verifying the tamper-evidence chain. On
+    /// success this device owns the chain head (it may append next).
+    @discardableResult
+    func restoreIndexFromRepo() async -> Bool {
+        guard let index, let client = makeClient() else {
+            attachStatus = "✗ Storage not configured"; return false
+        }
+        guard let secret = keyManager.exportSecret(), let identity = try? Age.Identity(bech32: secret) else {
+            attachStatus = "✗ This phone has no private key that can decrypt the repository"
+            return false
+        }
+        attachStatus = "Reading repository…"
+        do {
+            let entries = try await listMetadata(client: client)
+            let byGen = Dictionary(grouping: entries, by: \.gen)
+            guard let gen = byGen.filter({ $0.value.contains(where: { $0.seq == 0 }) }).keys.max() else {
+                attachStatus = "✗ No complete checkpoint found in this folder"
+                return false
+            }
+            let token = UUID().uuidString
+            let encURL = tempDir.appendingPathComponent("\(token).ckpt.age")
+            let dbURL = tempDir.appendingPathComponent("\(token).ckpt.sqlite")
+            defer {
+                try? FileManager.default.removeItem(at: encURL)
+                try? FileManager.default.removeItem(at: dbURL)
+            }
+            try await client.getObject(key: client.fullKey(for: Repo.checkpointKey(gen: gen)), to: encURL)
+            var lastHash = try Repo.sha256Hex(fileAt: encURL)
+            try Age.decryptFile(at: encURL, to: dbURL, identity: identity)
+            try index.importSnapshot(from: dbURL)
+
+            let seqs = byGen[gen]!.map(\.seq).filter { $0 > 0 }.sorted()
+            var applied = 0
+            for seq in seqs {
+                attachStatus = "Replaying journal \(seq) of \(seqs.count)…"
+                let jURL = tempDir.appendingPathComponent("\(token)-j\(seq).age")
+                defer { try? FileManager.default.removeItem(at: jURL) }
+                try await client.getObject(key: client.fullKey(for: Repo.journalKey(gen: gen, seq: seq)), to: jURL)
+                let data = try Data(contentsOf: jURL)
+                let journal = try Repo.decodeJournal(data, identity: identity, tempDir: tempDir)
+                if journal.prevHash != lastHash {
+                    appendLog("Tamper evidence: journal \(gen)/\(seq) does not chain to its predecessor (expected \(lastHash.prefix(12))…, recorded \(journal.prevHash.prefix(12))…). Applying anyway, but the repository history has been altered.", .error)
+                }
+                index.apply(journal: journal)
+                lastHash = Repo.sha256Hex(data)
+                applied += 1
+            }
+            setRepoPosition(generation: gen, nextSeq: (seqs.max() ?? 0) + 1, lastHash: lastHash)
+            repoConflict = nil
+            pendingAttach = nil
+            refreshCounts()
+            let c = index.counts()
+            attachStatus = "✓ Loaded \(Format.count(c.uploaded)) backed-up item\(c.uploaded == 1 ? "" : "s") (generation \(gen), \(applied) journal\(applied == 1 ? "" : "s")). This device now owns the journal chain."
+            appendLog(attachStatus!, .success)
+            return true
+        } catch {
+            attachStatus = "✗ \(error.localizedDescription)"
+            appendLog("Restore index from repository failed: \(error.localizedDescription)", .error)
+            return false
+        }
+    }
+
+    /// "Verify match" for the attach sheet: read the repository's metadata into
+    /// a throwaway index (never touching the real cache), then compare it with
+    /// the local cache and with the blobs actually present under objects/.
+    /// Catches missing blobs and local/repo divergence — not silent remote
+    /// corruption (self-stored hashes + Verify cover sizes; full corruption
+    /// checks would mean downloading everything).
+    func compareWithRepo() async {
+        guard let index, let client = makeClient() else {
+            attachStatus = "✗ Storage not configured"; return
+        }
+        guard let secret = keyManager.exportSecret(), let identity = try? Age.Identity(bech32: secret) else {
+            attachStatus = "✗ This phone has no private key that can decrypt the repository"; return
+        }
+        attachStatus = "Comparing with repository…"
+        let scratchDir = tempDir.appendingPathComponent("compare-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: scratchDir) }
+        do {
+            try FileManager.default.createDirectory(at: scratchDir, withIntermediateDirectories: true)
+            let scratch = try BackupIndex(directory: scratchDir)
+            let entries = try await listMetadata(client: client)
+            let byGen = Dictionary(grouping: entries, by: \.gen)
+            guard let gen = byGen.filter({ $0.value.contains(where: { $0.seq == 0 }) }).keys.max() else {
+                attachStatus = "✗ No complete checkpoint found in this folder"; return
+            }
+            let encURL = scratchDir.appendingPathComponent("ckpt.age")
+            let dbURL = scratchDir.appendingPathComponent("ckpt.sqlite")
+            try await client.getObject(key: client.fullKey(for: Repo.checkpointKey(gen: gen)), to: encURL)
+            try Age.decryptFile(at: encURL, to: dbURL, identity: identity)
+            try scratch.importSnapshot(from: dbURL)
+            for seq in byGen[gen]!.map(\.seq).filter({ $0 > 0 }).sorted() {
+                let jURL = scratchDir.appendingPathComponent("j\(seq).age")
+                try await client.getObject(key: client.fullKey(for: Repo.journalKey(gen: gen, seq: seq)), to: jURL)
+                scratch.apply(journal: try Repo.decodeJournal(try Data(contentsOf: jURL),
+                                                              identity: identity, tempDir: scratchDir))
+            }
+
+            // Blob existence under objects/ (sizes come free with the LIST).
+            var blobs = Set<String>()
+            var token: String? = nil
+            let objPfx = client.fullKey(for: "objects/")
+            repeat {
+                let page = try await client.listObjects(subPrefix: "objects/", continuationToken: token)
+                for o in page.objects where o.key.hasPrefix(objPfx) {
+                    blobs.insert(String(o.key.dropFirst(objPfx.count)))
+                }
+                token = page.next
+            } while token != nil
+
+            let repoUUIDs = Set(scratch.uploadedKeyPairs().map(\.uuid))
+            let localUUIDs = Set(index.uploadedKeyPairs().map(\.uuid))
+            let matching = repoUUIDs.intersection(localUUIDs).count
+            let repoOnly = repoUUIDs.subtracting(localUUIDs).count
+            let localOnly = localUUIDs.subtracting(repoUUIDs).count
+            let missingBlobs = repoUUIDs.subtracting(blobs).count
+            var lines = ["Repository: \(Format.count(repoUUIDs.count)) items · Local: \(Format.count(localUUIDs.count)) · Matching: \(Format.count(matching))"]
+            if repoOnly > 0 { lines.append("\(Format.count(repoOnly)) only in the repository (from another install or before a reset)") }
+            if localOnly > 0 { lines.append("\(Format.count(localOnly)) only local (not yet in the repository)") }
+            lines.append(missingBlobs == 0 ? "All repository items have their blob present ✓"
+                                          : "⚠ \(Format.count(missingBlobs)) repository item\(missingBlobs == 1 ? "" : "s") missing their blob")
+            attachStatus = (repoOnly == 0 && localOnly == 0 && missingBlobs == 0 ? "✓ " : "") + lines.joined(separator: "\n")
+        } catch {
+            attachStatus = "✗ \(error.localizedDescription)"
         }
     }
 
@@ -698,11 +1054,12 @@ final class BackupEngine: ObservableObject {
     @Published private(set) var verifying = false
     @Published private(set) var verifyStatus: String?
 
-    /// Egress-free backup verification: pages ListObjectsV2 over the prefix
-    /// (~10 requests per 10k objects, zero downloads) and checks every uploaded
-    /// record exists remotely with the expected size and — because B2's ETag for
-    /// single-part uploads IS the object's MD5, which we store at upload — the
-    /// expected checksum. Missing/mismatched files are re-queued for upload.
+    /// Egress-free backup verification: pages ListObjectsV2 over `objects/`
+    /// (~10 requests per 10k blobs, zero downloads) and checks every uploaded
+    /// record's blob exists remotely with the expected size. Missing or
+    /// wrong-size blobs are re-queued for upload (same UUID, so the repair is
+    /// an overwrite-in-place on versioned buckets, a fresh version on locked
+    /// ones). ETags are ignored — the repository stores its own hashes.
     func verifyBackups() async {
         guard !verifying, !phase.isActive, runTask == nil, pipelineTask == nil else { return }
         guard let index, let client = makeClient() else {
@@ -712,49 +1069,49 @@ final class BackupEngine: ObservableObject {
         verifying = true
         defer { verifying = false }
         do {
-            var remote: [String: (size: Int64, etag: String)] = [:]
+            var remote: [String: Int64] = [:]   // uuid → ciphertext size
             var token: String? = nil
+            let objPfx = client.fullKey(for: "objects/")
             repeat {
-                let page = try await client.listObjects(continuationToken: token)
-                for o in page.objects { remote[o.key] = (o.size, o.etag) }
+                let page = try await client.listObjects(subPrefix: "objects/", continuationToken: token)
+                for o in page.objects where o.key.hasPrefix(objPfx) {
+                    remote[String(o.key.dropFirst(objPfx.count))] = o.size
+                }
                 token = page.next
-                verifyStatus = "Listing bucket… \(Format.count(remote.count)) objects"
+                verifyStatus = "Listing bucket… \(Format.count(remote.count)) blobs"
             } while token != nil
 
             let uploaded = index.allUploaded()
             var ok = 0, missing = 0, mismatched = 0
-            var matchedKeys = Set<String>()
-            for r in uploaded where !r.remoteKey.isEmpty {
-                guard let obj = remote[r.remoteKey] else {
+            for r in uploaded where !r.uuid.isEmpty {
+                guard let size = remote[r.uuid] else {
                     missing += 1
                     index.requeue(r.localIdentifier, reason: "Verify: missing from bucket")
                     continue
                 }
-                matchedKeys.insert(r.remoteKey)
-                if r.byteSize > 0 && obj.size != r.byteSize {
+                if r.byteSize > 0 && size != r.byteSize {
                     mismatched += 1
                     index.requeue(r.localIdentifier, reason: "Verify: size mismatch")
-                } else if let md5 = r.md5, !obj.etag.isEmpty, obj.etag != md5 {
-                    mismatched += 1
-                    index.requeue(r.localIdentifier, reason: "Verify: checksum mismatch")
                 } else {
                     ok += 1
                 }
             }
-            let manifestPrefix = client.fullKey(for: "manifests/")
-            let orphans = remote.keys.filter { !matchedKeys.contains($0) && !$0.hasPrefix(manifestPrefix) }.count
+            // Blobs no cache row references: tombstones already purged from the
+            // cache, another install's uploads, or a crash between blob upload
+            // and journal commit (harmless by design — never auto-deleted).
+            let referenced = index.referencedUUIDs()
+            let orphans = remote.keys.filter { !referenced.contains($0) }.count
 
             refreshCounts()
-            if missing > 0 || mismatched > 0 { manifestDirty = true }   // uploaded set changed
             if missing == 0 && mismatched == 0 {
-                verifyStatus = "✓ \(Format.count(ok)) backups verified — all present, sizes & checksums match"
+                verifyStatus = "✓ \(Format.count(ok)) backups verified — every blob present with the expected size"
                 appendLog("Verify: all \(Format.count(ok)) backups check out.", .success)
             } else {
-                verifyStatus = "⚠ \(Format.count(ok)) ok · \(missing) missing · \(mismatched) mismatched — re-queued"
-                appendLog("Verify: \(missing) missing, \(mismatched) mismatched — re-queued for upload.", .warning)
+                verifyStatus = "⚠ \(Format.count(ok)) ok · \(missing) missing · \(mismatched) wrong size — re-queued"
+                appendLog("Verify: \(missing) missing, \(mismatched) wrong size — re-queued for upload.", .warning)
             }
             if orphans > 0 {
-                appendLog("Verify: \(orphans) untracked object\(orphans == 1 ? "" : "s") in the bucket (tombstoned, older key scheme, or another device).", .info)
+                appendLog("Verify: \(orphans) unreferenced blob\(orphans == 1 ? "" : "s") in the bucket (purged tombstones, another install, or an interrupted upload). Harmless.", .info)
             }
         } catch {
             verifyStatus = "✗ \(error.localizedDescription)"
@@ -762,116 +1119,19 @@ final class BackupEngine: ObservableObject {
         }
     }
 
-    // MARK: Adopt existing backups
-
-    @Published private(set) var adoptStatus: String?
-
-    /// Re-index an archive this install has never seen: one bucket LIST plus the
-    /// decrypted manifest, then match library assets by recomputing each one's
-    /// key hash. Matches are adopted as uploaded — real size from the listing,
-    /// MD5 from the ETag, filename/date from the manifest — with zero downloads
-    /// and zero re-uploads. `auto` runs silently inside Back Up Now whenever the
-    /// index has no uploads yet (fresh install pointed at an existing folder).
-    func adoptExistingBackups(auto: Bool = false) async {
-        guard let index, let client = makeClient() else { return }
-        if auto, index.counts().uploaded > 0 { return }   // nothing to migrate
-        if !auto { adoptStatus = "Listing bucket…" }
-        do {
-            var objects: [S3Client.RemoteObject] = []
-            var token: String? = nil
-            repeat {
-                let page = try await client.listObjects(continuationToken: token)
-                objects += page.objects
-                token = page.next
-            } while token != nil
-
-            let manifestPrefix = client.fullKey(for: "manifests/")
-            let dataObjects = objects.filter { !$0.key.hasPrefix(manifestPrefix) }
-            guard !dataObjects.isEmpty else {
-                if !auto { adoptStatus = "Bucket has no existing backups under this prefix." }
-                return
-            }
-
-            // hash → object (keys look like <prefix>/ab/<64-hex>.<ext>.age)
-            let pfx = client.fullKey(for: "")
-            var byHash: [String: S3Client.RemoteObject] = [:]
-            for o in dataObjects {
-                let rel = o.key.hasPrefix(pfx) ? String(o.key.dropFirst(pfx.count)) : o.key
-                guard let last = rel.split(separator: "/").last,
-                      let hash = last.split(separator: ".").first, hash.count == 64 else { continue }
-                byHash[String(hash)] = o
-            }
-
-            // Best-effort metadata from the newest manifest (needs our identity).
-            var manifestItems: [String: Manifest.Item] = [:]
-            if let latest = objects.map(\.key).filter({ $0.hasPrefix(manifestPrefix) }).sorted().last,
-               let secret = keyManager.exportSecret(),
-               let identity = try? Age.Identity(bech32: secret) {
-                let enc = tempDir.appendingPathComponent("adopt-manifest.age")
-                let dec = tempDir.appendingPathComponent("adopt-manifest.json")
-                defer {
-                    try? FileManager.default.removeItem(at: enc)
-                    try? FileManager.default.removeItem(at: dec)
-                }
-                try? await client.getObject(key: latest, to: enc)
-                if (try? Age.decryptFile(at: enc, to: dec, identity: identity)) != nil,
-                   let data = try? Data(contentsOf: dec),
-                   let m = try? JSONDecoder().decode(Manifest.self, from: data) {
-                    for item in m.items { manifestItems[item.key] = item }
-                }
-            }
-
-            if !auto { adoptStatus = "Matching \(Format.count(byHash.count)) objects against the library…" }
-            let photos = self.photos
-            let infos = await Task.detached(priority: .utility) {
-                photos.enumerate(includePhotos: true, includeVideos: true, since: nil)
-            }.value
-
-            let alreadyUploaded = Set(index.uploadedKeyPairs().map(\.id))
-            let iso = ISO8601DateFormatter()
-            var adopted = 0
-            for info in infos {
-                guard !alreadyUploaded.contains(info.localIdentifier),
-                      let obj = byHash[AssetProcessor.identifierHash(info.localIdentifier)] else { continue }
-                let item = manifestItems[obj.key]
-                index.upsert(AssetRecord(
-                    localIdentifier: info.localIdentifier,
-                    remoteKey: obj.key,
-                    state: .uploaded,
-                    mediaType: info.mediaType,
-                    filename: item?.filename ?? "",
-                    byteSize: obj.size,
-                    createdAt: info.creationDate,
-                    uploadedAt: item?.uploadedAt.flatMap { iso.date(from: $0) } ?? Date(),
-                    lastError: nil,
-                    md5: obj.etag.count == 32 ? obj.etag : nil))
-                adopted += 1
-            }
-            refreshCounts()
-            if adopted > 0 {
-                appendLog("Adopted \(Format.count(adopted)) existing backup\(adopted == 1 ? "" : "s") from the bucket — no re-upload needed.", .success)
-                adoptStatus = "✓ Adopted \(Format.count(adopted)) existing backups"
-            } else if !auto {
-                adoptStatus = "No bucket objects match this library (backups from a different device?)."
-            }
-        } catch {
-            if !auto { adoptStatus = "✗ \(error.localizedDescription)" }
-            appendLog("Adopt existing backups failed: \(error.localizedDescription)", .error)
-        }
-    }
-
     // MARK: Backup run
 
-    /// One-tap entry point for the dashboard: scan for new photos, then upload.
-    /// On a fresh index pointed at a bucket that already has content, existing
-    /// objects are adopted first, so only genuinely-new photos upload.
+    /// One-tap entry point for the dashboard: scan for new photos, make sure
+    /// the repository is attached (initializing a virgin folder, or raising the
+    /// attach prompt when the folder already holds a repository), then upload.
     func backUpNow() {
         guard runTask == nil, pipelineTask == nil, phase != .scanning, !verifying else { return }
         pipelineTask = Task { [weak self] in
             await self?.scan()
-            await self?.adoptExistingBackups(auto: true)
+            let ready = await self?.prepareRepository() ?? false
             await MainActor.run { [weak self] in
-                self?.start()
+                if ready { self?.start() }
+                else if self?.phase == .scanning { self?.phase = .idle }
                 self?.pipelineTask = nil
             }
         }
@@ -951,12 +1211,10 @@ final class BackupEngine: ObservableObject {
         }
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRunKey)
         rescheduleReminder()   // reset the "no backup for N days" countdown
-        // Refresh the bucket manifest whenever the archive has changed since the
-        // last successful write — covering uploads from THIS run, but also a
-        // previous run whose manifest write failed or was cut short.
-        if settings.keepBucketManifest && manifestDirty {
-            Task { await writeManifest() }
-        }
+        // Commit whatever this run changed to the journal chain — including
+        // changes a PREVIOUS run failed to commit (they stay flagged in the
+        // cache until a flush succeeds).
+        Task { await flushJournal() }
     }
 
     // MARK: Per-stream upload slots
@@ -1075,6 +1333,12 @@ final class BackupEngine: ObservableObject {
                     continue
                 }
                 if await !waitForFavorableConditions() { continue }   // park refills; in-flight uploads run on
+                // Journal every ~25 uploads so a mid-run crash loses at most a
+                // small tail of uncommitted (but re-flushable) changes.
+                let unjournaled = await self.pendingJournalCount()
+                if unjournaled >= journalFlushThreshold {
+                    await self.flushJournal()
+                }
                 // Top up to the (possibly changed) worker target.
                 target = await self.workerTarget
                 while inFlight.count < target, spawnNext() {}
@@ -1104,13 +1368,17 @@ final class BackupEngine: ObservableObject {
     private func processOne(_ record: AssetRecord, processor: AssetProcessor,
                             verifyFirst: Bool, bytesPerSecond: Double) async {
         guard let index else { return }
+        var record = record
+        // Rows imported from a checkpoint written by an older install could
+        // lack a blob name; mint one so the upload has a stable target.
+        if record.uuid.isEmpty { record.uuid = UUID().uuidString.lowercased() }
         let rid = record.localIdentifier
         beginSlot(record)
         do {
-            var uploaded = AssetRecord(localIdentifier: rid, remoteKey: record.remoteKey,
-                                       state: .uploading, mediaType: record.mediaType, filename: record.filename,
-                                       byteSize: record.byteSize, createdAt: record.createdAt,
-                                       uploadedAt: nil, lastError: nil)
+            var uploaded = record
+            uploaded.state = .uploading
+            uploaded.uploadedAt = nil
+            uploaded.lastError = nil
             index.upsert(uploaded)
 
             // A record requeued by Verify has a size/checksum mismatch — the
@@ -1134,15 +1402,18 @@ final class BackupEngine: ObservableObject {
                     Task { @MainActor in self.updateSlot(rid, progress: p) }
                 })
 
-            // Persist the metadata we learned at upload time (filename/size/key/md5).
+            // Persist what upload time taught us (filename/size/hashes). The
+            // row is NOT yet journaled — the blob is safely in the bucket, and
+            // the journal entry follows at the next flush (upload-before-
+            // commit; a crash in between strands only an ignorable orphan).
             uploaded.state = .uploaded
             uploaded.filename = result.filename
-            uploaded.remoteKey = result.remoteKey
             uploaded.byteSize = result.encryptedBytes
             uploaded.uploadedAt = Date()
-            uploaded.md5 = result.md5Hex
+            uploaded.plaintextHash = result.plaintextHash
+            uploaded.ciphertextHash = result.ciphertextHash
+            uploaded.journaled = false
             index.upsert(uploaded)
-            manifestDirty = true
 
             endSlot(rid)
             consecutiveTransportFailures = 0
@@ -1168,11 +1439,17 @@ final class BackupEngine: ObservableObject {
 
     // MARK: Maintenance
 
+    private func pendingJournalCount() -> Int {
+        index?.unjournaledCount() ?? 0
+    }
+
     func resetIndex() {
         index?.reset()
         scanMark = nil
+        repoConflict = nil
+        pendingAttach = nil
         refreshCounts()
-        appendLog("Local index cleared. Next scan re-checks everything.", .warning)
+        appendLog("Local index cleared (repository untouched). The next backup re-inspects the folder — use the attach prompt to reload from the repository, or a fresh folder to start over.", .warning)
     }
 
     // MARK: Logging

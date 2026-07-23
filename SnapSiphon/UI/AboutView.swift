@@ -27,12 +27,15 @@ struct AboutView: View {
 
                 card("How your backups are stored") {
                     Text("""
-                    Inside your bucket, under your chosen prefix:
+                    Inside your bucket, under your chosen prefix, lives a **repository**:
 
-                    • **Photos/videos** → `ab/<sha256-of-asset-id>.<ext>.age` — always hashed names, so the bucket never sees what anything is called (the extension is kept so you can tell types apart; the manifest maps names back).
-                    • **Manifests** → `manifests/manifest-<timestamp>.age` — an age-encrypted JSON index written after every backup: object key → original filename, dates, sizes, and which items were deleted on-device. The newest one is the source of truth.
-                    • **Deletions** are marked in the manifest immediately; blobs are only physically removed if "Purge deleted backups" is on, after the grace period.
-                    • **Integrity**: every upload carries its MD5 (Content-MD5); Verify compares stored checksums against bucket ETags with zero downloads.
+                    • **Blobs** → `objects/<random-uuid>` — every photo/video, encrypted, under a purely random name. No content hashes, no extensions: the bucket learns nothing about what's in it, and identical files can't even be correlated.
+                    • **Checkpoints** → `checkpoints/000001/checkpoint.age` — an encrypted SQLite snapshot of the whole index, starting a *generation*. Each generation is restorable on its own.
+                    • **Journals** → `checkpoints/000001/journal000001.age`, … — append-only encrypted change logs (adds, deletions, purges). Every journal records the hash of its predecessor, so rollback, deletion, or reordering of history is detectable.
+                    • **The bucket is the source of truth** — the app's local database is just a cache and can be rebuilt from the repository at any time (Settings → Repository).
+                    • Blobs upload **before** their journal entry commits: a crash mid-backup strands at most an unreferenced blob, never a phantom journal entry.
+                    • **Deletions** are journaled immediately; blobs are physically removed only if "Purge deleted backups" is on, after the grace period (and Object Lock permitting).
+                    • **Integrity**: the repository stores sha256 hashes of both the original file and the ciphertext; restores verify end-to-end. Uploads also carry Content-MD5.
                     • **Live Photos**: the full-quality still is backed up; the 3-second motion clip is not yet (planned).
                     """)
                 }
@@ -41,9 +44,9 @@ struct AboutView: View {
                     Text("""
                     Three independent paths, none of which need this app:
 
-                    1. **Restore script** (Settings → Disaster recovery): one Python file with credentials + key baked in. `python3 restore.py` rebuilds everything with original filenames. Needs the `age` CLI *or* `pip3 install cryptography`.
-                    2. **age CLI** anywhere: `age -d -i key.txt file.age`.
-                    3. This app on a new phone: import your secret key, point at the bucket, and *Adopt existing backups* re-indexes without re-uploading.
+                    1. **Restore script** (Settings → Disaster recovery): one Python file with credentials + key baked in. `python3 restore.py` reads the newest checkpoint, replays the journals (verifying the chain), and rebuilds everything with original filenames and integrity checks. Needs the `age` CLI *or* `pip3 install cryptography`.
+                    2. **age CLI** anywhere: `age -d -i key.txt file.age` — even the checkpoint is just an age file holding a SQLite database.
+                    3. This app on a new phone: import your secret key, point at the bucket, and the attach prompt reloads the whole index from the repository — no re-uploading.
                     """)
                 }
 

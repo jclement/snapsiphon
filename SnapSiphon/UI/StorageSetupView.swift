@@ -199,7 +199,7 @@ struct StorageSetupView: View {
             Card {
                 VStack(alignment: .leading, spacing: 10) {
                     guidanceRow("lock.shield.fill", .green,
-                                "Append-only is the sweet spot: SnapSiphon never needs delete permission unless you turn on \"Purge deleted backups\". Use an application key with only read/write/list and ransomware or a stolen unlocked phone can't destroy the archive. Deletions are still tracked in the encrypted manifest.")
+                                "Append-only is the sweet spot: SnapSiphon never needs delete permission unless you turn on \"Purge deleted backups\". Use an application key with only read/write/list and ransomware or a stolen unlocked phone can't destroy the archive. Deletions are still tracked in the encrypted journal.")
                     guidanceRow("clock.badge.checkmark.fill", .cyan,
                                 "Object Lock (B2) / retention makes it tamper-proof even with delete rights — nothing can be removed until the lock expires. Pairs well with the purge grace period.")
                     guidanceRow("arrow.triangle.2.circlepath", Theme.violet,

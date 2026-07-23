@@ -31,6 +31,13 @@ struct DashboardView: View {
             .background(Theme.canvas.ignoresSafeArea())
             .navigationBarHidden(true)
             .task { engine.refreshCounts(); await engine.refreshLibraryCounts() }
+            // A repository already exists at the configured folder and this
+            // install has no position in it — the user must choose how to
+            // attach before anything is written.
+            .sheet(item: $engine.pendingAttach) { info in
+                AttachRepositorySheet(info: info)
+                    .environmentObject(engine)
+            }
         }
     }
 
@@ -130,7 +137,11 @@ struct DashboardView: View {
 
     @ViewBuilder private func middleSection(now: Date) -> some View {
         VStack(spacing: 8) {
-            if engine.phase == .scanning {
+            if let conflict = engine.repoConflict {
+                infoPanel(icon: "exclamationmark.octagon.fill", color: .red, spinning: false,
+                          title: "Repository conflict — backups halted", subtitle: conflict)
+                gaugeRow(now: now)
+            } else if engine.phase == .scanning {
                 infoPanel(icon: "magnifyingglass", color: .cyan, spinning: true,
                           title: "Scanning library",
                           subtitle: "\(Format.count(engine.scanChecked)) checked")

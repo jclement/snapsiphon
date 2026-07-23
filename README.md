@@ -10,7 +10,8 @@ Polished and nerdy. Your keys, your bucket, zero trust in the provider.
 SnapSiphon walks your photo library, encrypts every original **on-device** with
 [age](https://age-encryption.org), and uploads the ciphertext to an
 S3-compatible bucket you control. The storage provider never sees a decrypted
-byte — or even a real filename: objects are stored under hashed names, and the encrypted manifest maps them back.
+byte — or a filename, or even a content hash: blobs are stored under purely
+random names, and an encrypted checkpoint + journal repository maps them back.
 
 - **End-to-end encryption with age.** Paste an `age1…` public key you already
   own (SnapSiphon can then *encrypt but never decrypt* — the safest mode), or
@@ -20,10 +21,18 @@ byte — or even a real filename: objects are stored under hashed names, and the
 - **Bring your own bucket.** First-class presets for **Backblaze B2** and
   **Cloudflare R2**, plus a custom endpoint. Requests are signed with
   AWS Signature V4; credentials live only in the iOS Keychain.
-- **A light local index.** A SQLite table is the source of truth for what's
-  been uploaded; scans load the known-identifier set in a single query and do
-  in-memory membership checks, plus an oldest-first high-water mark so re-scans
-  of 50k+ photos only look at what's new.
+- **The bucket is the source of truth.** The repository layout is
+  `objects/<random-uuid>` for blobs plus `checkpoints/NNNNNN/` generations, each
+  holding an encrypted SQLite snapshot (`checkpoint.age`) and append-only
+  encrypted journals of every change (adds, deletions, purges). Journals chain
+  by ciphertext hash (tamper-evident), blobs upload **before** their journal
+  entry commits (a crash strands only an ignorable orphan), and the phone's
+  SQLite is just a rebuildable cache. Scans stay fast via a single
+  known-identifier query and an oldest-first high-water mark.
+- **Safe multi-device story.** Attaching to a folder that already holds a
+  repository raises an explicit choice (take over / verify match / new folder),
+  and a foreign journal appearing mid-chain halts writes with a loud conflict
+  banner — two writers can never silently interleave.
 - **Lots of knobs — all enforced.** Photos/videos/favorites filters,
   parallel-upload count, **mid-stream speed limit** (a throttled bound-stream
   body, not just a per-file average), **Wi-Fi-only** and **pause-on-low-battery**
@@ -36,14 +45,16 @@ byte — or even a real filename: objects are stored under hashed names, and the
   `piv-p256` stanza — implemented in CryptoKit, so no plugin binary or hardware
   is needed to *encrypt*; only the hardware can decrypt.
 - **Forever archive with safe deletes.** No retention/expiry — backups are kept
-  indefinitely. Delete mirroring is off by default (pure append-only). When on,
-  a photo deleted on-device is **tombstoned** in the encrypted manifest, then
-  physically freed only after a **grace period** (and once Object Lock retention
-  expires). Photos that reappear within the window are **resurrected** — an
-  accidental iCloud wipe can't cascade into the bucket.
-- **Encrypted restore manifest.** Timestamped, write-once `manifests/*.age`
-  (Object-Lock safe) mapping opaque `<hash>.<ext>.age` keys back to filenames;
-  restore with `age -d | jq`.
+  indefinitely. Purging is off by default (pure append-only). A photo deleted
+  on-device is always **journaled as a tombstone**; its blob is physically freed
+  only if purging is on (or via the manual *Clean up now* garbage collection),
+  after a **grace period** and once Object Lock retention expires. Photos that
+  reappear within the window are **resurrected** — an accidental iCloud wipe
+  can't cascade into the bucket.
+- **Break-glass restore.** A generated single-file Python script (credentials +
+  key baked in) replays the newest checkpoint and journals — verifying the
+  chain and each file's sha256 — with no SnapSiphon and no SDKs; even the
+  checkpoint is just an age file holding SQLite.
 - **Detailed progress & stats.** A live dashboard: dual-ring (file-count
   progress + stored-bytes-by-type), per-stream upload bars, live gauges
   (speed / ETA / last-backup), and a running activity log.
@@ -54,7 +65,8 @@ byte — or even a real filename: objects are stored under hashed names, and the
 |------|-------|-------|
 | Crypto | `Crypto/Age.swift`, `Bech32.swift`, `AgeKeyManager.swift` | Native age v1 (X25519 + ChaCha20-Poly1305 STREAM), Keychain-backed keys |
 | Storage | `Storage/SigV4.swift`, `S3Client.swift`, `S3CredentialStore.swift` | SigV4 signing, streaming `URLSession` uploads, `UNSIGNED-PAYLOAD` |
-| Index | `Index/SQLiteDatabase.swift`, `BackupIndex.swift` | libsqlite3 (WAL), serialized |
+| Repository | `Repo/Repository.swift` | Bucket format: naming, journal model, chain hashing, age-encrypted encode/decode |
+| Index | `Index/SQLiteDatabase.swift`, `BackupIndex.swift` | libsqlite3 (WAL), serialized — a cache of the repository |
 | Photos | `Photos/PhotoLibrary.swift` | PhotoKit auth + original-resource export |
 | Engine | `Engine/BackupEngine.swift`, `AssetProcessor.swift`, `RateLimiter.swift`, `ThroughputMeter.swift` | Orchestration, bounded concurrency, throttling |
 | UI | `UI/*`, `App/*` | SwiftUI, dark "polished and nerdy" theme |
@@ -115,13 +127,14 @@ decrypts on a real **Secure Enclave** via `age-plugin-se` (YubiKey uses the
 identical stanza — the user's exact recipient produces the correct tag). The
 speed-limit throttle holds its cap (±3%), and the Content-MD5 matches `openssl`.
 
-Verified in isolation but **not yet exercised against a live bucket**: SigV4
-signing, upload/HEAD/list-versions/versioned-delete.
+The repository format is exercised end-to-end in a harness: a repo built with
+the app's own format code (checkpoint snapshot, chained journals, deletes and
+purges) restores correctly through the generated Python script — both decrypt
+backends, `--all` semantics, integrity hashes, and the tamper-evidence warning.
 
-Natural next steps: background-task scheduling (`BGProcessingTask`), multipart
-uploads for videos over the ~5 GB single-PUT ceiling (and resumable large
-uploads), and a pluggable backend protocol so non-S3 targets (SFTP/Borg/Restic)
-could slot beside `S3Client`.
+Natural next steps: multipart uploads for videos over the ~5 GB single-PUT
+ceiling (and resumable large uploads), and a pluggable backend protocol so
+non-S3 targets (SFTP/Borg/Restic) could slot beside `S3Client`.
 
 ## License
 

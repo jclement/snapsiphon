@@ -222,7 +222,7 @@ final class S3Client {
     /// List objects under the configured prefix with size + ETag (one page,
     /// up to 1000). This is verification's workhorse: ~10 requests cover a
     /// 10k-object archive, no per-object HEADs needed.
-    func listObjects(continuationToken: String? = nil, now: Date = Date()) async throws -> (objects: [RemoteObject], next: String?) {
+    func listObjects(subPrefix: String? = nil, continuationToken: String? = nil, now: Date = Date()) async throws -> (objects: [RemoteObject], next: String?) {
         var components: URLComponents
         if config.usesPathStyle {
             components = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
@@ -233,9 +233,13 @@ final class S3Client {
         // encode the query OURSELVES with the same encoder SigV4 canonicalizes
         // with — otherwise a '+' in a continuation token is signed as %2B but
         // sent literally, breaking pagination with a signature mismatch.
+        // `subPrefix` narrows the listing to one repo area ("objects/",
+        // "checkpoints/000003/") so verify and journal checks never page
+        // through the whole archive.
         var items = [
             ("list-type", "2"),
-            ("prefix", config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))),
+            ("prefix", subPrefix.map { fullKey(for: $0) }
+                ?? config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))),
         ]
         if let token = continuationToken {
             items.append(("continuation-token", token))
