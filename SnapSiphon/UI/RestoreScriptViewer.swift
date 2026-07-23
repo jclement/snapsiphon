@@ -7,6 +7,21 @@ struct RestoreScriptViewer: View {
     let script: String
     @Environment(\.dismiss) private var dismiss
     @State private var copied = false
+    /// The script written to a temp file so the share sheet offers it as a
+    /// real `restore.py` (AirDrop, Save to Files, mail attachment) instead of
+    /// a wall of text. Removed again when the sheet closes.
+    @State private var shareURL: URL?
+
+    private func makeShareFile() {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("restore.py")
+        try? script.data(using: .utf8)?.write(to: url, options: .completeFileProtection)
+        shareURL = url
+    }
+
+    private func removeShareFile() {
+        if let shareURL { try? FileManager.default.removeItem(at: shareURL) }
+        shareURL = nil
+    }
 
     var body: some View {
         NavigationStack {
@@ -24,7 +39,14 @@ struct RestoreScriptViewer: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
-                ToolbarItem(placement: .primaryAction) {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if let shareURL {
+                        ShareLink(item: shareURL,
+                                  preview: SharePreview("restore.py", image: Image(systemName: "cross.case.fill"))) {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                        }
+                        .tint(Theme.teal)
+                    }
                     Button {
                         UIPasteboard.general.string = script
                         copied = true
@@ -38,6 +60,8 @@ struct RestoreScriptViewer: View {
                     .tint(copied ? .green : Theme.teal)
                 }
             }
+            .onAppear(perform: makeShareFile)
+            .onDisappear(perform: removeShareFile)
         }
         .preferredColorScheme(.dark)
     }
