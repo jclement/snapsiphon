@@ -82,28 +82,46 @@ struct SettingsView: View {
                         ToggleRow(title: "Favorites only", subtitle: "Skip anything you haven't hearted.",
                                   isOn: $engine.settings.favoritesOnly)
                         Divider().overlay(Theme.hairline)
-                        ToggleRow(title: "Only content after a date",
-                                  subtitle: "Skip everything captured before a cutoff — handy for testing on a slice of a huge library, or when older content already lives in another backup. Older items are also left out of the progress ring.",
-                                  isOn: Binding(
-                                    get: { engine.settings.backupCutoff != nil },
-                                    set: { on in
-                                        // Seed far in the past: flipping the toggle
-                                        // on excludes NOTHING until the user
-                                        // actually moves the date.
-                                        engine.settings.backupCutoff = on
-                                            ? (engine.settings.backupCutoff ?? Self.cutoffSeed)
-                                            : nil
-                                    }))
-                        if let cutoff = engine.settings.backupCutoff {
-                            DatePicker("Back up from",
-                                       selection: Binding(
-                                        get: { cutoff },
-                                        set: { engine.settings.backupCutoff = Calendar.current.startOfDay(for: $0) }),
-                                       in: ...Date(),
-                                       displayedComponents: .date)
-                                .font(Theme.rounded(15, weight: .medium))
-                                .foregroundStyle(Theme.textPrimary)
-                                .tint(Theme.teal)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Back up from")
+                                    .font(Theme.rounded(15, weight: .medium))
+                                    .foregroundStyle(Theme.textPrimary)
+                                Spacer()
+                                if let cutoff = engine.settings.backupCutoff {
+                                    DatePicker("",
+                                               selection: Binding(
+                                                get: { cutoff },
+                                                set: { engine.settings.backupCutoff = Calendar.current.startOfDay(for: $0) }),
+                                               in: ...Date(),
+                                               displayedComponents: .date)
+                                        .labelsHidden()
+                                        .tint(Theme.teal)
+                                    Button {
+                                        engine.settings.backupCutoff = nil
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.system(size: 18))
+                                            .foregroundStyle(Theme.textTertiary)
+                                    }
+                                } else {
+                                    Button {
+                                        // Seeded far in the past, so setting a
+                                        // date excludes nothing until it's moved.
+                                        engine.settings.backupCutoff = Self.cutoffSeed
+                                    } label: {
+                                        Text("Everything")
+                                            .font(Theme.rounded(14, weight: .medium))
+                                            .foregroundStyle(Theme.teal)
+                                            .padding(.horizontal, 12).padding(.vertical, 6)
+                                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surfaceHi))
+                                    }
+                                }
+                            }
+                            Text(engine.settings.backupCutoff == nil
+                                 ? "Will include all photos & videos."
+                                 : "Will include only items taken or added after \(engine.settings.backupCutoff!.formatted(date: .abbreviated, time: .omitted)). Earlier items are also left out of the progress ring.")
+                                .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                         }
                     }
 
