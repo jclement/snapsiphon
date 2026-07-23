@@ -52,7 +52,7 @@ struct AttachRepositorySheet: View {
                                 if ok { dismiss() }
                             }
                         }
-                        optionButton(icon: "checkmark.magnifyingglass",
+                        optionButton(icon: "doc.text.magnifyingglass",
                                      title: "Verify match first",
                                      detail: "Read the repository's index (touching nothing) and compare it with this phone: matching items, differences, and whether every backed-up file is actually present.",
                                      color: Theme.violet) {
