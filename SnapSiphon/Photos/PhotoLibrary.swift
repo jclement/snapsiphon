@@ -45,6 +45,7 @@ final class PhotoLibrary {
         let mediaType: AssetRecord.MediaType
         let creationDate: Date?
         let isFavorite: Bool
+        let isLivePhoto: Bool
     }
 
     /// Enumerate the library honouring the media-type filters, oldest-first.
@@ -89,7 +90,8 @@ final class PhotoLibrary {
                 localIdentifier: asset.localIdentifier,
                 mediaType: mediaType,
                 creationDate: asset.creationDate,
-                isFavorite: asset.isFavorite))
+                isFavorite: asset.isFavorite,
+                isLivePhoto: asset.mediaSubtypes.contains(.photoLive)))
         }
         return infos
     }
@@ -163,7 +165,22 @@ final class PhotoLibrary {
             ?? resources.first { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo }
             ?? resources.first
         guard let resource else { throw ExportError.noResource }
+        return try await writeResource(resource, to: destination)
+    }
 
+    /// Export a Live Photo's paired motion clip (the ~3 s video that plays on
+    /// press). Throws `.noResource` for assets without one.
+    func exportLiveMotion(localIdentifier: String, to destination: URL) async throws -> Exported {
+        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
+        guard let asset = fetch.firstObject else { throw ExportError.notFound }
+        let resources = PHAssetResource.assetResources(for: asset)
+        let resource = resources.first { $0.type == .fullSizePairedVideo }
+            ?? resources.first { $0.type == .pairedVideo }
+        guard let resource else { throw ExportError.noResource }
+        return try await writeResource(resource, to: destination)
+    }
+
+    private func writeResource(_ resource: PHAssetResource, to destination: URL) async throws -> Exported {
         try? FileManager.default.removeItem(at: destination)
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true  // fetch from iCloud if needed

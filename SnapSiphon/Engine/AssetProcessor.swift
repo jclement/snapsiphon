@@ -55,9 +55,17 @@ struct AssetProcessor {
         }
 
         // 1. Export the untouched original (learns the real filename/size,
-        //    deferred from scan time).
+        //    deferred from scan time). A "#live"-suffixed record means this
+        //    row is a Live Photo's paired motion clip.
         onPhase?(.exporting)
-        let exported = try await photos.exportOriginal(localIdentifier: record.localIdentifier, to: originalURL)
+        let exported: PhotoLibrary.Exported
+        if AssetRecord.isLiveMotion(record.localIdentifier) {
+            exported = try await photos.exportLiveMotion(
+                localIdentifier: AssetRecord.baseIdentifier(record.localIdentifier), to: originalURL)
+        } else {
+            exported = try await photos.exportOriginal(
+                localIdentifier: record.localIdentifier, to: originalURL)
+        }
         onMeta?(exported.filename, exported.byteSize)
 
         // 2. Hash the plaintext (fast local read) — its salted HMAC IS the

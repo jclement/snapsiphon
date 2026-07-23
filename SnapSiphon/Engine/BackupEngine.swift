@@ -88,6 +88,7 @@ final class BackupEngine: ObservableObject {
             // next scan re-checks the whole library for them.
             if (settings.includePhotos && !oldValue.includePhotos) ||
                (settings.includeVideos && !oldValue.includeVideos) ||
+               (settings.includeLiveMotion && !oldValue.includeLiveMotion) ||
                (!settings.favoritesOnly && oldValue.favoritesOnly) ||
                // Cutoff removed or moved earlier: assets before the old cutoff
                // are behind the mark and would otherwise never be picked up.
@@ -473,6 +474,7 @@ final class BackupEngine: ObservableObject {
 
         let includePhotos = settings.includePhotos
         let includeVideos = settings.includeVideos
+        let includeLiveMotion = settings.includeLiveMotion
         let favoritesOnly = settings.favoritesOnly
         let photos = self.photos
         // Fast-scan mark: only enumerate assets created after it (unless deep or
@@ -513,6 +515,25 @@ final class BackupEngine: ObservableObject {
                 // later has to be picked up by a fast scan).
                 if favoritesOnly && !info.isFavorite { continue }
                 if let d = info.creationDate, newest == nil || d > newest! { newest = d }
+                // Live Photo motion clips get their own suffixed record —
+                // checked independently of the still, so enabling the toggle
+                // later back-fills clips for already-uploaded stills.
+                if includeLiveMotion, info.isLivePhoto {
+                    let clipID = AssetRecord.liveMotionIdentifier(for: info.localIdentifier)
+                    if !known.contains(clipID) {
+                        idx.upsert(AssetRecord(
+                            localIdentifier: clipID,
+                            uuid: "",
+                            state: .pending,
+                            mediaType: .other,   // not counted in the photo/video ring
+                            filename: "",
+                            byteSize: 0,
+                            createdAt: info.creationDate,
+                            uploadedAt: nil,
+                            lastError: nil))
+                        added += 1
+                    }
+                }
                 if known.contains(info.localIdentifier) { continue }
                 idx.upsert(AssetRecord(
                     localIdentifier: info.localIdentifier,
@@ -530,7 +551,13 @@ final class BackupEngine: ObservableObject {
             }
             // Everything enumerated is by definition present in THIS phone's
             // library — the precondition for ever tombstoning it later.
-            idx.markLocalSeen(infos.map(\.localIdentifier))
+            // (Clip records ride on their still's presence.)
+            var seenIDs = infos.map(\.localIdentifier)
+            if includeLiveMotion {
+                seenIDs += infos.filter(\.isLivePhoto)
+                    .map { AssetRecord.liveMotionIdentifier(for: $0.localIdentifier) }
+            }
+            idx.markLocalSeen(seenIDs)
             return (added, newest, infos.count)
         }.value
 
@@ -665,9 +692,10 @@ final class BackupEngine: ObservableObject {
         let photos = self.photos
         let liveIDs = await Task.detached(priority: .utility) { photos.allLocalIdentifiers() }.value
 
-        // Resurrect tombstones whose asset is back in the library.
+        // Resurrect tombstones whose asset is back in the library. Motion-clip
+        // records (#live suffix) follow their still's presence.
         var resurrected = 0
-        for id in index.tombstonedIdentifiers() where liveIDs.contains(id) {
+        for id in index.tombstonedIdentifiers() where liveIDs.contains(AssetRecord.baseIdentifier(id)) {
             index.resurrect(id); resurrected += 1
         }
         if resurrected > 0 {
@@ -680,7 +708,7 @@ final class BackupEngine: ObservableObject {
         // had is not a deletion, and after a take-over on a new device the old
         // rows would otherwise all read as "deleted" and trip the fuse forever.
         let uploadedPairs = index.locallySeenUploadedPairs()
-        let orphans = uploadedPairs.filter { !liveIDs.contains($0.id) }
+        let orphans = uploadedPairs.filter { !liveIDs.contains(AssetRecord.baseIdentifier($0.id)) }
         // Mass-deletion fuse: if a huge fraction of the archive suddenly reads
         // as deleted, it's far more likely an access/App-state anomaly than a
         // real intent — refuse to tombstone and tell the user.
@@ -695,7 +723,8 @@ final class BackupEngine: ObservableObject {
         // this cache no longer tracks.
         let liveSet = liveIDs
         let now = Date()
-        for rec in index.pendingRecords(limit: 100_000) where !liveSet.contains(rec.localIdentifier) {
+        for rec in index.pendingRecords(limit: 100_000)
+        where !liveSet.contains(AssetRecord.baseIdentifier(rec.localIdentifier)) {
             if !rec.uuid.isEmpty && (rec.journaled || rec.uploadedAt != nil) {
                 index.markDeleted(rec.localIdentifier, at: now)
             } else {
@@ -1516,6 +1545,7 @@ final class BackupEngine: ObservableObject {
         let bytesPerSecond = totalBudget > 0 ? totalBudget / Double(workerTarget) : 0
         let includePhotos = settings.includePhotos
         let includeVideos = settings.includeVideos
+        let includeLiveMotion = settings.includeLiveMotion
         // Live worker count: refreshed at every refill, so moving the slider
         // mid-run takes effect as files finish — more lanes spawn up to the new
         // target, or excess lanes drain away.
@@ -1552,6 +1582,7 @@ final class BackupEngine: ObservableObject {
                         // Honour type filters for items queued before a toggle changed.
                         && !($0.mediaType == .photo && !includePhotos)
                         && !($0.mediaType == .video && !includeVideos)
+                        && !(AssetRecord.isLiveMotion($0.localIdentifier) && !includeLiveMotion)
                 }) else { return false }
                 inFlight.insert(record.localIdentifier)
                 attempted.insert(record.localIdentifier)

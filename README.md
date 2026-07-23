@@ -160,9 +160,9 @@ design has been through a 118-agent adversarial review (six dimensions, every
 finding independently attacked before being accepted).
 
 Natural next steps: multipart uploads for videos over the ~5 GB single-PUT
-ceiling (and resumable large uploads), Live Photo motion clips, and a
-pluggable backend protocol so non-S3 targets (SFTP/Borg/Restic) could slot
-beside `S3Client`.
+ceiling (and resumable large uploads), and a pluggable backend protocol so
+non-S3 targets (SFTP/Borg/Restic) could slot beside `S3Client`. (Live Photo
+motion clips shipped as an opt-in toggle.)
 
 ## App Store copy
 

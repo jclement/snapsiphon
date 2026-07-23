@@ -8,6 +8,10 @@ struct BackupSettings: Codable, Equatable {
     var includePhotos: Bool = true
     var includeVideos: Bool = true
     var favoritesOnly: Bool = false
+    /// Also back up each Live Photo's paired ~3 s motion clip (a second,
+    /// separate encrypted blob per Live Photo). Off = stills only.
+    var backupLivePhotoMovies: Bool? = nil
+    var includeLiveMotion: Bool { backupLivePhotoMovies ?? false }
     /// Only back up content captured on/after this date (nil = everything).
     /// For testing against a slice of a huge library, or when older content is
     /// already safe in a pre-existing backup.

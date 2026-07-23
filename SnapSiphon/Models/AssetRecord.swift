@@ -40,3 +40,18 @@ struct AssetRecord: Identifiable, Codable, Equatable {
         case photo, video, other
     }
 }
+
+extension AssetRecord {
+    /// Suffix marking a Live Photo's paired motion-clip record. The base
+    /// (unsuffixed) localIdentifier is the still photo's asset id — library
+    /// membership checks must always use the base.
+    static let liveMotionSuffix = "#live"
+
+    static func liveMotionIdentifier(for base: String) -> String { base + liveMotionSuffix }
+
+    static func baseIdentifier(_ id: String) -> String {
+        id.hasSuffix(liveMotionSuffix) ? String(id.dropLast(liveMotionSuffix.count)) : id
+    }
+
+    static func isLiveMotion(_ id: String) -> Bool { id.hasSuffix(liveMotionSuffix) }
+}

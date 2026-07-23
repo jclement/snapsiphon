@@ -41,7 +41,7 @@ Inside your bucket, under your chosen prefix, lives a **repository**:
 - Blobs upload **before** their journal entry commits: a crash mid-backup strands at most an unreferenced blob, never a phantom journal entry.
 - **Deletions** are journaled immediately; blobs are physically removed only by garbage collection — the automatic "Purge deleted backups" toggle or the manual *Clean up now* button — after the grace period (and Object Lock permitting).
 - **Integrity**: the repository stores sha256 hashes of both the original file and the ciphertext; restores verify end-to-end. Uploads also carry Content-MD5.
-- **Live Photos**: the full-quality still is backed up; the 3-second motion clip is not yet (planned).
+- **Live Photos**: the full-quality still is always backed up; turn on *Live Photo motion clips* (Settings → What to back up) to also store each ~3-second clip as its own encrypted file — enabling it later back-fills clips for everything already backed up.
 - **Very large videos**: a single upload tops out around the S3 5 GB single-request ceiling (provider-dependent). Files beyond it fail with a clear error rather than uploading partially; multipart support is planned.
 
 ## One phone per folder

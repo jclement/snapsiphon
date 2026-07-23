@@ -84,6 +84,12 @@ struct SettingsView: View {
                         ToggleRow(title: "Favorites only", subtitle: "Skip anything you haven't hearted.",
                                   isOn: $engine.settings.favoritesOnly)
                         Divider().overlay(Theme.hairline)
+                        ToggleRow(title: "Live Photo motion clips",
+                                  subtitle: "Also back up each Live Photo's ~3-second motion clip as its own encrypted file. Turning this on back-fills clips for Live Photos already backed up.",
+                                  isOn: Binding(
+                                    get: { engine.settings.includeLiveMotion },
+                                    set: { engine.settings.backupLivePhotoMovies = $0 }))
+                        Divider().overlay(Theme.hairline)
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Text("Back up from")
