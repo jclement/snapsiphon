@@ -85,6 +85,7 @@ struct DashboardView: View {
                 switch engine.phase {
                 case .idle: Pill(text: "READY", color: Theme.teal)
                 case .scanning: Pill(text: "SCANNING", color: .cyan, filled: true)
+                case .preparing: Pill(text: "CHECKING", color: .cyan, filled: true)
                 case .running: Pill(text: "UPLOADING", color: Theme.teal, filled: true)
                 case .paused: Pill(text: "PAUSED", color: .orange)
                 case .finished: Pill(text: "DONE", color: .green, filled: true)
@@ -237,7 +238,12 @@ struct DashboardView: View {
             } else if engine.phase == .scanning {
                 infoPanel(icon: "magnifyingglass", color: .cyan, spinning: true,
                           title: "Scanning library",
-                          subtitle: "\(Format.count(engine.scanChecked)) checked")
+                          subtitle: engine.activityDetail ?? "\(Format.count(engine.scanChecked)) checked")
+                gaugeRow(now: now)
+            } else if engine.phase == .preparing {
+                infoPanel(icon: "externaldrive.badge.checkmark", color: .cyan, spinning: true,
+                          title: "Checking repository",
+                          subtitle: engine.activityDetail ?? "Comparing with the bucket…")
                 gaugeRow(now: now)
             } else if let reason = engine.waitingReason {
                 infoPanel(icon: "pause.circle.fill", color: .orange, spinning: true,

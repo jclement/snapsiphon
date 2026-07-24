@@ -13,12 +13,13 @@ final class BackupEngine: ObservableObject {
     enum Phase: Equatable {
         case idle
         case scanning
+        case preparing   // between scan and upload: repo checks, journal work
         case running
         case paused
         case finished
         case failed(String)
 
-        var isActive: Bool { self == .scanning || self == .running }
+        var isActive: Bool { self == .scanning || self == .preparing || self == .running }
     }
 
     struct LogEntry: Identifiable {
@@ -54,6 +55,10 @@ final class BackupEngine: ObservableObject {
     @Published private(set) var log: [LogEntry] = []
     /// Number of library assets examined so far during a scan (for live feedback).
     @Published private(set) var scanChecked: Int = 0
+    /// What the pipeline is doing RIGHT NOW during scan/prepare — keeps the
+    /// dashboard honest through the quiet stretches (deletion reconcile,
+    /// repository checks) between "scanning" and "uploading".
+    @Published private(set) var activityDetail: String?
     /// Result of the last completed scan (shown in Settings → Automation).
     @Published private(set) var scanStatus: String?
     /// Library totals by type (denominator) and uploaded-by-type (numerator) for
@@ -641,10 +646,12 @@ final class BackupEngine: ObservableObject {
             : "✓ \(deep ? "Full scan" : "Scan") checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
         appendLog("Scan complete — \(added) new item\(added == 1 ? "" : "s") queued.", .success)
 
-        // Deletions are ALWAYS reconciled into the manifest (tombstones +
-        // resurrections) so restores reflect reality; the toggle only governs
-        // whether blobs are physically purged.
+        // Deletions are ALWAYS reconciled (tombstones + resurrections) so
+        // restores reflect reality; the toggle only governs whether blobs are
+        // physically purged.
+        activityDetail = "Checking for deleted photos…"
         await reconcileDeletes()
+        activityDetail = nil
         phase = .idle
     }
 
@@ -797,7 +804,10 @@ final class BackupEngine: ObservableObject {
         }
 
         // Physical space reclamation is opt-in; marking above is unconditional.
-        if settings.propagateDeletes { await purgeTombstones() }
+        if settings.propagateDeletes {
+            activityDetail = "Cleaning up deleted backups…"
+            await purgeTombstones()
+        }
     }
 
     /// Physically remove tombstones past the grace period, freeing bucket bytes.
@@ -1493,10 +1503,17 @@ final class BackupEngine: ObservableObject {
         guard runTask == nil, pipelineTask == nil, phase != .scanning, !verifying else { return }
         pipelineTask = Task { [weak self] in
             await self?.scan()
+            // The repository checks are real network work (LIST + possibly a
+            // checkpoint) — show them, don't dead-air on "READY".
+            await MainActor.run { [weak self] in
+                self?.phase = .preparing
+                self?.activityDetail = "Checking the repository…"
+            }
             let ready = await self?.prepareRepository() ?? false
             await MainActor.run { [weak self] in
+                self?.activityDetail = nil
                 if ready { self?.start() }
-                else if self?.phase == .scanning { self?.phase = .idle }
+                else if self?.phase == .scanning || self?.phase == .preparing { self?.phase = .idle }
                 self?.pipelineTask = nil
             }
         }
@@ -1572,7 +1589,9 @@ final class BackupEngine: ObservableObject {
             appendLog(reason, .error)
         } else if phase == .running {
             phase = .finished
-            appendLog("Backup finished — \(sessionUploaded) uploaded this session.", .success)
+            appendLog(sessionUploaded == 0
+                      ? "Backup finished — everything was already backed up."
+                      : "Backup finished — \(sessionUploaded) uploaded this session.", .success)
         }
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRunKey)
         rescheduleReminder()   // reset the "no backup for N days" countdown
