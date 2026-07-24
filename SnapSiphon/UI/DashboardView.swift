@@ -123,13 +123,23 @@ struct DashboardView: View {
 
     // Legend for the ring: inner donut = stored bytes split photos/videos.
     private var mediaLegend: some View {
-        HStack(spacing: 18) {
-            legendItem(color: Theme.teal, label: "Photos",
-                       count: engine.uploadedPhotos, total: engine.libraryPhotos,
-                       bytes: engine.storedPhotoBytes)
-            legendItem(color: Theme.violet, label: "Videos",
-                       count: engine.uploadedVideos, total: engine.libraryVideos,
-                       bytes: engine.storedVideoBytes)
+        VStack(spacing: 3) {
+            HStack(spacing: 18) {
+                legendItem(color: Theme.teal, label: "Photos",
+                           count: engine.uploadedPhotos, total: engine.libraryPhotos,
+                           bytes: engine.storedPhotoBytes)
+                legendItem(color: Theme.violet, label: "Videos",
+                           count: engine.uploadedVideos, total: engine.libraryVideos,
+                           bytes: engine.storedVideoBytes)
+            }
+            // Hidden album is never invisible: say whether it's in or out.
+            if engine.hiddenItemCount > 0 {
+                Text(engine.settings.includeHidden
+                     ? "including \(Format.count(engine.hiddenItemCount)) hidden"
+                     : "\(Format.count(engine.hiddenItemCount)) hidden excluded (Settings → Hidden album)")
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.textTertiary)
+            }
         }
         .frame(maxWidth: .infinity)
     }

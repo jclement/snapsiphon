@@ -59,6 +59,9 @@ final class BackupEngine: ObservableObject {
     /// the photos/videos ring.
     @Published private(set) var libraryPhotos = 0
     @Published private(set) var libraryVideos = 0
+    /// How many items live in the Hidden album — shown on the dashboard so
+    /// "what's excluded" (or included) is never invisible.
+    @Published private(set) var hiddenItemCount = 0
     @Published private(set) var uploadedPhotos = 0
     @Published private(set) var uploadedVideos = 0
     @Published private(set) var storedPhotoBytes: Int64 = 0
@@ -415,11 +418,15 @@ final class BackupEngine: ObservableObject {
         let photos = self.photos
         let cutoff = settings.backupCutoff
         let includeHidden = settings.includeHidden
-        let counts = await Task.detached(priority: .utility) {
-            photos.libraryCounts(since: cutoff, includeHidden: includeHidden)
+        let (counts, hidden) = await Task.detached(priority: .utility) { () -> ((photos: Int, videos: Int), Int) in
+            let with = photos.libraryCounts(since: cutoff, includeHidden: true)
+            let without = photos.libraryCounts(since: cutoff, includeHidden: false)
+            let hidden = max(0, (with.photos + with.videos) - (without.photos + without.videos))
+            return (includeHidden ? with : without, hidden)
         }.value
         libraryPhotos = counts.photos
         libraryVideos = counts.videos
+        hiddenItemCount = hidden
     }
 
     // MARK: Permissions
@@ -739,7 +746,12 @@ final class BackupEngine: ObservableObject {
         }
         for orphan in orphans { index.markDeleted(orphan.id, at: now) }
         if !orphans.isEmpty {
-            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device — recording tombstone\(orphans.count == 1 ? "" : "s") in the journal.", .warning)
+            // Name names (up to a few) — "3 photos deleted" is unactionable.
+            let names = orphans.prefix(4).compactMap { index.record(for: $0.id)?.filename }
+                .filter { !$0.isEmpty }
+            let sample = names.isEmpty ? "" :
+                " (\(names.joined(separator: ", "))\(orphans.count > names.count ? ", …" : ""))"
+            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device\(sample) — recording tombstone\(orphans.count == 1 ? "" : "s") in the journal. Blobs stay until purged.", .warning)
         }
 
         if resurrected > 0 || !orphans.isEmpty {
@@ -839,7 +851,10 @@ final class BackupEngine: ObservableObject {
                 for r in freed { index.hardDeleteRecord(r.localIdentifier) }
                 await rolloverIfDue()
             }
-            appendLog("Freed \(freed.count) deleted backup\(freed.count == 1 ? "" : "s") from the bucket.", .info)
+            let names = freed.prefix(4).map(\.filename).filter { !$0.isEmpty }
+            let sample = names.isEmpty ? "" :
+                " (\(names.joined(separator: ", "))\(freed.count > names.count ? ", …" : ""))"
+            appendLog("Freed \(freed.count) deleted backup\(freed.count == 1 ? "" : "s") from the bucket\(sample).", .info)
         }
         if blocked > 0 {
             appendLog("\(blocked) deletion\(blocked == 1 ? "" : "s") still locked — will retry once Object Lock retention expires.", .info)
@@ -1026,7 +1041,16 @@ final class BackupEngine: ObservableObject {
             }
             index.markJournaled(records: dirty)
             setRepoPosition(generation: generation, nextSeq: seq + 1, lastHash: Repo.sha256Hex(data))
-            appendLog("Journal \(generation)/\(seq) committed — \(entries.count) change\(entries.count == 1 ? "" : "s").", .info)
+            // Break the commit down by operation so deletions are visible in
+            // the activity feed, not buried inside "N changes".
+            var parts: [String] = []
+            let adds = entries.filter { $0.op == .add }.count
+            let deletes = entries.filter { $0.op == .delete }.count
+            let purges = entries.filter { $0.op == .purge }.count
+            if adds > 0 { parts.append("\(adds) added") }
+            if deletes > 0 { parts.append("\(deletes) deleted") }
+            if purges > 0 { parts.append("\(purges) purged") }
+            appendLog("Journal \(generation)/\(seq) committed — \(parts.isEmpty ? "\(entries.count) changes" : parts.joined(separator: " · ")).", .info)
             // Compaction: enough journals → roll a fresh self-contained
             // generation (checkpoint carries the whole state). Deferred during
             // a purge flush so the snapshot never captures rows the caller is
