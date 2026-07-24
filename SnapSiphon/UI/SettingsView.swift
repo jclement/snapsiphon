@@ -91,7 +91,7 @@ struct SettingsView: View {
                                     set: { engine.settings.backupLivePhotoMovies = $0 }))
                         Divider().overlay(Theme.hairline)
                         ToggleRow(title: "Hidden album",
-                                  subtitle: "Also back up photos in the Hidden album (everything is encrypted either way). Off = hidden photos are never uploaded — though hiding a photo AFTER backup never deletes its backup.",
+                                  subtitle: "Also back up photos in the Hidden album (everything is encrypted either way). ⚠︎ iOS only shows the Hidden album to apps when its Face ID lock is OFF (Settings → Photos → Use Face ID) — with the lock on, iOS hides these photos from SnapSiphon entirely, whatever this toggle says.",
                                   isOn: Binding(
                                     get: { engine.settings.includeHidden },
                                     set: { engine.settings.backupHiddenPhotos = $0 }))
