@@ -283,6 +283,17 @@ final class BackupIndex {
         }
     }
 
+    /// Permanently exclude a record from the queue (asset has nothing to
+    /// export — e.g. an edited Live Photo with no motion clip). Unlike
+    /// 'failed', skipped rows are never retried; a later scan can still
+    /// re-queue them if the asset changes.
+    func markSkipped(_ localIdentifier: String, reason: String) {
+        queue.sync {
+            db.exec("UPDATE assets SET state='skipped', lastError=? WHERE localIdentifier=?;",
+                    [.text(reason), .text(localIdentifier)])
+        }
+    }
+
     func requeue(_ localIdentifier: String, reason: String) {
         queue.sync {
             db.exec("UPDATE assets SET state='pending', lastError=? WHERE localIdentifier=?;",

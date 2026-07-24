@@ -1801,6 +1801,27 @@ final class BackupEngine: ObservableObject {
             // CancellationError — treat both as a quiet pause, not a failure.
             let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
             if !cancelled, S3Client.isTransient(error) { consecutiveTransportFailures += 1 }
+            // Permanent conditions must not retry forever: an asset with no
+            // exportable resource (an edited Live Photo whose motion clip was
+            // stripped, or an asset that vanished) is SKIPPED, not failed.
+            if case PhotoLibrary.ExportError.noResource = error {
+                let what = AssetRecord.isLiveMotion(rid)
+                    ? "Live Photo has no motion clip (edited?)"
+                    : "asset has no exportable file"
+                index.markSkipped(rid, reason: "No exportable resource")
+                endSlot(rid)
+                appendLog("Skipped \(record.filename.isEmpty ? "an item" : record.filename) — \(what). It won't be retried.", .warning)
+                refreshCounts()
+                return
+            }
+            if case PhotoLibrary.ExportError.notFound = error {
+                // Asset is gone from the library; the next scan's cleanup
+                // tombstones or drops the row properly.
+                index.markSkipped(rid, reason: "Asset no longer in library")
+                endSlot(rid)
+                refreshCounts()
+                return
+            }
             // A verify-requeued record keeps its "Verify:" marker across failed
             // attempts — losing it would let the next attempt's HEAD-skip
             // re-mark the bad blob as healthy without re-uploading.
