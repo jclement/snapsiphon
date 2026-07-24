@@ -665,12 +665,18 @@ final class BackupEngine: ObservableObject {
         static let nextSeq = "repo.nextSeq"
         static let lastHash = "repo.lastHash"
         static let salt = "repo.salt"      // blob-naming HMAC salt (hex)
+        static let layout = "repo.layout"  // blob key layout (absent = flat)
     }
 
     /// The repository's blob-naming salt. Minted once at repo init; travels
     /// inside the encrypted checkpoint (the meta table is part of the
     /// snapshot), so an attach/reload recovers it automatically.
     private var repoSalt: String? { index?.metaValue(RepoMeta.salt) }
+
+    /// Whether this repository uses the sharded blob layout (objects/ab/…).
+    /// Recorded at init; old repositories stay flat forever — the layout is a
+    /// repository property, never a per-device choice.
+    var repoSharded: Bool { index?.metaValue(RepoMeta.layout) == Repo.shardedLayout }
 
     @discardableResult
     private func ensureRepoSalt() -> String {
@@ -868,7 +874,7 @@ final class BackupEngine: ObservableObject {
                 freed.append(record)                    // drop the row, keep the blob
                 continue
             }
-            let key = client.fullKey(for: Repo.objectKey(uuid: record.uuid))
+            let key = client.fullKey(for: Repo.objectKey(uuid: record.uuid, sharded: repoSharded))
             do {
                 let versions = try await client.listVersions(forKey: key)
                 var allGone = true
@@ -1234,9 +1240,10 @@ final class BackupEngine: ObservableObject {
                 }
                 allowInitWithStaleCache = false
                 appendLog("Initializing repository…", .info)
-                // The salt must exist BEFORE the checkpoint so the snapshot
-                // carries it.
+                // Salt and layout must exist BEFORE the checkpoint so the
+                // snapshot carries them (readers learn both from it).
                 ensureRepoSalt()
+                index?.setMeta(RepoMeta.layout, Repo.shardedLayout)
                 return await writeCheckpoint(generation: 1)
             }
             // Existing repository, and this install has no position in it.
@@ -1363,7 +1370,9 @@ final class BackupEngine: ObservableObject {
             repeat {
                 let page = try await client.listObjects(subPrefix: "objects/", continuationToken: token)
                 for o in page.objects where o.key.hasPrefix(objPfx) {
-                    blobs.insert(String(o.key.dropFirst(objPfx.count)))
+                    // Last path component = the blob address, in both the
+                    // flat and sharded (objects/ab/…) layouts.
+                    if let addr = o.key.split(separator: "/").last { blobs.insert(String(addr)) }
                 }
                 token = page.next
             } while token != nil
@@ -1439,7 +1448,8 @@ final class BackupEngine: ObservableObject {
             repeat {
                 let page = try await client.listObjects(subPrefix: "objects/", continuationToken: token)
                 for o in page.objects where o.key.hasPrefix(objPfx) {
-                    remote[String(o.key.dropFirst(objPfx.count))] = o.size
+                    // Last path component = blob address (flat or sharded layout).
+                    if let addr = o.key.split(separator: "/").last { remote[String(addr)] = o.size }
                 }
                 token = page.next
                 verifyStatus = "Listing bucket… \(Format.count(remote.count)) blobs"
@@ -1545,7 +1555,8 @@ final class BackupEngine: ObservableObject {
         appendLog("Backup started.", .info)
 
         let processor = AssetProcessor(photos: photos, client: client, recipients: recipients,
-                                       tempDir: tempDir, saltHex: ensureRepoSalt())
+                                       tempDir: tempDir, saltHex: ensureRepoSalt(),
+                                       shardedLayout: repoSharded)
 
         let draining = drainingTask
         drainingTask = nil

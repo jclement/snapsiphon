@@ -437,6 +437,13 @@ def main():
                         "SELECT localIdentifier, uuid, state, filename, plaintextHash FROM assets WHERE uuid != ''"):
                     if state in ("uploaded", "deleted"):
                         loaded[lid] = {"uuid": u, "filename": filename or "", "state": state, "hash": plain}
+                # Blob layout is a repository property recorded in the
+                # checkpoint's meta table (absent = old flat layout).
+                try:
+                    row = con.execute("SELECT value FROM meta WHERE key='repo.layout'").fetchone()
+                    sharded = bool(row and row[0] == "sharded2")
+                except sqlite3.Error:
+                    sharded = False
                 con.close()
                 items, gen = loaded, candidate
                 break
@@ -523,7 +530,8 @@ def main():
                 if twin is not None and twin.exists():
                     shutil.copyfile(twin, part)             # same content, already verified
                 else:
-                    download(base + "objects/" + u, blob)
+                    blob_key = base + ("objects/" + u[:2] + "/" + u if sharded else "objects/" + u)
+                    download(blob_key, blob)
                     # Decrypt to a temp name and rename only on success, so an
                     # interrupted/failed decrypt can't leave a partial file that
                     # the resume check above would silently accept as restored.

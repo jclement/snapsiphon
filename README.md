@@ -25,7 +25,7 @@ them back. Deterministic for dedup and idempotent uploads; opaque to outsiders.
   in-app per-provider cheat sheet for endpoints/regions. Requests are signed
   with AWS Signature V4; credentials live only in the iOS Keychain.
 - **The bucket is the source of truth.** The repository layout is
-  `objects/<salted-content-address>` for blobs plus `checkpoints/NNNNNN/` generations, each
+  `objects/ab/<salted-content-address>` for blobs (sharded, filesystem-friendly) plus `checkpoints/NNNNNN/` generations, each
   holding an encrypted SQLite snapshot (`checkpoint.age`) and append-only
   encrypted journals of every change (adds, deletions, purges). Journals chain
   by ciphertext hash (tamper-evident), blobs upload **before** their journal

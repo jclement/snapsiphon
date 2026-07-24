@@ -23,7 +23,17 @@ enum Repo {
 
     // MARK: Naming
 
-    static func objectKey(uuid: String) -> String { "objects/\(uuid)" }
+    /// Blob keys: flat (`objects/<addr>`) for repositories created before
+    /// sharding existed, or sharded (`objects/ab/<addr>`) for new ones. Object
+    /// stores don't care either way (flat namespace); sharding exists for
+    /// filesystem-backed backends and local mirrors, where a single directory
+    /// with 100k entries hurts. The repository records its layout in the meta
+    /// table (inside the checkpoint), so every reader agrees.
+    static let shardedLayout = "sharded2"
+
+    static func objectKey(uuid: String, sharded: Bool) -> String {
+        sharded ? "objects/\(uuid.prefix(2))/\(uuid)" : "objects/\(uuid)"
+    }
     static func generationDir(_ gen: Int) -> String { String(format: "checkpoints/%06d", gen) }
     static func checkpointKey(gen: Int) -> String { "\(generationDir(gen))/checkpoint.age" }
     static func journalKey(gen: Int, seq: Int) -> String {

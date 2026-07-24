@@ -34,7 +34,7 @@ Your storage provider only ever sees ciphertext. Output is byte-compatible with 
 
 Inside your bucket, under your chosen prefix, lives a **repository**:
 
-- **Blobs** → `objects/<name>` — every photo/video, encrypted, under a *salted content address*: an HMAC of the file's hash keyed with a secret per-repository salt (stored inside the encrypted checkpoint). Deterministic, so identical files share one blob and interrupted uploads resume for free — but without the salt the name reveals nothing, and no outsider can hash a known photo to probe whether you have it. No extensions either.
+- **Blobs** → `objects/ab/<name>` (sharded by the address's first two characters, so filesystem-backed storage and local mirrors never face one giant directory) — every photo/video, encrypted, under a *salted content address*: an HMAC of the file's hash keyed with a secret per-repository salt (stored inside the encrypted checkpoint). Deterministic, so identical files share one blob and interrupted uploads resume for free — but without the salt the name reveals nothing, and no outsider can hash a known photo to probe whether you have it. No extensions either.
 - **Checkpoints** → `checkpoints/000001/checkpoint.age` — an encrypted SQLite snapshot of the whole index, starting a *generation*. Each generation is restorable on its own.
 - **Journals** → `checkpoints/000001/journal000001.age`, … — append-only encrypted change logs (adds, deletions, purges). Every journal records the hash of its predecessor, so rollback, deletion, or reordering of history is detectable.
 - **The bucket is the source of truth** — the app's local database is just a cache and can be rebuilt from the repository at any time (Settings → Repository).

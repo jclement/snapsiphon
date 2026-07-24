@@ -12,6 +12,8 @@ struct AssetProcessor {
     /// The repository's blob-naming salt (hex). Blob names are
     /// HMAC(salt, sha256(content)) — deterministic per repo, opaque outside it.
     let saltHex: String
+    /// Whether blob keys use the sharded objects/ab/… layout.
+    let shardedLayout: Bool
 
     /// Where a file currently is in its lane's pipeline (drives the lane UI).
     enum Phase: Equatable, Sendable {
@@ -74,7 +76,7 @@ struct AssetProcessor {
         let plainHash = try Repo.sha256Hex(fileAt: originalURL)
         let uuid = record.uuid.isEmpty ? Repo.blobName(saltHex: saltHex, plaintextHash: plainHash)
                                        : record.uuid
-        let key = client.fullKey(for: Repo.objectKey(uuid: uuid))
+        let key = client.fullKey(for: Repo.objectKey(uuid: uuid, sharded: shardedLayout))
 
         // 3. Skip if the blob is already there: a crashed previous attempt, or
         //    a different asset with identical bytes (dedup). One cheap HEAD.
