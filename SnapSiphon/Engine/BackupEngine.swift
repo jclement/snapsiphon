@@ -1016,14 +1016,7 @@ final class BackupEngine: ObservableObject {
             let md5 = Data(Insecure.MD5.hash(data: data)).base64EncodedString()
             let key = client.fullKey(for: Repo.journalKey(gen: generation, seq: seq))
             do {
-                try await S3Client.withRetries {
-                    // Conditional PUT: providers that honor If-None-Match make
-                    // the LIST→PUT race atomic; those that ignore it are no
-                    // worse than before (the head check narrows the window).
-                    try await client.putObject(fileURL: encURL, key: key,
-                                               contentType: "application/age", contentMD5: md5,
-                                               ifNoneMatch: true)
-                }
+                try await putJournalObject(client: client, fileURL: encURL, key: key, md5: md5)
             } catch S3Error.http(412, _) {
                 // Someone wrote this seq between our check and PUT — possibly
                 // our own earlier timed-out attempt. Next flush's head check
@@ -1045,6 +1038,37 @@ final class BackupEngine: ObservableObject {
         } catch {
             appendLog("Journal write failed (changes stay queued): \(error.localizedDescription)", .error)
             return false
+        }
+    }
+
+    /// Providers that answered 501 NotImplemented to a conditional PUT — B2
+    /// does this ("a header you provided implies functionality that is not
+    /// implemented") rather than ignoring the header. Remembered per endpoint
+    /// so we only pay one failed request, ever.
+    private func conditionalPutUnsupportedKey() -> String {
+        "SnapSiphon.noConditionalPut.\(s3Config.endpoint)"
+    }
+
+    /// PUT a journal file, preferring a conditional (If-None-Match: *) write
+    /// where the provider supports it — that makes the LIST→PUT ownership race
+    /// atomic. On 501 the capability is remembered as absent and the write
+    /// retries plain (the pre-write head check still guards ownership).
+    private func putJournalObject(client: S3Client, fileURL: URL, key: String, md5: String) async throws {
+        let conditional = !UserDefaults.standard.bool(forKey: conditionalPutUnsupportedKey())
+        do {
+            try await S3Client.withRetries {
+                try await client.putObject(fileURL: fileURL, key: key,
+                                           contentType: "application/age", contentMD5: md5,
+                                           ifNoneMatch: conditional)
+            }
+        } catch S3Error.http(501, _) where conditional {
+            UserDefaults.standard.set(true, forKey: conditionalPutUnsupportedKey())
+            appendLog("This provider doesn't support conditional writes — using plain journal writes from now on (the pre-write ownership check still applies).", .info)
+            try await S3Client.withRetries {
+                try await client.putObject(fileURL: fileURL, key: key,
+                                           contentType: "application/age", contentMD5: md5,
+                                           ifNoneMatch: false)
+            }
         }
     }
 
