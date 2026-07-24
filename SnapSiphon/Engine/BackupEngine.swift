@@ -818,7 +818,10 @@ final class BackupEngine: ObservableObject {
                 .filter { !$0.isEmpty }
             let sample = names.isEmpty ? "" :
                 " (\(names.joined(separator: ", "))\(orphans.count > names.count ? ", …" : ""))"
-            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") deleted on device\(sample) — recording tombstone\(orphans.count == 1 ? "" : "s") in the journal. Blobs stay until purged.", .warning)
+            // Gentle wording: under the iOS 16+ Face ID lock, a photo moved to
+            // the Hidden album is indistinguishable from a deleted one — don't
+            // claim "deleted" when we can't know.
+            appendLog("\(orphans.count) photo\(orphans.count == 1 ? "" : "s") no longer visible in the library\(sample) — deleted, or moved to the locked Hidden album. Marked deleted in the journal; the backup stays until purged, and anything that reappears is restored automatically.", .warning)
         }
 
         if resurrected > 0 || !orphans.isEmpty {

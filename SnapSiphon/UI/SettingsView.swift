@@ -95,6 +95,13 @@ struct SettingsView: View {
                                   isOn: Binding(
                                     get: { engine.settings.includeHidden },
                                     set: { engine.settings.backupHiddenPhotos = $0 }))
+                        // The ambiguous state: toggle on, nothing visible.
+                        // iOS gives apps no way to distinguish "empty Hidden
+                        // album" from "Face ID lock is on" — say exactly that.
+                        if engine.settings.includeHidden && engine.hiddenItemCount == 0 {
+                            Text("iOS is currently showing SnapSiphon no hidden items — either your Hidden album is empty, or its Face ID lock is on (apps can't tell which).")
+                                .font(.system(size: 12)).foregroundStyle(.orange)
+                        }
                         Divider().overlay(Theme.hairline)
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
