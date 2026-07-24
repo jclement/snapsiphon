@@ -545,7 +545,7 @@ final class BackupEngine: ObservableObject {
 
         // Enumerate AND index off the main actor so the UI stays live and we can
         // report progress as we go.
-        let outcome: (added: Int, newest: Date?, checked: Int) = await Task.detached(priority: .utility) {
+        let outcome: (added: Int, newest: Date?, checked: Int, hiddenSeen: Int) = await Task.detached(priority: .utility) {
             let infos = photos.enumerate(includePhotos: includePhotos, includeVideos: includeVideos,
                                          since: since, includeHidden: includeHidden)
             var added = 0
@@ -625,7 +625,7 @@ final class BackupEngine: ObservableObject {
                 }
             }
             idx.setHiddenFlags(hidden: hiddenIDs, visible: visibleIDs)
-            return (added, newest, infos.count)
+            return (added, newest, infos.count, hiddenIDs.count)
         }.value
 
         let added = outcome.added
@@ -644,7 +644,10 @@ final class BackupEngine: ObservableObject {
         // This replaces the old user-facing "Deep scan" button.
         if !deep, !favoritesOnly {
             let expected = (includePhotos ? libraryPhotos : 0) + (includeVideos ? libraryVideos : 0)
-            let indexed = index.counts().total
+            // Compare like-for-like: only photo/video rows. Live-clip rows
+            // have no library-count counterpart and once masked genuinely
+            // missing assets (old hidden photos after the lock came off).
+            let indexed = index.indexedPhotoVideoCount()
             if expected > indexed {
                 appendLog("Library has \(Format.count(expected)) eligible items but the index only knows \(Format.count(indexed)) — running a full re-check.", .info)
                 return await runScan(deep: true)
@@ -656,7 +659,13 @@ final class BackupEngine: ObservableObject {
         scanStatus = added == 0
             ? "✓ \(deep ? "Full scan" : "Scan") checked \(Format.count(outcome.checked)) item\(outcome.checked == 1 ? "" : "s") — nothing new, everything already indexed"
             : "✓ \(deep ? "Full scan" : "Scan") checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
-        appendLog("Scan complete — \(added) new item\(added == 1 ? "" : "s") queued.", .success)
+        // Hidden visibility is genuinely murky (iOS 16 Face ID gate), so say
+        // what the scan actually SAW — turns "why isn't it syncing?" into a
+        // one-glance diagnosis.
+        let hiddenNote = includeHidden
+            ? " iOS showed \(outcome.hiddenSeen == 0 ? "no" : Format.count(outcome.hiddenSeen)) hidden item\(outcome.hiddenSeen == 1 ? "" : "s")\(outcome.hiddenSeen == 0 ? " (empty, or Face ID-locked)" : "")."
+            : ""
+        appendLog("Scan complete — \(added) new item\(added == 1 ? "" : "s") queued.\(hiddenNote)", .success)
 
         // Deletions are ALWAYS reconciled (tombstones + resurrections) so
         // restores reflect reality; the toggle only governs whether blobs are

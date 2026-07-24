@@ -324,6 +324,16 @@ final class BackupIndex {
         var totalBytes: Int64 = 0
     }
 
+    /// Rows comparable against PhotoKit's photo/video library counts — used by
+    /// the self-healing full-scan check. Excludes Live-clip rows (mediaType
+    /// 'other', which have no library-count counterpart) so they can't inflate
+    /// the indexed side and mask missing assets.
+    func indexedPhotoVideoCount() -> Int {
+        queue.sync {
+            Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state != 'deleted' AND mediaType IN ('photo','video');"))
+        }
+    }
+
     func counts() -> Counts {
         queue.sync {
             var c = Counts()
