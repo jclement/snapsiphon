@@ -14,6 +14,8 @@ struct AssetProcessor {
     let saltHex: String
     /// Whether blob keys use the sharded objects/ab/… layout.
     let shardedLayout: Bool
+    /// Whether Hidden-album assets may be exported (mirrors the setting).
+    let allowHidden: Bool
 
     /// Where a file currently is in its lane's pipeline (drives the lane UI).
     enum Phase: Equatable, Sendable {
@@ -63,10 +65,12 @@ struct AssetProcessor {
         let exported: PhotoLibrary.Exported
         if AssetRecord.isLiveMotion(record.localIdentifier) {
             exported = try await photos.exportLiveMotion(
-                localIdentifier: AssetRecord.baseIdentifier(record.localIdentifier), to: originalURL)
+                localIdentifier: AssetRecord.baseIdentifier(record.localIdentifier), to: originalURL,
+                allowHidden: allowHidden)
         } else {
             exported = try await photos.exportOriginal(
-                localIdentifier: record.localIdentifier, to: originalURL)
+                localIdentifier: record.localIdentifier, to: originalURL,
+                allowHidden: allowHidden)
         }
         onMeta?(exported.filename, exported.byteSize)
 

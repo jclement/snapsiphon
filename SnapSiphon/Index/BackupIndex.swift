@@ -294,6 +294,18 @@ final class BackupIndex {
         }
     }
 
+    /// Skipped rows whose skip reason is one the caller can re-check (e.g.
+    /// hidden-excluded, asset-gone) — candidates for automatic requeue when a
+    /// scan proves them eligible again.
+    func skippedIdentifiers(reasons: [String]) -> Set<String> {
+        queue.sync {
+            let marks = reasons.map { _ in "?" }.joined(separator: ",")
+            return Set((try? db.query(
+                "SELECT localIdentifier FROM assets WHERE state='skipped' AND lastError IN (\(marks));",
+                reasons.map { .text($0) }) { $0.text(0) }) ?? [])
+        }
+    }
+
     func requeue(_ localIdentifier: String, reason: String) {
         queue.sync {
             db.exec("UPDATE assets SET state='pending', lastError=? WHERE localIdentifier=?;",

@@ -138,11 +138,13 @@ final class PhotoLibrary {
     enum ExportError: Error, LocalizedError {
         case notFound
         case noResource
+        case hiddenExcluded
         case exportFailed(String)
         var errorDescription: String? {
             switch self {
             case .notFound: return "The photo is no longer in the library."
             case .noResource: return "No original file could be found for this item."
+            case .hiddenExcluded: return "This photo is in the Hidden album, which is excluded by settings."
             case .exportFailed(let m): return "Could not export the original: \(m)"
             }
         }
@@ -159,9 +161,13 @@ final class PhotoLibrary {
     /// Write the asset's original resource to `destination`, returning its
     /// filename/size/type. This is where the `PHAssetResource` lookup we skipped
     /// during scanning finally happens — but only for items we actually upload.
-    func exportOriginal(localIdentifier: String, to destination: URL) async throws -> Exported {
-        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
-        guard let asset = fetch.firstObject else { throw ExportError.notFound }
+    /// `allowHidden` gates Hidden-album assets EXPLICITLY: the identifier
+    /// fetch must always include hidden assets (a default fetch silently
+    /// returns nothing for a hidden photo — indistinguishable from deleted),
+    /// then we decide, so "hidden" can never masquerade as "not found".
+    func exportOriginal(localIdentifier: String, to destination: URL,
+                        allowHidden: Bool = true) async throws -> Exported {
+        let asset = try fetchAsset(localIdentifier, allowHidden: allowHidden)
 
         let resources = PHAssetResource.assetResources(for: asset)
         // Prefer the true original (photo/video) resource.
@@ -175,14 +181,23 @@ final class PhotoLibrary {
 
     /// Export a Live Photo's paired motion clip (the ~3 s video that plays on
     /// press). Throws `.noResource` for assets without one.
-    func exportLiveMotion(localIdentifier: String, to destination: URL) async throws -> Exported {
-        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
-        guard let asset = fetch.firstObject else { throw ExportError.notFound }
+    func exportLiveMotion(localIdentifier: String, to destination: URL,
+                          allowHidden: Bool = true) async throws -> Exported {
+        let asset = try fetchAsset(localIdentifier, allowHidden: allowHidden)
         let resources = PHAssetResource.assetResources(for: asset)
         let resource = resources.first { $0.type == .fullSizePairedVideo }
             ?? resources.first { $0.type == .pairedVideo }
         guard let resource else { throw ExportError.noResource }
         return try await writeResource(resource, to: destination)
+    }
+
+    private func fetchAsset(_ localIdentifier: String, allowHidden: Bool) throws -> PHAsset {
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = true
+        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: options)
+        guard let asset = fetch.firstObject else { throw ExportError.notFound }
+        if asset.isHidden && !allowHidden { throw ExportError.hiddenExcluded }
+        return asset
     }
 
     private func writeResource(_ resource: PHAssetResource, to destination: URL) async throws -> Exported {

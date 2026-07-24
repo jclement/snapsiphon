@@ -535,6 +535,10 @@ final class BackupEngine: ObservableObject {
         // One query for everything we already know, then in-memory membership
         // checks — no per-asset database round-trips.
         let known = index.allIdentifiers()
+        // Rows skipped for provably-recheckable reasons: an enumeration that
+        // includes the asset proves it exists and is eligible again (unhidden,
+        // or the Hidden setting flipped on) — requeue on sight.
+        let recheckable = index.skippedIdentifiers(reasons: [Self.skipReasonHidden, Self.skipReasonGone])
         let idx = index
         let startMark = scanMark
         scanChecked = 0
@@ -559,8 +563,16 @@ final class BackupEngine: ObservableObject {
                 // Live Photo motion clips get their own suffixed record —
                 // checked independently of the still, so enabling the toggle
                 // later back-fills clips for already-uploaded stills.
+                if recheckable.contains(info.localIdentifier) {
+                    idx.requeue(info.localIdentifier, reason: "Eligible again")
+                    added += 1
+                }
                 if includeLiveMotion, info.isLivePhoto {
                     let clipID = AssetRecord.liveMotionIdentifier(for: info.localIdentifier)
+                    if recheckable.contains(clipID) {
+                        idx.requeue(clipID, reason: "Eligible again")
+                        added += 1
+                    }
                     if !known.contains(clipID) {
                         idx.upsert(AssetRecord(
                             localIdentifier: clipID,
@@ -719,6 +731,11 @@ final class BackupEngine: ObservableObject {
     private static let repoISO = ISO8601DateFormatter()
 
     // MARK: Fast-scan high-water mark
+
+    /// Skip reasons that scans can prove wrong later (the asset shows up in an
+    /// enumeration) — such rows are re-queued automatically.
+    static let skipReasonHidden = "In Hidden album (excluded)"
+    static let skipReasonGone = "Asset no longer in library"
 
     private static let scanMarkKey = "SnapSiphon.scanMark.v1"
 
@@ -1556,7 +1573,8 @@ final class BackupEngine: ObservableObject {
 
         let processor = AssetProcessor(photos: photos, client: client, recipients: recipients,
                                        tempDir: tempDir, saltHex: ensureRepoSalt(),
-                                       shardedLayout: repoSharded)
+                                       shardedLayout: repoSharded,
+                                       allowHidden: settings.includeHidden)
 
         let draining = drainingTask
         drainingTask = nil
@@ -1847,8 +1865,18 @@ final class BackupEngine: ObservableObject {
             if case PhotoLibrary.ExportError.notFound = error {
                 // Asset is gone from the library; the next scan's cleanup
                 // tombstones or drops the row properly.
-                index.markSkipped(rid, reason: "Asset no longer in library")
+                index.markSkipped(rid, reason: Self.skipReasonGone)
                 endSlot(rid)
+                refreshCounts()
+                return
+            }
+            if case PhotoLibrary.ExportError.hiddenExcluded = error {
+                // Hidden after being queued, with the Hidden-album setting
+                // off. Skipped for now; scans requeue it the moment it turns
+                // eligible again (unhidden, or the setting turned on).
+                index.markSkipped(rid, reason: Self.skipReasonHidden)
+                endSlot(rid)
+                appendLog("Skipped \(record.filename.isEmpty ? "a photo" : record.filename) — it's in the Hidden album, which isn't backed up (Settings → What to back up → Hidden album).", .info)
                 refreshCounts()
                 return
             }
