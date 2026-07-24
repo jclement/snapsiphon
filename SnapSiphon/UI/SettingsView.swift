@@ -518,24 +518,48 @@ struct SettingsView: View {
         return n == 0 ? "Not set" : "\(n) recipient\(n == 1 ? "" : "s")"
     }
 
+    /// Sub-screens hide their contents — so problems inside must surface HERE,
+    /// as an attention badge + one-line explanation on the summary row.
+    private var keyWarning: String? {
+        guard keyManager.isConfigured else { return nil }   // "not set" state covers it
+        if let mine = keyManager.identityRecipient, keyManager.hasIdentity,
+           !keyManager.recipients.contains(mine) {
+            return "This phone's key isn't in the recipient list — re-add it"
+        }
+        if !keyManager.hasIdentity, engine.s3Config.isComplete {
+            return "No secret key on this phone — restores and repository attach need one imported"
+        }
+        return nil
+    }
+
+    private var storageWarning: String? {
+        if engine.repoConflict != nil {
+            return "Repository conflict — backups halted (see Backup tab)"
+        }
+        return nil
+    }
+
     private var setupLinks: some View {
         VStack(spacing: 12) {
             NavigationLink { KeysView() } label: {
                 setupRow(icon: "key.fill",
                          title: "Encryption key",
                          subtitle: keySubtitle,
-                         ok: keyManager.isConfigured)
+                         ok: keyManager.isConfigured,
+                         warning: keyWarning)
             }
             NavigationLink { StorageSetupView() } label: {
                 setupRow(icon: "externaldrive.connected.to.line.below.fill",
                          title: "Storage bucket",
                          subtitle: engine.s3Config.isComplete ? "\(engine.s3Config.bucket) @ \(engine.s3Config.endpoint)" : "Not set",
-                         ok: engine.s3Config.isComplete && S3CredentialStore.hasCredentials)
+                         ok: engine.s3Config.isComplete && S3CredentialStore.hasCredentials,
+                         warning: storageWarning)
             }
         }
     }
 
-    private func setupRow(icon: String, title: String, subtitle: String, ok: Bool) -> some View {
+    private func setupRow(icon: String, title: String, subtitle: String, ok: Bool,
+                          warning: String? = nil) -> some View {
         Card {
             HStack(spacing: 14) {
                 Image(systemName: icon)
@@ -545,10 +569,15 @@ struct SettingsView: View {
                     Text(title).font(Theme.rounded(16, weight: .semibold)).foregroundStyle(Theme.textPrimary)
                     Text(subtitle).font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
                         .lineLimit(1)
+                    if let warning {
+                        Text(warning).font(.system(size: 12)).foregroundStyle(.orange)
+                            .multilineTextAlignment(.leading)
+                    }
                 }
                 Spacer()
-                Image(systemName: ok ? "checkmark.circle.fill" : "circle.dashed")
-                    .foregroundStyle(ok ? .green : Theme.textTertiary)
+                Image(systemName: warning != nil ? "exclamationmark.triangle.fill"
+                                                 : ok ? "checkmark.circle.fill" : "circle.dashed")
+                    .foregroundStyle(warning != nil ? .orange : ok ? .green : Theme.textTertiary)
                 Image(systemName: "chevron.right").font(.system(size: 13)).foregroundStyle(Theme.textTertiary)
             }
         }
