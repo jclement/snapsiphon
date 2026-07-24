@@ -198,6 +198,8 @@ final class BackupEngine: ObservableObject {
             s.videoBytes = 40_200_000_000;  s.videoCount = 611
             s.hiddenVideoBytes = 3_400_000_000; s.hiddenVideoCount = 45
             s.clipBytes = 1_300_000_000;    s.clipCount = 902
+            s.remainingPhotos = 3_054; s.remainingVideos = 1_147
+            s.remainingHiddenPhotos = 138; s.remainingClips = 764
             return s
         }()
         libraryHiddenPhotos = 512

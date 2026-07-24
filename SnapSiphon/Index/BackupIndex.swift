@@ -337,6 +337,13 @@ final class BackupIndex {
         var videoCount = 0
         var hiddenVideoCount = 0
         var clipCount = 0
+        // Not-yet-uploaded (pending/uploading/failed) per kind — what a
+        // running backup still has ahead of it.
+        var remainingPhotos = 0
+        var remainingHiddenPhotos = 0
+        var remainingVideos = 0
+        var remainingHiddenVideos = 0
+        var remainingClips = 0
     }
 
     func storedSegments() -> StoredSegments {
@@ -346,11 +353,19 @@ final class BackupIndex {
                 (db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND \(cond);"),
                  Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='uploaded' AND \(cond);")))
             }
+            func remaining(_ cond: String) -> Int {
+                Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state IN ('pending','uploading','failed') AND \(cond);"))
+            }
             (s.photoBytes, s.photoCount) = bucket("mediaType='photo' AND hidden=0")
             (s.hiddenPhotoBytes, s.hiddenPhotoCount) = bucket("mediaType='photo' AND hidden=1")
             (s.videoBytes, s.videoCount) = bucket("mediaType='video' AND hidden=0")
             (s.hiddenVideoBytes, s.hiddenVideoCount) = bucket("mediaType='video' AND hidden=1")
             (s.clipBytes, s.clipCount) = bucket("mediaType='other'")
+            s.remainingPhotos = remaining("mediaType='photo' AND hidden=0")
+            s.remainingHiddenPhotos = remaining("mediaType='photo' AND hidden=1")
+            s.remainingVideos = remaining("mediaType='video' AND hidden=0")
+            s.remainingHiddenVideos = remaining("mediaType='video' AND hidden=1")
+            s.remainingClips = remaining("mediaType='other'")
             return s
         }
     }

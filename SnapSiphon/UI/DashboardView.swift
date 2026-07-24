@@ -201,15 +201,26 @@ struct DashboardView: View {
         }
     }
 
+    /// Mid-run strip: REMAINING counts per kind — the number that matters
+    /// while lanes are chewing through the queue.
     private var compactLegend: some View {
-        HStack(spacing: 10) {
-            ForEach(legendRows) { row in
+        let s = engine.storedSegments
+        let remaining: [(MediaKind, Int)] = [
+            (.photo, s.remainingPhotos), (.hiddenPhoto, s.remainingHiddenPhotos),
+            (.clip, s.remainingClips), (.video, s.remainingVideos),
+            (.hiddenVideo, s.remainingHiddenVideos),
+        ].filter { $0.1 > 0 }
+        return HStack(spacing: 10) {
+            Text(remaining.isEmpty ? "finishing" : "left")
+                .font(Theme.mono(10)).foregroundStyle(Theme.textTertiary)
+            ForEach(remaining, id: \.0) { kind, count in
                 HStack(spacing: 4) {
-                    RoundedRectangle(cornerRadius: 2).fill(row.kind.color)
+                    RoundedRectangle(cornerRadius: 2).fill(kind.color)
                         .frame(width: 8, height: 8)
-                    Text(Format.count(row.count))
+                    Text(Format.count(count))
                         .font(Theme.mono(11)).foregroundStyle(Theme.textSecondary)
                         .lineLimit(1)
+                        .contentTransition(.numericText())
                 }
             }
         }
