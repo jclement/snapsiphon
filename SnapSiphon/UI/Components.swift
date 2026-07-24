@@ -58,6 +58,43 @@ struct GaugePill: View {
     }
 }
 
+/// The five kinds of stored content, with ONE color definition shared by the
+/// donut segments, the legend, and the upload lanes — they can never drift.
+enum MediaKind: String, CaseIterable, Identifiable {
+    case photo, hiddenPhoto, clip, video, hiddenVideo
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .photo: return "Photos"
+        case .hiddenPhoto: return "Hidden photos"
+        case .clip: return "Live clips"
+        case .video: return "Videos"
+        case .hiddenVideo: return "Hidden videos"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .photo: return Theme.teal
+        case .hiddenPhoto: return Theme.teal.opacity(0.38)
+        case .clip: return Color.cyan.opacity(0.85)
+        case .video: return Theme.violet
+        case .hiddenVideo: return Theme.violet.opacity(0.38)
+        }
+    }
+
+    var isVideo: Bool { self == .video || self == .hiddenVideo || self == .clip }
+
+    static func of(record: AssetRecord) -> MediaKind {
+        if AssetRecord.isLiveMotion(record.localIdentifier) { return .clip }
+        switch record.mediaType {
+        case .video: return record.hidden ? .hiddenVideo : .video
+        default: return record.hidden ? .hiddenPhoto : .photo
+        }
+    }
+}
+
 /// The dashboard hero. Two concentric layers:
 /// - **Outer ring:** overall file-count progress (uploaded / total files).
 /// - **Inner donut:** stored bytes segmented by kind — photos, Live Photo
@@ -67,10 +104,12 @@ struct GaugePill: View {
 struct MediaBackupRing: View {
     /// One donut wedge. Fainter colors = hidden portions.
     struct Segment: Identifiable {
-        let id: String
-        let label: String
+        let kind: MediaKind
         let bytes: Int64
-        let color: Color
+        let count: Int
+        var id: String { kind.id }
+        var label: String { kind.label }
+        var color: Color { kind.color }
     }
 
     let fileProgress: Double     // 0…1, outer ring
@@ -80,15 +119,15 @@ struct MediaBackupRing: View {
     var outerWidth: CGFloat = 12
     var innerWidth: CGFloat = 20
 
-    /// Canonical segment palette shared with the dashboard legend.
+    /// Canonical segments shared with the dashboard legend.
     static func build(_ s: BackupIndex.StoredSegments) -> [Segment] {
         [
-            Segment(id: "photo", label: "Photos", bytes: s.photoBytes, color: Theme.teal),
-            Segment(id: "hphoto", label: "Hidden photos", bytes: s.hiddenPhotoBytes, color: Theme.teal.opacity(0.38)),
-            Segment(id: "clip", label: "Live clips", bytes: s.clipBytes, color: Color.cyan.opacity(0.85)),
-            Segment(id: "video", label: "Videos", bytes: s.videoBytes, color: Theme.violet),
-            Segment(id: "hvideo", label: "Hidden videos", bytes: s.hiddenVideoBytes, color: Theme.violet.opacity(0.38)),
-        ].filter { $0.bytes > 0 }
+            Segment(kind: .photo, bytes: s.photoBytes, count: s.photoCount),
+            Segment(kind: .hiddenPhoto, bytes: s.hiddenPhotoBytes, count: s.hiddenPhotoCount),
+            Segment(kind: .clip, bytes: s.clipBytes, count: s.clipCount),
+            Segment(kind: .video, bytes: s.videoBytes, count: s.videoCount),
+            Segment(kind: .hiddenVideo, bytes: s.hiddenVideoBytes, count: s.hiddenVideoCount),
+        ].filter { $0.bytes > 0 || $0.count > 0 }
     }
 
     var body: some View {
@@ -167,15 +206,16 @@ struct UploadRow: View {
     let filename: String
     let byteSize: Int64
     let progress: Double
-    let isVideo: Bool
+    let kind: MediaKind          // lane color = donut segment color
     var phase: AssetProcessor.Phase = .uploading
 
     private var phaseIcon: (name: String, color: Color) {
         switch phase {
         case .exporting: return ("icloud.and.arrow.down", .cyan)
         case .encrypting: return ("lock.fill", .orange)
-        case .uploading: return (isVideo ? "video.fill" : "photo.fill",
-                                 isVideo ? Theme.violet : Theme.teal)
+        case .uploading:
+            let name = kind == .clip ? "livephoto.play" : (kind.isVideo ? "video.fill" : "photo.fill")
+            return (name, kind.color)
         }
     }
 
@@ -183,7 +223,7 @@ struct UploadRow: View {
         ZStack(alignment: .leading) {
             GeometryReader { geo in
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(isVideo ? Theme.violet.opacity(0.28) : Theme.teal.opacity(0.28))
+                    .fill(kind.color.opacity(0.30))
                     .frame(width: max(6, geo.size.width * max(0, min(progress, 1))))
                     .animation(.linear(duration: 0.25), value: progress)
             }

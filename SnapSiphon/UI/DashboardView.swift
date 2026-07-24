@@ -120,31 +120,75 @@ struct DashboardView: View {
         .padding(.bottom, 10)
     }
 
-    // Legend for the ring: inner donut = stored bytes split photos/videos.
+    // Legend for the ring. Idle: a vertical, column-aligned table — one row
+    // per kind, colors matching the donut wedges. While lanes are on screen,
+    // it collapses to a compact single line to leave room for the streams.
     private var mediaLegend: some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 18) {
-                legendItem(color: Theme.teal, label: "Photos",
-                           count: engine.uploadedPhotos, total: engine.libraryPhotos,
-                           bytes: engine.storedPhotoBytes)
-                legendItem(color: Theme.violet, label: "Videos",
-                           count: engine.uploadedVideos, total: engine.libraryVideos,
-                           bytes: engine.storedVideoBytes)
+        Group {
+            if isRunning || engine.uploadLanes.contains(where: { $0 != nil }) {
+                compactLegend
+            } else {
+                verticalLegend
             }
-            // Mini-chips for the extra donut segments (only ones that exist),
-            // so every wedge color is identifiable at a glance.
-            let extras = MediaBackupRing.build(engine.storedSegments)
-                .filter { !["photo", "video"].contains($0.id) }
-            if !extras.isEmpty {
-                HStack(spacing: 10) {
-                    ForEach(extras) { seg in
-                        HStack(spacing: 4) {
-                            RoundedRectangle(cornerRadius: 2).fill(seg.color)
-                                .frame(width: 8, height: 8)
-                            Text("\(seg.label.lowercased()) \(Format.bytes(seg.bytes))")
-                                .font(Theme.mono(10)).foregroundStyle(Theme.textTertiary)
-                                .lineLimit(1).minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private struct LegendRow: Identifiable {
+        let kind: MediaKind
+        let count: Int
+        let total: Int?     // library denominator where known
+        let bytes: Int64
+        var id: String { kind.id }
+    }
+
+    private var legendRows: [LegendRow] {
+        let s = engine.storedSegments
+        let hiddenIncluded = engine.settings.includeHidden
+        var rows: [LegendRow] = [
+            LegendRow(kind: .photo, count: s.photoCount,
+                      total: max(0, engine.libraryPhotos - (hiddenIncluded ? engine.libraryHiddenPhotos : 0)),
+                      bytes: s.photoBytes),
+            LegendRow(kind: .hiddenPhoto, count: s.hiddenPhotoCount,
+                      total: engine.libraryHiddenPhotos, bytes: s.hiddenPhotoBytes),
+            LegendRow(kind: .clip, count: s.clipCount, total: nil, bytes: s.clipBytes),
+            LegendRow(kind: .video, count: s.videoCount,
+                      total: max(0, engine.libraryVideos - (hiddenIncluded ? engine.libraryHiddenVideos : 0)),
+                      bytes: s.videoBytes),
+            LegendRow(kind: .hiddenVideo, count: s.hiddenVideoCount,
+                      total: engine.libraryHiddenVideos, bytes: s.hiddenVideoBytes),
+        ]
+        // Photos/Videos always show; the rest only when they have something
+        // stored or something to do.
+        rows = rows.filter { $0.kind == .photo || $0.kind == .video || $0.count > 0 || ($0.total ?? 0) > 0 }
+        // Hidden rows with the toggle off would show 0/N forever — drop them
+        // unless something is actually stored (the caption covers exclusion).
+        if !hiddenIncluded {
+            rows.removeAll { ($0.kind == .hiddenPhoto || $0.kind == .hiddenVideo) && $0.count == 0 }
+        }
+        return rows
+    }
+
+    private var verticalLegend: some View {
+        VStack(spacing: 4) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                ForEach(legendRows) { row in
+                    GridRow {
+                        HStack(spacing: 6) {
+                            RoundedRectangle(cornerRadius: 2).fill(row.kind.color)
+                                .frame(width: 9, height: 9)
+                            Text(row.kind.label)
+                                .font(Theme.rounded(13, weight: .semibold))
+                                .foregroundStyle(Theme.textPrimary)
                         }
+                        .gridColumnAlignment(.leading)
+                        Text(row.total.map { "\(Format.count(row.count))/\(Format.count($0))" }
+                             ?? Format.count(row.count))
+                            .font(Theme.mono(11)).foregroundStyle(Theme.textSecondary)
+                            .gridColumnAlignment(.trailing)
+                        Text(Format.bytes(row.bytes))
+                            .font(Theme.mono(11)).foregroundStyle(Theme.textTertiary)
+                            .gridColumnAlignment(.trailing)
                     }
                 }
             }
@@ -155,19 +199,18 @@ struct DashboardView: View {
                     .foregroundStyle(Theme.textTertiary)
             }
         }
-        .frame(maxWidth: .infinity)
     }
 
-    private func legendItem(color: Color, label: String, count: Int, total: Int, bytes: Int64) -> some View {
-        HStack(spacing: 7) {
-            Circle().fill(color).frame(width: 9, height: 9)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text(label).font(Theme.rounded(13, weight: .semibold)).foregroundStyle(Theme.textPrimary)
-                    Text(total > 0 ? "\(Format.count(count))/\(Format.count(total))" : Format.count(count))
+    private var compactLegend: some View {
+        HStack(spacing: 10) {
+            ForEach(legendRows) { row in
+                HStack(spacing: 4) {
+                    RoundedRectangle(cornerRadius: 2).fill(row.kind.color)
+                        .frame(width: 8, height: 8)
+                    Text(Format.count(row.count))
                         .font(Theme.mono(11)).foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1)
                 }
-                Text(Format.bytes(bytes)).font(Theme.mono(10)).foregroundStyle(Theme.textTertiary)
             }
         }
     }
@@ -265,9 +308,9 @@ struct DashboardView: View {
             ForEach(Array(lanes.enumerated()), id: \.offset) { _, slot in
                 if let slot {
                     UploadRow(filename: slot.filename, byteSize: slot.byteSize,
-                              progress: slot.progress, isVideo: slot.isVideo, phase: slot.phase)
+                              progress: slot.progress, kind: slot.kind, phase: slot.phase)
                 } else {
-                    UploadRow(filename: "idle", byteSize: 0, progress: 0, isVideo: false)
+                    UploadRow(filename: "idle", byteSize: 0, progress: 0, kind: .photo)
                         .opacity(0.35)
                 }
             }

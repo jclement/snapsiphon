@@ -332,16 +332,25 @@ final class BackupIndex {
         var videoBytes: Int64 = 0
         var hiddenVideoBytes: Int64 = 0
         var clipBytes: Int64 = 0
+        var photoCount = 0
+        var hiddenPhotoCount = 0
+        var videoCount = 0
+        var hiddenVideoCount = 0
+        var clipCount = 0
     }
 
     func storedSegments() -> StoredSegments {
         queue.sync {
             var s = StoredSegments()
-            s.photoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='photo' AND hidden=0;")
-            s.hiddenPhotoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='photo' AND hidden=1;")
-            s.videoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='video' AND hidden=0;")
-            s.hiddenVideoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='video' AND hidden=1;")
-            s.clipBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='other';")
+            func bucket(_ cond: String) -> (Int64, Int) {
+                (db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND \(cond);"),
+                 Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='uploaded' AND \(cond);")))
+            }
+            (s.photoBytes, s.photoCount) = bucket("mediaType='photo' AND hidden=0")
+            (s.hiddenPhotoBytes, s.hiddenPhotoCount) = bucket("mediaType='photo' AND hidden=1")
+            (s.videoBytes, s.videoCount) = bucket("mediaType='video' AND hidden=0")
+            (s.hiddenVideoBytes, s.hiddenVideoCount) = bucket("mediaType='video' AND hidden=1")
+            (s.clipBytes, s.clipCount) = bucket("mediaType='other'")
             return s
         }
     }
@@ -486,6 +495,7 @@ final class BackupIndex {
             lastError: r.textOrNil(8),
             plaintextHash: r.textOrNil(9),
             ciphertextHash: r.textOrNil(10),
-            journaled: r.int(11) == 1)
+            journaled: r.int(11) == 1,
+            hidden: r.int(14) == 1)   // 12 deletedAt, 13 localSeen (not carried)
     }
 }

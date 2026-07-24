@@ -43,8 +43,9 @@ final class BackupEngine: ObservableObject {
         var filename: String
         var progress: Double
         var byteSize: Int64       // original media size
-        var isVideo: Bool
+        var kind: MediaKind       // colors the lane to match the donut
         var phase: AssetProcessor.Phase = .exporting
+        var isVideo: Bool { kind.isVideo }
     }
     @Published private(set) var bytesPerSecond: Double = 0
     @Published private(set) var sessionUploaded: Int = 0
@@ -62,6 +63,8 @@ final class BackupEngine: ObservableObject {
     /// How many items live in the Hidden album — shown on the dashboard so
     /// "what's excluded" (or included) is never invisible.
     @Published private(set) var hiddenItemCount = 0
+    @Published private(set) var libraryHiddenPhotos = 0
+    @Published private(set) var libraryHiddenVideos = 0
     @Published private(set) var uploadedPhotos = 0
     @Published private(set) var uploadedVideos = 0
     @Published private(set) var storedPhotoBytes: Int64 = 0
@@ -190,21 +193,24 @@ final class BackupEngine: ObservableObject {
         storedVideoBytes = 43_600_000_000    // ~44 GB videos
         storedSegments = {
             var s = BackupIndex.StoredSegments()
-            s.photoBytes = 24_100_000_000
-            s.hiddenPhotoBytes = 2_400_000_000
-            s.videoBytes = 40_200_000_000
-            s.hiddenVideoBytes = 3_400_000_000
-            s.clipBytes = 1_300_000_000
+            s.photoBytes = 24_100_000_000;  s.photoCount = 7_612
+            s.hiddenPhotoBytes = 2_400_000_000; s.hiddenPhotoCount = 374
+            s.videoBytes = 40_200_000_000;  s.videoCount = 611
+            s.hiddenVideoBytes = 3_400_000_000; s.hiddenVideoCount = 45
+            s.clipBytes = 1_300_000_000;    s.clipCount = 902
             return s
         }()
+        libraryHiddenPhotos = 512
+        libraryHiddenVideos = 61
+        hiddenItemCount = 573
         lastBackupDate = Date().addingTimeInterval(-42)
 
         if mode == "uploading" {
             phase = .running
             uploadLanes = [
-                UploadSlot(id: "1", filename: "IMG_4821.HEIC", progress: 0.62, byteSize: 4_200_000, isVideo: false, phase: .uploading),
-                UploadSlot(id: "2", filename: "IMG_4822.MOV", progress: 0.28, byteSize: 214_000_000, isVideo: true, phase: .encrypting),
-                UploadSlot(id: "3", filename: "IMG_4823.HEIC", progress: 0, byteSize: 3_900_000, isVideo: false, phase: .exporting),
+                UploadSlot(id: "1", filename: "IMG_4821.HEIC", progress: 0.62, byteSize: 4_200_000, kind: .photo, phase: .uploading),
+                UploadSlot(id: "2", filename: "IMG_4822.MOV", progress: 0.28, byteSize: 214_000_000, kind: .video, phase: .encrypting),
+                UploadSlot(id: "3", filename: "IMG_4823.MOV", progress: 0.11, byteSize: 2_100_000, kind: .clip, phase: .uploading),
             ]
             sessionUploaded = 143
             sessionBytes = 2_410_000_000
@@ -430,15 +436,18 @@ final class BackupEngine: ObservableObject {
         let photos = self.photos
         let cutoff = settings.backupCutoff
         let includeHidden = settings.includeHidden
-        let (counts, hidden) = await Task.detached(priority: .utility) { () -> ((photos: Int, videos: Int), Int) in
+        let (counts, hiddenP, hiddenV) = await Task.detached(priority: .utility) { () -> ((photos: Int, videos: Int), Int, Int) in
             let with = photos.libraryCounts(since: cutoff, includeHidden: true)
             let without = photos.libraryCounts(since: cutoff, includeHidden: false)
-            let hidden = max(0, (with.photos + with.videos) - (without.photos + without.videos))
-            return (includeHidden ? with : without, hidden)
+            return (includeHidden ? with : without,
+                    max(0, with.photos - without.photos),
+                    max(0, with.videos - without.videos))
         }.value
         libraryPhotos = counts.photos
         libraryVideos = counts.videos
-        hiddenItemCount = hidden
+        libraryHiddenPhotos = hiddenP
+        libraryHiddenVideos = hiddenV
+        hiddenItemCount = hiddenP + hiddenV
     }
 
     // MARK: Permissions
@@ -1578,7 +1587,7 @@ final class BackupEngine: ObservableObject {
                               filename: record.filename.isEmpty ? "Preparing…" : record.filename,
                               progress: 0,
                               byteSize: record.byteSize,
-                              isVideo: record.mediaType == .video)
+                              kind: MediaKind.of(record: record))
         // Claim the first idle lane; grow only if somehow all are busy.
         if let i = uploadLanes.firstIndex(where: { $0 == nil }) {
             uploadLanes[i] = slot

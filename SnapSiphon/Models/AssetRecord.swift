@@ -33,6 +33,9 @@ struct AssetRecord: Identifiable, Codable, Equatable {
     /// journal in the bucket. Uncommitted uploads are re-journaled next flush;
     /// if the cache is lost first, their blobs are ignorable orphans.
     var journaled: Bool = false
+    /// Hidden-album membership (read-only mirror; the scan refreshes the
+    /// underlying column in batches — upserts never write it).
+    var hidden: Bool = false
 
     var id: String { localIdentifier }
 
