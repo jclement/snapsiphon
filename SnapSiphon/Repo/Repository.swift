@@ -71,6 +71,10 @@ enum Repo {
         var plaintextHash: String? = nil    // sha256 hex of the original file
         var ciphertextHash: String? = nil   // sha256 hex of the stored blob
         var createdAt: String? = nil        // ISO-8601 asset capture date
+        /// True when the asset lives in the Hidden album. Repository-level so
+        /// hidden-ness survives cache reloads — a hidden item disappearing
+        /// from fetches (Face ID lock re-enabled) must never read as deletion.
+        var hidden: Bool? = nil
         var at: String                      // ISO-8601 event time
     }
 

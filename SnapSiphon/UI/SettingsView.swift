@@ -21,6 +21,7 @@ struct SettingsView: View {
     @State private var showReloadConfirm = false
     @State private var showPurgeConfirm = false
     @State private var purgePendingCount = 0
+    @State private var showHiddenZeroAlert = false
 
     /// Initial cutoff when the toggle is first enabled: Jan 1 2000, i.e.
     /// "everything" — predates any phone photo library.
@@ -90,14 +91,26 @@ struct SettingsView: View {
                                     get: { engine.settings.includeLiveMotion },
                                     set: { engine.settings.backupLivePhotoMovies = $0 }))
                         Divider().overlay(Theme.hairline)
-                        ToggleRow(title: "Hidden album",
-                                  subtitle: "Also back up photos in the Hidden album (everything is encrypted either way). ⚠︎ iOS only shows the Hidden album to apps when its Face ID lock is OFF (Settings → Photos → Use Face ID) — with the lock on, iOS hides these photos from SnapSiphon entirely, whatever this toggle says.",
+                        ToggleRow(title: engine.hiddenItemCount > 0
+                                    ? "Hidden album (\(Format.count(engine.hiddenItemCount)) item\(engine.hiddenItemCount == 1 ? "" : "s"))"
+                                    : "Hidden album",
+                                  subtitle: "Also back up photos in the Hidden album (everything is encrypted either way). Requires the album's Face ID lock to be OFF while backing up (Settings → Photos → Use Face ID).",
                                   isOn: Binding(
                                     get: { engine.settings.includeHidden },
-                                    set: { engine.settings.backupHiddenPhotos = $0 }))
+                                    set: { on in
+                                        // Enabling while iOS reports zero is
+                                        // almost always the Face ID lock —
+                                        // explain instead of silently doing
+                                        // nothing.
+                                        if on && engine.hiddenItemCount == 0 { showHiddenZeroAlert = true }
+                                        engine.settings.backupHiddenPhotos = on
+                                    }))
+                        .alert("iOS is reporting zero hidden items", isPresented: $showHiddenZeroAlert) {
+                            Button("OK") {}
+                        } message: {
+                            Text("Either you have nothing hidden, or the Hidden album's Face ID lock is on — iOS hides those photos from apps entirely. To back them up: Settings → Photos → turn OFF \"Use Face ID\", run a backup, then turn it back on. Once backed up, re-locking never deletes their backups.")
+                        }
                         // The ambiguous state: toggle on, nothing visible.
-                        // iOS gives apps no way to distinguish "empty Hidden
-                        // album" from "Face ID lock is on" — say exactly that.
                         if engine.settings.includeHidden && engine.hiddenItemCount == 0 {
                             Text("iOS is currently showing SnapSiphon no hidden items — either your Hidden album is empty, or its Face ID lock is on (apps can't tell which).")
                                 .font(.system(size: 12)).foregroundStyle(.orange)
@@ -444,6 +457,9 @@ struct SettingsView: View {
             }
             .background(Theme.canvas.ignoresSafeArea())
             .navigationBarHidden(true)
+            // Keep the Hidden-album count fresh (it can change any time the
+            // user flips the iOS Face ID lock).
+            .task { await engine.refreshLibraryCounts() }
             .alert("Restore script", isPresented: $showRestoreScriptWarning) {
                 Button("Cancel", role: .cancel) {}
                 Button("Without secrets") {

@@ -87,14 +87,14 @@ final class BackupIndex {
         queue.sync {
             db.exec("""
                 INSERT INTO assets
-                    (localIdentifier, uuid, state, mediaType, filename, byteSize, createdAt, uploadedAt, lastError, plaintextHash, ciphertextHash, journaled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (localIdentifier, uuid, state, mediaType, filename, byteSize, createdAt, uploadedAt, lastError, plaintextHash, ciphertextHash, journaled, hidden)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(localIdentifier) DO UPDATE SET
                     uuid=excluded.uuid, state=excluded.state, mediaType=excluded.mediaType,
                     filename=excluded.filename, byteSize=excluded.byteSize, createdAt=excluded.createdAt,
                     uploadedAt=excluded.uploadedAt, lastError=excluded.lastError,
                     plaintextHash=excluded.plaintextHash, ciphertextHash=excluded.ciphertextHash,
-                    journaled=excluded.journaled;
+                    journaled=excluded.journaled, hidden=excluded.hidden;
                 """,
                 [
                     .text(record.localIdentifier),
@@ -109,6 +109,7 @@ final class BackupIndex {
                     .optText(record.plaintextHash),
                     .optText(record.ciphertextHash),
                     .int(record.journaled ? 1 : 0),
+                    .int(record.hidden ? 1 : 0),
                 ])
         }
     }
@@ -225,10 +226,12 @@ final class BackupIndex {
     }
 
     /// Uploaded rows this phone has actually seen locally — the only rows
-    /// deletion reconciliation may tombstone.
+    /// deletion reconciliation may tombstone. Hidden rows are exempt: a hidden
+    /// item vanishing from fetches usually means the Hidden album's Face ID
+    /// lock came back on, not deletion — never tombstone on that signal.
     func locallySeenUploadedPairs() -> [(id: String, uuid: String)] {
         queue.sync {
-            (try? db.query("SELECT localIdentifier, uuid FROM assets WHERE state='uploaded' AND localSeen=1;", []) {
+            (try? db.query("SELECT localIdentifier, uuid FROM assets WHERE state='uploaded' AND localSeen=1 AND hidden=0;", []) {
                 (id: $0.text(0), uuid: $0.text(1))
             }) ?? []
         }
@@ -515,7 +518,8 @@ final class BackupIndex {
                     lastError: nil,
                     plaintextHash: e.plaintextHash,
                     ciphertextHash: e.ciphertextHash,
-                    journaled: true)
+                    journaled: true,
+                    hidden: e.hidden ?? false)
                 upsert(rec)
             case .delete:
                 if let id = e.localIdentifier {

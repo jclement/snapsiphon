@@ -1099,6 +1099,7 @@ final class BackupEngine: ObservableObject {
                        plaintextHash: r.plaintextHash,
                        ciphertextHash: r.ciphertextHash,
                        createdAt: r.createdAt.map { iso.string(from: $0) },
+                       hidden: r.hidden ? true : nil,
                        at: at)
         }
         entries.append(contentsOf: extra)
