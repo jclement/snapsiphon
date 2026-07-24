@@ -187,6 +187,12 @@ struct SettingsView: View {
                         ToggleRow(title: "Keep screen on",
                                   subtitle: "Prevent auto-lock while uploading.",
                                   isOn: $engine.settings.keepScreenOnWhileUploading)
+                        Divider().overlay(Theme.hairline)
+                        ToggleRow(title: "Pew pew mode",
+                                  subtitle: "Tiny synthesized sound effects for every step — a download blip, an encrypt zzt, an upload pew, a happy ding per finished file. Eight parallel lanes become a small arcade. Respects the silent switch; mixes politely with music.",
+                                  isOn: Binding(
+                                    get: { engine.settings.pewPew },
+                                    set: { engine.settings.pewPewMode = $0 }))
                     }
 
                     knobGroup("Deletions") {

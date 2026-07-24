@@ -35,6 +35,10 @@ struct BackupSettings: Codable, Equatable {
     // Device behaviour
     var keepScreenOnWhileUploading: Bool = true
     var runInLowPowerMode: Bool = false
+    /// Pew pew mode: synthesized sound effects for every pipeline event.
+    /// A full-parallel backup becomes a tiny arcade. Off by default.
+    var pewPewMode: Bool? = nil
+    var pewPew: Bool { pewPewMode ?? false }
 
     // Housekeeping
     var autoStartOnLaunch: Bool = false

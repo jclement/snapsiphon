@@ -114,6 +114,7 @@ final class BackupEngine: ObservableObject {
             if settings.backupCutoff != oldValue.backupCutoff {
                 Task { await self.refreshLibraryCounts() }
             }
+            PewPew.shared.enabled = settings.pewPew
         }
     }
     @Published var s3Config: S3Config { didSet { s3Config.save() } }
@@ -173,6 +174,7 @@ final class BackupEngine: ObservableObject {
         }
         registerBackgroundTask()
         rescheduleReminder(force: false)
+        PewPew.shared.enabled = settings.pewPew
     }
 
     #if DEBUG
@@ -1135,6 +1137,7 @@ final class BackupEngine: ObservableObject {
             if deletes > 0 { parts.append("\(deletes) deleted") }
             if purges > 0 { parts.append("\(purges) purged") }
             appendLog("Journal \(generation)/\(seq) committed — \(parts.isEmpty ? "\(entries.count) changes" : parts.joined(separator: " · ")).", .info)
+            PewPew.shared.play(.journal)
             // Compaction: enough journals → roll a fresh self-contained
             // generation (checkpoint carries the whole state). Deferred during
             // a purge flush so the snapshot never captures rows the caller is
@@ -1215,6 +1218,7 @@ final class BackupEngine: ObservableObject {
             }
             setRepoPosition(generation: generation, nextSeq: 1, lastHash: digests.ciphertextSHA256)
             appendLog("Checkpoint written — generation \(generation) begins.", .success)
+            PewPew.shared.play(.checkpoint)
             return true
         } catch {
             appendLog("Checkpoint write failed: \(error.localizedDescription)", .error)
@@ -1664,7 +1668,14 @@ final class BackupEngine: ObservableObject {
         guard let i = uploadLanes.firstIndex(where: { $0?.id == id }) else { return }
         if let filename { uploadLanes[i]?.filename = filename }
         if let byteSize { uploadLanes[i]?.byteSize = byteSize }
-        if let phase { uploadLanes[i]?.phase = phase }
+        if let phase, uploadLanes[i]?.phase != phase {
+            uploadLanes[i]?.phase = phase
+            switch phase {
+            case .exporting: PewPew.shared.play(.export)
+            case .encrypting: PewPew.shared.play(.encrypt)
+            case .uploading: PewPew.shared.play(.upload)
+            }
+        }
         if let progress, let slot = uploadLanes[i] {
             // Feed the throughput meter from byte-level progress, not file
             // completions — a single long video used to starve the 5s window
@@ -1849,6 +1860,7 @@ final class BackupEngine: ObservableObject {
             }
 
             endSlot(rid)
+            PewPew.shared.play(result.alreadyPresent ? .dedup : .done)
             consecutiveTransportFailures = 0
             sessionUploaded += 1
             if !result.alreadyPresent {
@@ -1901,6 +1913,7 @@ final class BackupEngine: ObservableObject {
             index.markFailed(rid, error: hadVerify ? "Verify: retry — \(reason)" : reason)
             endSlot(rid)
             if !cancelled {
+                PewPew.shared.play(.fail)
                 appendLog("Failed \(record.filename): \(error.localizedDescription)", .error)
             }
         }
