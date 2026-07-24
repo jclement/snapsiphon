@@ -60,16 +60,36 @@ struct GaugePill: View {
 
 /// The dashboard hero. Two concentric layers:
 /// - **Outer ring:** overall file-count progress (uploaded / total files).
-/// - **Inner donut:** how the stored bytes split between photos and videos.
+/// - **Inner donut:** stored bytes segmented by kind — photos, Live Photo
+///   clips, videos, with fainter shades for their Hidden-album portions.
+///   Squared (butt-capped) segment ends with thin gaps, pie-instrument style.
 /// Centre shows the overall backed-up percentage.
 struct MediaBackupRing: View {
+    /// One donut wedge. Fainter colors = hidden portions.
+    struct Segment: Identifiable {
+        let id: String
+        let label: String
+        let bytes: Int64
+        let color: Color
+    }
+
     let fileProgress: Double     // 0…1, outer ring
-    let photoBytes: Int64        // inner donut segment
-    let videoBytes: Int64
+    let segments: [Segment]
     let centerTitle: String
 
     var outerWidth: CGFloat = 12
     var innerWidth: CGFloat = 20
+
+    /// Canonical segment palette shared with the dashboard legend.
+    static func build(_ s: BackupIndex.StoredSegments) -> [Segment] {
+        [
+            Segment(id: "photo", label: "Photos", bytes: s.photoBytes, color: Theme.teal),
+            Segment(id: "hphoto", label: "Hidden photos", bytes: s.hiddenPhotoBytes, color: Theme.teal.opacity(0.38)),
+            Segment(id: "clip", label: "Live clips", bytes: s.clipBytes, color: Color.cyan.opacity(0.85)),
+            Segment(id: "video", label: "Videos", bytes: s.videoBytes, color: Theme.violet),
+            Segment(id: "hvideo", label: "Hidden videos", bytes: s.hiddenVideoBytes, color: Theme.violet.opacity(0.38)),
+        ].filter { $0.bytes > 0 }
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -97,23 +117,23 @@ struct MediaBackupRing: View {
 
     private let top = -Double.pi / 2
 
-    /// Inner donut: solid segments sized by stored bytes per type.
+    /// Inner donut: squared-off segments sized by stored bytes per kind, with
+    /// a thin gap between neighbours. Hidden portions render fainter.
     private func drawInner(_ ctx: GraphicsContext, center: CGPoint, radius: CGFloat) {
-        let total = photoBytes + videoBytes
+        let live = segments.filter { $0.bytes > 0 }
+        let total = live.reduce(Int64(0)) { $0 + $1.bytes }
         guard total > 0 else {
-            arc(ctx, center, radius, from: top, to: top + 2 * .pi, .color(Theme.surfaceHi), innerWidth)
+            arc(ctx, center, radius, from: top, to: top + 2 * .pi, .color(Theme.surfaceHi), innerWidth, cap: .butt)
             return
         }
-        let both = photoBytes > 0 && videoBytes > 0
-        let gap = both ? 0.09 : 0.0
-        let available = 2 * .pi - (both ? 2 * gap : 0)
-        let photoSweep = available * Double(photoBytes) / Double(total)
-        if photoBytes > 0 {
-            arc(ctx, center, radius, from: top, to: top + photoSweep, .color(Theme.teal), innerWidth)
-        }
-        if videoBytes > 0 {
-            let b0 = top + (photoBytes > 0 ? photoSweep + gap : 0)
-            arc(ctx, center, radius, from: b0, to: b0 + (available - photoSweep), .color(Theme.violet), innerWidth)
+        let gap = live.count > 1 ? 0.045 : 0.0
+        let available = 2 * .pi - gap * Double(live.count)
+        var cursor = top
+        for segment in live {
+            let sweep = available * Double(segment.bytes) / Double(total)
+            arc(ctx, center, radius, from: cursor, to: cursor + sweep,
+                .color(segment.color), innerWidth, cap: .butt)
+            cursor += sweep + gap
         }
     }
 
@@ -130,11 +150,12 @@ struct MediaBackupRing: View {
     }
 
     private func arc(_ ctx: GraphicsContext, _ center: CGPoint, _ radius: CGFloat,
-                     from: Double, to: Double, _ shading: GraphicsContext.Shading, _ width: CGFloat) {
+                     from: Double, to: Double, _ shading: GraphicsContext.Shading, _ width: CGFloat,
+                     cap: CGLineCap = .round) {
         var path = Path()
         path.addArc(center: center, radius: radius,
                     startAngle: .radians(from), endAngle: .radians(to), clockwise: false)
-        ctx.stroke(path, with: shading, style: StrokeStyle(lineWidth: width, lineCap: .round))
+        ctx.stroke(path, with: shading, style: StrokeStyle(lineWidth: width, lineCap: cap))
     }
 }
 

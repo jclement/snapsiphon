@@ -46,6 +46,7 @@ final class PhotoLibrary {
         let creationDate: Date?
         let isFavorite: Bool
         let isLivePhoto: Bool
+        let isHidden: Bool
     }
 
     /// Enumerate the library honouring the media-type filters, oldest-first.
@@ -93,7 +94,8 @@ final class PhotoLibrary {
                 mediaType: mediaType,
                 creationDate: asset.creationDate,
                 isFavorite: asset.isFavorite,
-                isLivePhoto: asset.mediaSubtypes.contains(.photoLive)))
+                isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
+                isHidden: asset.isHidden))
         }
         return infos
     }

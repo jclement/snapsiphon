@@ -101,8 +101,7 @@ struct DashboardView: View {
             // The ring eats the remaining vertical space so it stays the hero.
             MediaBackupRing(
                 fileProgress: overallProgress,
-                photoBytes: engine.storedPhotoBytes,
-                videoBytes: engine.storedVideoBytes,
+                segments: MediaBackupRing.build(engine.storedSegments),
                 centerTitle: ringTitle)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 20)
@@ -132,11 +131,26 @@ struct DashboardView: View {
                            count: engine.uploadedVideos, total: engine.libraryVideos,
                            bytes: engine.storedVideoBytes)
             }
-            // Hidden album is never invisible: say whether it's in or out.
-            if engine.hiddenItemCount > 0 {
-                Text(engine.settings.includeHidden
-                     ? "including \(Format.count(engine.hiddenItemCount)) hidden"
-                     : "\(Format.count(engine.hiddenItemCount)) hidden excluded (Settings → Hidden album)")
+            // Mini-chips for the extra donut segments (only ones that exist),
+            // so every wedge color is identifiable at a glance.
+            let extras = MediaBackupRing.build(engine.storedSegments)
+                .filter { !["photo", "video"].contains($0.id) }
+            if !extras.isEmpty {
+                HStack(spacing: 10) {
+                    ForEach(extras) { seg in
+                        HStack(spacing: 4) {
+                            RoundedRectangle(cornerRadius: 2).fill(seg.color)
+                                .frame(width: 8, height: 8)
+                            Text("\(seg.label.lowercased()) \(Format.bytes(seg.bytes))")
+                                .font(Theme.mono(10)).foregroundStyle(Theme.textTertiary)
+                                .lineLimit(1).minimumScaleFactor(0.75)
+                        }
+                    }
+                }
+            }
+            // Hidden album is never invisible: when it's excluded, say so.
+            if engine.hiddenItemCount > 0 && !engine.settings.includeHidden {
+                Text("\(Format.count(engine.hiddenItemCount)) hidden excluded (Settings → Hidden album)")
                     .font(Theme.mono(10))
                     .foregroundStyle(Theme.textTertiary)
             }

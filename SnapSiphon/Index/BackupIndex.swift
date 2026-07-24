@@ -47,6 +47,13 @@ final class BackupIndex {
         if hasLocalSeen == 0 {
             db.exec("ALTER TABLE assets ADD COLUMN localSeen INTEGER NOT NULL DEFAULT 0;")
         }
+        // v2.2 migration: hidden mirrors the asset's Hidden-album membership
+        // (refreshed at every scan) so the dashboard can segment stored bytes.
+        let hasHidden = db.scalarInt(
+            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='hidden';")
+        if hasHidden == 0 {
+            db.exec("ALTER TABLE assets ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;")
+        }
         db.exec("CREATE INDEX IF NOT EXISTS idx_state ON assets(state);")
         db.exec("CREATE INDEX IF NOT EXISTS idx_journaled ON assets(journaled);")
         db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")
@@ -314,6 +321,43 @@ final class BackupIndex {
             let pb = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='photo';")
             let vb = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='video';")
             return (Int(p), Int(v), pb, vb)
+        }
+    }
+
+    /// Stored-byte segments for the dashboard donut: visible/hidden splits per
+    /// media type, plus Live Photo motion clips (mediaType 'other').
+    struct StoredSegments {
+        var photoBytes: Int64 = 0
+        var hiddenPhotoBytes: Int64 = 0
+        var videoBytes: Int64 = 0
+        var hiddenVideoBytes: Int64 = 0
+        var clipBytes: Int64 = 0
+    }
+
+    func storedSegments() -> StoredSegments {
+        queue.sync {
+            var s = StoredSegments()
+            s.photoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='photo' AND hidden=0;")
+            s.hiddenPhotoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='photo' AND hidden=1;")
+            s.videoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='video' AND hidden=0;")
+            s.hiddenVideoBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='video' AND hidden=1;")
+            s.clipBytes = db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND mediaType='other';")
+            return s
+        }
+    }
+
+    /// Refresh Hidden-album membership flags for the given rows (batched).
+    func setHiddenFlags(hidden: [String], visible: [String]) {
+        queue.sync {
+            for (value, ids) in [(1, hidden), (0, visible)] {
+                for chunk in stride(from: 0, to: ids.count, by: 500).map({
+                    Array(ids[$0..<min($0 + 500, ids.count)])
+                }) {
+                    let marks = chunk.map { _ in "?" }.joined(separator: ",")
+                    db.exec("UPDATE assets SET hidden=\(value) WHERE hidden != \(value) AND localIdentifier IN (\(marks));",
+                            chunk.map { .text($0) })
+                }
+            }
         }
     }
 

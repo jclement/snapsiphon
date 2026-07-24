@@ -66,6 +66,8 @@ final class BackupEngine: ObservableObject {
     @Published private(set) var uploadedVideos = 0
     @Published private(set) var storedPhotoBytes: Int64 = 0
     @Published private(set) var storedVideoBytes: Int64 = 0
+    /// Fine-grained donut segments: visible/hidden per type + Live clips.
+    @Published private(set) var storedSegments = BackupIndex.StoredSegments()
     /// When the newest object in the bucket was uploaded (for the "last backup" gauge).
     @Published private(set) var lastBackupDate: Date?
     /// When the current backup run began (for throughput / ETA math).
@@ -186,6 +188,15 @@ final class BackupEngine: ObservableObject {
         uploadedVideos = 656
         storedPhotoBytes = 27_800_000_000    // ~28 GB photos
         storedVideoBytes = 43_600_000_000    // ~44 GB videos
+        storedSegments = {
+            var s = BackupIndex.StoredSegments()
+            s.photoBytes = 24_100_000_000
+            s.hiddenPhotoBytes = 2_400_000_000
+            s.videoBytes = 40_200_000_000
+            s.hiddenVideoBytes = 3_400_000_000
+            s.clipBytes = 1_300_000_000
+            return s
+        }()
         lastBackupDate = Date().addingTimeInterval(-42)
 
         if mode == "uploading" {
@@ -395,6 +406,7 @@ final class BackupEngine: ObservableObject {
         uploadedVideos = byType.videos
         storedPhotoBytes = byType.photoBytes
         storedVideoBytes = byType.videoBytes
+        storedSegments = index.storedSegments()
         lastBackupDate = index.recentUploads(limit: 1).first?.uploadedAt
     }
 
@@ -571,6 +583,20 @@ final class BackupEngine: ObservableObject {
                     .map { AssetRecord.liveMotionIdentifier(for: $0.localIdentifier) }
             }
             idx.markLocalSeen(seenIDs)
+            // Refresh Hidden-album membership (it changes over time; clips
+            // follow their still) — feeds the dashboard's segment donut.
+            var hiddenIDs: [String] = []
+            var visibleIDs: [String] = []
+            for info in infos {
+                if info.isHidden {
+                    hiddenIDs.append(info.localIdentifier)
+                    if info.isLivePhoto { hiddenIDs.append(AssetRecord.liveMotionIdentifier(for: info.localIdentifier)) }
+                } else {
+                    visibleIDs.append(info.localIdentifier)
+                    if info.isLivePhoto { visibleIDs.append(AssetRecord.liveMotionIdentifier(for: info.localIdentifier)) }
+                }
+            }
+            idx.setHiddenFlags(hidden: hiddenIDs, visible: visibleIDs)
             return (added, newest, infos.count)
         }.value
 
