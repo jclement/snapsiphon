@@ -31,7 +31,9 @@ final class BackupEngine: ObservableObject {
     }
 
     // MARK: Published state
-    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var phase: Phase = .idle {
+        didSet { updateIdleTimer() }
+    }
     @Published private(set) var counts = BackupIndex.Counts()
     /// Fixed upload "lanes" — one per parallel thread, so the row count stays
     /// static during a run: a finished file's lane is reused by the next file
@@ -115,6 +117,7 @@ final class BackupEngine: ObservableObject {
                 Task { await self.refreshLibraryCounts() }
             }
             PewPew.shared.enabled = settings.pewPew
+            updateIdleTimer()   // honour mid-run toggling of Keep screen on
         }
     }
     @Published var s3Config: S3Config { didSet { s3Config.save() } }
@@ -1458,7 +1461,17 @@ final class BackupEngine: ObservableObject {
 
     // MARK: Verification
 
-    @Published private(set) var verifying = false
+    @Published private(set) var verifying = false {
+        didSet { updateIdleTimer() }
+    }
+
+    /// "Keep screen on" applies to ALL long foreground work — scanning,
+    /// repository checks, uploading, verifying — not just the upload run.
+    /// A sleeping screen suspends the app and silently stalls all of them.
+    private func updateIdleTimer() {
+        UIApplication.shared.isIdleTimerDisabled =
+            settings.keepScreenOnWhileUploading && (phase.isActive || verifying)
+    }
     @Published private(set) var verifyStatus: String?
 
     /// Egress-free backup verification: pages ListObjectsV2 over `objects/`
@@ -1574,7 +1587,6 @@ final class BackupEngine: ObservableObject {
             phase = .failed("Missing key or storage configuration.")
             return
         }
-        UIApplication.shared.isIdleTimerDisabled = settings.keepScreenOnWhileUploading
 
         phase = .running
         sessionUploaded = 0
@@ -1615,7 +1627,6 @@ final class BackupEngine: ObservableObject {
         phase = .paused
         waitingReason = nil
         uploadLanes.removeAll()
-        UIApplication.shared.isIdleTimerDisabled = false
         appendLog("Paused.", .warning)
     }
 
@@ -1625,7 +1636,6 @@ final class BackupEngine: ObservableObject {
         guard generation == runGeneration else { return }
         runTask = nil
         waitingReason = nil
-        UIApplication.shared.isIdleTimerDisabled = false
         refreshCounts()
         uploadLanes.removeAll()
         bytesPerSecond = 0
