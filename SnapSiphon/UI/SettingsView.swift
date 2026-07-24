@@ -242,6 +242,20 @@ struct SettingsView: View {
                         Text("Every change is committed to an append-only encrypted journal in the bucket — the journal, not this phone, is the source of truth. Checkpoints compact the history into a fresh snapshot; old generations stay untouched (append-only friendly).")
                             .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                         Divider().overlay(Theme.hairline)
+                        SliderRow(title: "Journal every",
+                                  subtitle: "Commit a journal after this many uncommitted changes mid-run (one always lands at the end of a run). Lower = a crash loses less bookkeeping; higher = fewer requests on metered storage.",
+                                  value: Binding(
+                                    get: { Double(engine.settings.journalFlushEvery) },
+                                    set: { engine.settings.journalEvery = Int($0) }),
+                                  range: BackupSettings.journalEveryRange, step: 5) { "\(Int($0))" }
+                        Divider().overlay(Theme.hairline)
+                        SliderRow(title: "Checkpoint every",
+                                  subtitle: "Roll a fresh generation (full snapshot) after this many journals. Lower = faster restores and attach; higher = fewer, larger checkpoint uploads.",
+                                  value: Binding(
+                                    get: { Double(engine.settings.checkpointEveryJournals) },
+                                    set: { engine.settings.checkpointEvery = Int($0) }),
+                                  range: BackupSettings.checkpointEveryRange, step: 5) { "\(Int($0)) jrnl" }
+                        Divider().overlay(Theme.hairline)
                         Button {
                             Task {
                                 compacting = true

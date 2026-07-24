@@ -46,6 +46,18 @@ struct BackupSettings: Codable, Equatable {
     /// Local-notification reminder when no backup has run for N days (0 = off).
     var reminderDays: Int = 0
 
+    // Repository cadence (nerd knobs; the defaults are sensible)
+    /// Commit a journal after this many uncommitted changes mid-run (one is
+    /// always written at the end of a run regardless).
+    var journalEvery: Int? = nil
+    var journalFlushEvery: Int { journalEvery ?? 25 }
+    /// Compact into a fresh checkpoint generation after this many journals.
+    var checkpointEvery: Int? = nil
+    var checkpointEveryJournals: Int { checkpointEvery ?? 20 }
+
+    static let journalEveryRange = 5.0...200.0
+    static let checkpointEveryRange = 5.0...100.0
+
     /// Whether to physically purge deleted photos' blobs (best-effort, after
     /// the grace period, Object Lock permitting). Deletions are ALWAYS marked
     /// in the manifest regardless — this knob only reclaims storage.

@@ -929,10 +929,11 @@ final class BackupEngine: ObservableObject {
     }
 
     /// Uncommitted changes before a mid-run journal write (also always flushed
-    /// at the end of every run).
-    private let journalFlushThreshold = 25
+    /// at the end of every run). User-tunable.
+    private var journalFlushThreshold: Int { settings.journalFlushEvery }
     /// Journals per generation before compacting into a fresh checkpoint.
-    private let journalsPerGeneration = 20
+    /// User-tunable.
+    private var journalsPerGeneration: Int { settings.checkpointEveryJournals }
 
     /// List every metadata key under checkpoints/, parsed to (gen, seq).
     private func listMetadata(client: S3Client) async throws -> [(gen: Int, seq: Int)] {
