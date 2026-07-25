@@ -8,6 +8,11 @@ import SQLite3
 final class SQLiteDatabase {
     private var db: OpaquePointer?
     private static let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    /// Sticky by design: once SQLite has rejected an index operation, callers
+    /// must stop committing repository metadata until the index is reopened or
+    /// rebuilt. Continuing with a partially-updated cache is less safe than
+    /// stopping the backup.
+    private(set) var lastError: DBError?
 
     enum DBError: Error, LocalizedError {
         case open(String)
@@ -35,20 +40,42 @@ final class SQLiteDatabase {
 
     /// Run a statement with no result rows (DDL, INSERT, UPDATE, DELETE).
     func exec(_ sql: String, _ params: [SQLiteValue] = []) {
-        guard let stmt = try? prepare(sql, params) else { return }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_step(stmt)
+        do {
+            let stmt = try prepare(sql, params)
+            defer { sqlite3_finalize(stmt) }
+            let rc = sqlite3_step(stmt)
+            guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
+                throw DBError.step(String(cString: sqlite3_errmsg(db)))
+            }
+            return
+        } catch let error as DBError {
+            lastError = error
+        } catch {
+            lastError = .step(error.localizedDescription)
+        }
     }
 
     /// Like exec, but surfaces failures (used for VACUUM INTO snapshots where
     /// silent failure would mean an empty checkpoint).
     func execThrowing(_ sql: String, _ params: [SQLiteValue] = []) throws {
-        let stmt = try prepare(sql, params)
-        defer { sqlite3_finalize(stmt) }
-        let rc = sqlite3_step(stmt)
-        guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
-            throw DBError.step(String(cString: sqlite3_errmsg(db)))
+        do {
+            let stmt = try prepare(sql, params)
+            defer { sqlite3_finalize(stmt) }
+            let rc = sqlite3_step(stmt)
+            guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
+                throw DBError.step(String(cString: sqlite3_errmsg(db)))
+            }
+        } catch let error as DBError {
+            lastError = error
+            throw error
         }
+    }
+
+    /// A successful, explicit index rebuild is the one operation allowed to
+    /// recover this connection from a sticky error. Callers must only use this
+    /// after every statement in the rebuild has completed successfully.
+    func clearErrorAfterSuccessfulReset() {
+        lastError = nil
     }
 
     /// Run a query and map each row.
@@ -56,29 +83,53 @@ final class SQLiteDatabase {
         let stmt = try prepare(sql, params)
         defer { sqlite3_finalize(stmt) }
         var rows: [T] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             rows.append(map(Row(stmt: stmt)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else {
+            let error = DBError.step(String(cString: sqlite3_errmsg(db)))
+            lastError = error
+            throw error
         }
         return rows
     }
 
     /// Single scalar helper (e.g. COUNT/SUM).
     func scalarInt(_ sql: String, _ params: [SQLiteValue] = []) -> Int64 {
-        (try? query(sql, params) { $0.int64(0) })?.first ?? 0
+        do {
+            return try query(sql, params) { $0.int64(0) }.first ?? 0
+        } catch let error as DBError {
+            lastError = error
+            return 0
+        } catch {
+            lastError = .step(error.localizedDescription)
+            return 0
+        }
     }
 
     private func prepare(_ sql: String, _ params: [SQLiteValue]) throws -> OpaquePointer {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
-            throw DBError.prepare(String(cString: sqlite3_errmsg(db)))
+            let error = DBError.prepare(String(cString: sqlite3_errmsg(db)))
+            lastError = error
+            throw error
         }
         for (i, value) in params.enumerated() {
             let idx = Int32(i + 1)
+            let rc: Int32
             switch value {
-            case .null: sqlite3_bind_null(stmt, idx)
-            case .int(let v): sqlite3_bind_int64(stmt, idx, v)
-            case .double(let v): sqlite3_bind_double(stmt, idx, v)
-            case .text(let v): sqlite3_bind_text(stmt, idx, v, -1, Self.SQLITE_TRANSIENT)
+            case .null: rc = sqlite3_bind_null(stmt, idx)
+            case .int(let v): rc = sqlite3_bind_int64(stmt, idx, v)
+            case .double(let v): rc = sqlite3_bind_double(stmt, idx, v)
+            case .text(let v): rc = sqlite3_bind_text(stmt, idx, v, -1, Self.SQLITE_TRANSIENT)
+            }
+            guard rc == SQLITE_OK else {
+                sqlite3_finalize(stmt)
+                let error = DBError.prepare(String(cString: sqlite3_errmsg(db)))
+                lastError = error
+                throw error
             }
         }
         return stmt

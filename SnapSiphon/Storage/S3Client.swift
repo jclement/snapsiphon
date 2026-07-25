@@ -40,12 +40,16 @@ struct S3Config: Codable, Equatable {
 struct S3Credentials {
     var accessKeyID: String
     var secretAccessKey: String
+    /// Optional AWS STS/session token. Long-lived B2/R2/AWS keys leave this nil.
+    var sessionToken: String? = nil
 }
 
 enum S3Error: Error, LocalizedError {
     case badConfig
     case http(Int, String)
     case network(String)
+    case malformedResponse(String)
+    case objectTooLarge(Int64)
 
     var errorDescription: String? {
         switch self {
@@ -53,6 +57,9 @@ enum S3Error: Error, LocalizedError {
         case .http(let code, let body):
             return "Storage returned HTTP \(code).\(body.isEmpty ? "" : " \(body.prefix(300))")"
         case .network(let m): return "Network error: \(m)"
+        case .malformedResponse(let m): return "Storage returned an invalid S3 response: \(m)"
+        case .objectTooLarge(let bytes):
+            return "This file would require a \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) single upload, above SnapSiphon's 5 GB limit. Multipart upload is not implemented yet."
         }
     }
 }
@@ -61,6 +68,7 @@ enum S3Error: Error, LocalizedError {
 /// Kept deliberately small — just the verbs SnapSiphon needs (PUT, HEAD, GET
 /// list) so there is no opaque SDK between the user's photos and their bucket.
 final class S3Client {
+    static let maximumSinglePutBytes: Int64 = 5_000_000_000
     let config: S3Config
     private let signer: SigV4
     private let session: URLSession
@@ -69,7 +77,8 @@ final class S3Client {
         self.config = config
         self.signer = SigV4(accessKeyID: credentials.accessKeyID,
                             secretAccessKey: credentials.secretAccessKey,
-                            region: config.region)
+                            region: config.region,
+                            sessionToken: credentials.sessionToken)
         self.session = session
     }
 
@@ -93,6 +102,14 @@ final class S3Client {
         return url
     }
 
+    private func bucketURLComponents() throws -> URLComponents {
+        let raw = config.usesPathStyle
+            ? "https://\(config.endpoint)/\(config.bucket)"
+            : "https://\(config.bucket).\(config.endpoint)"
+        guard let components = URLComponents(string: raw) else { throw S3Error.badConfig }
+        return components
+    }
+
     // MARK: PUT (upload from a file on disk)
 
     /// Upload the file at `fileURL` to `key`. Progress is reported 0…1.
@@ -106,7 +123,10 @@ final class S3Client {
                    now: Date = Date(),
                    progress: ((Double) -> Void)? = nil) async throws {
         let url = try objectURL(key: key)
-        let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int) ?? nil
+        let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value
+        if let size, size > Self.maximumSinglePutBytes {
+            throw S3Error.objectTooLarge(size)
+        }
 
         var headers: [String: String] = ["content-type": contentType]
         if let size { headers["content-length"] = String(size) }
@@ -144,20 +164,37 @@ final class S3Client {
     /// versioned bucket (which Object Lock requires) freeing bytes means deleting
     /// each version, not just adding a hide-marker.
     func listVersions(forKey key: String, now: Date = Date()) async throws -> [ObjectVersion] {
-        var components: URLComponents
-        if config.usesPathStyle {
-            components = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
-        } else {
-            components = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!
-        }
-        components.percentEncodedQuery = "versions=&prefix=\(SigV4.uriEncode(key, encodeSlash: true))"
-        guard let url = components.url else { throw S3Error.badConfig }
-        let signed = signer.sign(method: "GET", url: url, now: now)
-        var request = URLRequest(url: url)
-        for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
-        let (data, response) = try await session.data(for: request)
-        try Self.validate(response: response, data: data)
-        return ListVersionsParser(matchKey: key).parse(data)
+        var all: [ObjectVersion] = []
+        var keyMarker: String?
+        var versionMarker: String?
+        repeat {
+            var components = try bucketURLComponents()
+            var query = [("versions", ""), ("prefix", key)]
+            if let keyMarker { query.append(("key-marker", keyMarker)) }
+            if let versionMarker { query.append(("version-id-marker", versionMarker)) }
+            components.percentEncodedQuery = query
+                .map { "\(SigV4.uriEncode($0.0, encodeSlash: true))=\(SigV4.uriEncode($0.1, encodeSlash: true))" }
+                .joined(separator: "&")
+            guard let url = components.url else { throw S3Error.badConfig }
+            let signed = signer.sign(method: "GET", url: url, now: now)
+            var request = URLRequest(url: url)
+            for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
+            let (data, response) = try await session.data(for: request)
+            try Self.validate(response: response, data: data)
+            let page = try ListVersionsParser(matchKey: key).parse(data)
+            all.append(contentsOf: page.versions)
+            guard page.isTruncated else {
+                keyMarker = nil
+                versionMarker = nil
+                break
+            }
+            guard let nextKey = page.nextKeyMarker, !nextKey.isEmpty else {
+                throw S3Error.malformedResponse("truncated version listing omitted NextKeyMarker")
+            }
+            keyMarker = nextKey
+            versionMarker = page.nextVersionIDMarker
+        } while keyMarker != nil
+        return all
     }
 
     /// Delete one specific version. On an Object-Lock bucket this **fails** until
@@ -169,6 +206,21 @@ final class S3Client {
         }
         comps.percentEncodedQuery = "versionId=\(SigV4.uriEncode(versionId, encodeSlash: true))"
         guard let url = comps.url else { throw S3Error.badConfig }
+        let signed = signer.sign(method: "DELETE", url: url, now: now)
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw S3Error.network("No response") }
+        if http.statusCode == 404 { return }
+        guard (200..<300).contains(http.statusCode) else {
+            throw S3Error.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+
+    /// Delete the current object on an unversioned S3-compatible server.
+    func deleteObject(key: String, now: Date = Date()) async throws {
+        let url = try objectURL(key: key)
         let signed = signer.sign(method: "DELETE", url: url, now: now)
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
@@ -217,6 +269,9 @@ final class S3Client {
         }
         try? FileManager.default.removeItem(at: destination)
         try FileManager.default.moveItem(at: tmp, to: destination)
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: destination.path)
     }
 
     // MARK: List (verify / reconcile remote → local index)
@@ -231,12 +286,7 @@ final class S3Client {
     /// up to 1000). This is verification's workhorse: ~10 requests cover a
     /// 10k-object archive, no per-object HEADs needed.
     func listObjects(subPrefix: String? = nil, continuationToken: String? = nil, now: Date = Date()) async throws -> (objects: [RemoteObject], next: String?) {
-        var components: URLComponents
-        if config.usesPathStyle {
-            components = URLComponents(string: "https://\(config.endpoint)/\(config.bucket)")!
-        } else {
-            components = URLComponents(string: "https://\(config.bucket).\(config.endpoint)")!
-        }
+        var components = try bucketURLComponents()
         // Match the trimmed prefix used for uploads (fullKey), and percent-
         // encode the query OURSELVES with the same encoder SigV4 canonicalizes
         // with — otherwise a '+' in a continuation token is signed as %2B but
@@ -264,7 +314,7 @@ final class S3Client {
         try Self.validate(response: response, data: data)
 
         let parser = ListBucketParser()
-        return parser.parse(data)
+        return try parser.parse(data)
     }
 
     /// Best-effort connectivity check: list a single page.
@@ -352,10 +402,12 @@ private final class ListBucketParser: NSObject, XMLParserDelegate {
     private var currentETag = ""
     private var inContents = false
 
-    func parse(_ data: Data) -> (objects: [S3Client.RemoteObject], next: String?) {
+    func parse(_ data: Data) throws -> (objects: [S3Client.RemoteObject], next: String?) {
         let parser = XMLParser(data: data)
         parser.delegate = self
-        parser.parse()
+        guard parser.parse() else {
+            throw S3Error.malformedResponse(parser.parserError?.localizedDescription ?? "malformed ListObjects XML")
+        }
         return (objects, next)
     }
 
@@ -397,14 +449,22 @@ private final class ListVersionsParser: NSObject, XMLParserDelegate {
     private var versionId = ""
     private var isMarker = false
     private var inEntry = false
+    private var isTruncated = false
+    private var nextKeyMarker: String?
+    private var nextVersionIDMarker: String?
 
     init(matchKey: String) { self.matchKey = matchKey }
 
-    func parse(_ data: Data) -> [S3Client.ObjectVersion] {
+    func parse(_ data: Data) throws -> (versions: [S3Client.ObjectVersion],
+                                        isTruncated: Bool,
+                                        nextKeyMarker: String?,
+                                        nextVersionIDMarker: String?) {
         let parser = XMLParser(data: data)
         parser.delegate = self
-        parser.parse()
-        return results
+        guard parser.parse() else {
+            throw S3Error.malformedResponse(parser.parserError?.localizedDescription ?? "malformed ListObjectVersions XML")
+        }
+        return (results, isTruncated, nextKeyMarker, nextVersionIDMarker)
     }
 
     func parser(_ parser: XMLParser, didStartElement elementName: String,
@@ -423,6 +483,12 @@ private final class ListVersionsParser: NSObject, XMLParserDelegate {
         switch elementName {
         case "Key" where inEntry: key = current.trimmingCharacters(in: .whitespacesAndNewlines)
         case "VersionId" where inEntry: versionId = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        case "IsTruncated":
+            isTruncated = current.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"
+        case "NextKeyMarker":
+            nextKeyMarker = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        case "NextVersionIdMarker":
+            nextVersionIDMarker = current.trimmingCharacters(in: .whitespacesAndNewlines)
         case "Version", "DeleteMarker":
             if key == matchKey && !versionId.isEmpty {
                 results.append(.init(versionId: versionId, isDeleteMarker: isMarker))

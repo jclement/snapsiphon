@@ -21,7 +21,11 @@ struct SettingsView: View {
     @State private var showReloadConfirm = false
     @State private var showPurgeConfirm = false
     @State private var purgePendingCount = 0
+    @State private var pendingGraceDays: Int?
+    @State private var showGraceReductionConfirm = false
     @State private var showHiddenZeroAlert = false
+    @State private var showResetIndexConfirm = false
+    @State private var resetIndexStatus: String?
 
     /// Initial cutoff when the toggle is first enabled: Jan 1 2000, i.e.
     /// "everything" — predates any phone photo library.
@@ -225,8 +229,32 @@ struct SettingsView: View {
                                   subtitle: "Accident window for automatic purge AND Clean up now: erase iCloud by mistake and get it back within this many days → nothing is purged.",
                                   value: Binding(
                                     get: { Double(engine.settings.deleteGraceDays) },
-                                    set: { engine.settings.deleteGraceDays = Int($0) }),
+                                    set: {
+                                        let proposed = Int($0)
+                                        if engine.settings.propagateDeletes,
+                                           proposed < engine.settings.deleteGraceDays {
+                                            pendingGraceDays = proposed
+                                            purgePendingCount = engine.purgeEligibleCount(graceDays: proposed)
+                                            showGraceReductionConfirm = true
+                                        } else {
+                                            engine.settings.deleteGraceDays = proposed
+                                        }
+                                    }),
                                   range: 7...180, step: 1) { "\(Int($0))d" }
+                        .alert("Shorten the purge grace period?",
+                               isPresented: $showGraceReductionConfirm) {
+                            Button("Shorten", role: .destructive) {
+                                if let days = pendingGraceDays {
+                                    engine.settings.deleteGraceDays = days
+                                }
+                                pendingGraceDays = nil
+                            }
+                            Button("Cancel", role: .cancel) { pendingGraceDays = nil }
+                        } message: {
+                            Text(purgePendingCount > 0
+                                 ? "\(Format.count(purgePendingCount)) deleted backup\(purgePendingCount == 1 ? " is" : "s are") already old enough under the shorter window and can be permanently purged on the next sync."
+                                 : "No existing tombstones become immediately eligible, but future deletions will have a shorter recovery window.")
+                        }
                         if engine.settings.propagateDeletes {
                             HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: "info.circle.fill")
@@ -245,7 +273,7 @@ struct SettingsView: View {
                                 Image(systemName: "trash.slash")
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Clean up now").font(Theme.rounded(16, weight: .medium))
-                                    Text("One-off garbage collection: free the blobs of deleted photos that are past the grace period, even with automatic purging off. Blobs are deleted first, then the purge is journaled — a crash in between just retries safely on the next cleanup.")
+                                    Text("One-off garbage collection: free blobs of deleted photos past the grace period, even with automatic purging off. The deletion tombstone already exists; physical absence is confirmed before the final purge record is committed. Interrupted cleanup is reconciled on the next run.")
                                         .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                                 }
                                 Spacer()
@@ -379,7 +407,9 @@ struct SettingsView: View {
                             .foregroundStyle(engine.isConfigured ? Theme.teal : Theme.textTertiary)
                         }
                         .disabled(!engine.isConfigured || engine.phase.isActive || engine.verifying)
-                        if let status = engine.verifyStatus {
+                        if engine.verifying {
+                            verificationProgressCard
+                        } else if let status = engine.verifyStatus {
                             Text(status)
                                 .font(Theme.mono(12))
                                 .multilineTextAlignment(.leading)
@@ -442,7 +472,8 @@ struct SettingsView: View {
 
                     knobGroup("Maintenance") {
                         Button(role: .destructive) {
-                            engine.resetIndex()
+                            resetIndexStatus = nil
+                            showResetIndexConfirm = true
                         } label: {
                             HStack {
                                 Image(systemName: "trash")
@@ -450,6 +481,27 @@ struct SettingsView: View {
                                 Spacer()
                             }
                             .foregroundStyle(.red)
+                        }
+                        .disabled(engine.isRunActive)
+                        .alert("Reset the local index?", isPresented: $showResetIndexConfirm) {
+                            Button("Reset local index", role: .destructive) {
+                                switch engine.resetIndex() {
+                                case .success:
+                                    resetIndexStatus = "✓ Local index cleared. Repository files were not changed."
+                                case .failure(let error):
+                                    resetIndexStatus = "✗ Could not clear local index: \(error.localizedDescription)"
+                                }
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("This clears only the cache on this phone. The next backup will inspect the repository again and may ask you to reload its index.")
+                        }
+                        if let status = resetIndexStatus {
+                            Text(status)
+                                .font(Theme.mono(12))
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .foregroundStyle(status.hasPrefix("✓") ? .green : .red)
                         }
                     }
 
@@ -610,6 +662,35 @@ struct SettingsView: View {
                 Image(systemName: "chevron.right").font(.system(size: 13)).foregroundStyle(Theme.textTertiary)
             }
         }
+    }
+
+    private var verificationProgressCard: some View {
+        let progress = engine.verifyProgress
+        return VStack(alignment: .leading, spacing: 8) {
+            if let total = progress?.total, total > 0 {
+                ProgressView(value: Double(progress?.completed ?? 0), total: Double(total))
+                    .tint(Theme.teal)
+            } else {
+                ProgressView().tint(Theme.teal)
+            }
+            HStack {
+                Text(progress?.title ?? "Verifying backups…")
+                    .font(Theme.rounded(13, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+                if let total = progress?.total, total > 0 {
+                    Text("\(min(progress?.completed ?? 0, total))/\(total)")
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+            }
+            Text(progress?.detail ?? engine.verifyStatus ?? "Starting…")
+                .font(Theme.mono(11))
+                .foregroundStyle(Theme.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.teal.opacity(0.08)))
     }
 
     private func knobGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {

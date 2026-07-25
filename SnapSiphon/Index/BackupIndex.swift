@@ -60,6 +60,14 @@ final class BackupIndex {
         // Crash recovery: mid-flight rows go back to pending (blobs from a PUT
         // that finished without being recorded are ignorable orphans).
         db.exec("UPDATE assets SET state='pending' WHERE state='uploading';")
+        if let error = db.lastError { throw error }
+    }
+
+    /// Any SQLite failure poisons the cache until it is reopened/rebuilt.
+    /// Repository writers use this to fail closed instead of journaling a
+    /// partial view of local state.
+    var databaseError: Error? {
+        queue.sync { db.lastError }
     }
 
     // MARK: Meta (journal chain position)
@@ -457,10 +465,19 @@ final class BackupIndex {
         }
     }
 
-    func reset() {
-        queue.sync {
-            db.exec("DELETE FROM assets;")
-            db.exec("DELETE FROM meta;")
+    func reset() throws {
+        try queue.sync {
+            try db.execThrowing("BEGIN IMMEDIATE;")
+            do {
+                try db.execThrowing("DELETE FROM assets;")
+                try db.execThrowing("DELETE FROM meta;")
+                try db.execThrowing("COMMIT;")
+                db.clearErrorAfterSuccessfulReset()
+            } catch {
+                // Preserve the original failure even if rollback also fails.
+                try? db.execThrowing("ROLLBACK;")
+                throw error
+            }
         }
     }
 
@@ -489,9 +506,9 @@ final class BackupIndex {
     func importSnapshot(from url: URL) throws {
         let snap = try SQLiteDatabase(path: url.path)
         let rows = try snap.query("SELECT * FROM assets;", [], Self.mapRow)
-        let metaRows: [(String, String)] = (try? snap.query("SELECT key, value FROM meta;", []) {
+        let metaRows: [(String, String)] = try snap.query("SELECT key, value FROM meta;", []) {
             ($0.text(0), $0.text(1))
-        }) ?? []
+        }
         queue.sync {
             db.exec("DELETE FROM assets;")
             db.exec("DELETE FROM meta;")

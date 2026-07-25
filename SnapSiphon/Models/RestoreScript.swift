@@ -41,6 +41,7 @@ enum RestoreScript {
                       includeSecrets: Bool = true) -> String {
         let secret = pyString(includeSecrets ? (ageSecret ?? "") : "")
         let secretKey = pyString(includeSecrets ? credentials.secretAccessKey : "")
+        let sessionToken = pyString(includeSecrets ? (credentials.sessionToken ?? "") : "")
         let endpoint = pyString(config.endpoint)
         let region = pyString(config.region)
         let bucket = pyString(config.bucket)
@@ -78,6 +79,7 @@ BUCKET     = "\#(bucket)"
 PREFIX     = "\#(prefix)"
 ACCESS_KEY = "\#(accessKey)"
 SECRET_KEY = "\#(secretKey)"      # empty = prompted at run
+SESSION_TOKEN = "\#(sessionToken)" # optional AWS STS token
 AGE_SECRET = "\#(secret)"         # empty = prompted at run
 PATH_STYLE = \#(pathStyle)
 
@@ -97,10 +99,11 @@ CONFIG_FIELDS = [
     ("PATH_STYLE", "Path style"),
     ("ACCESS_KEY", "Access key"),
     ("SECRET_KEY", "Secret key"),
+    ("SESSION_TOKEN", "Session token"),
     ("AGE_SECRET", "Age secret"),
 ]
-OPTIONAL = {"PREFIX"}
-HIDDEN = {"SECRET_KEY", "AGE_SECRET"}
+OPTIONAL = {"PREFIX", "SESSION_TOKEN"}
+HIDDEN = {"SECRET_KEY", "SESSION_TOKEN", "AGE_SECRET"}
 
 def _shown(name, val):
     if name == "PATH_STYLE":
@@ -109,7 +112,7 @@ def _shown(name, val):
         return None
     if name == "AGE_SECRET":
         return val[:18] + "…" + val[-4:] if len(val) > 26 else "(set)"
-    if name == "SECRET_KEY":
+    if name in ("SECRET_KEY", "SESSION_TOKEN"):
         return val[:4] + "…" + val[-4:] if len(val) > 12 else "(set)"
     return str(val)
 
@@ -179,6 +182,8 @@ def s3_open(method, key="", query=None):
         f"{urllib.parse.quote(str(k), safe='-._~')}={urllib.parse.quote(str(v), safe='-._~')}"
         for k, v in sorted(query.items()))
     headers = {"host": host, "x-amz-content-sha256": "UNSIGNED-PAYLOAD", "x-amz-date": amz}
+    if SESSION_TOKEN:
+        headers["x-amz-security-token"] = SESSION_TOKEN
     ch = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
     sh = ";".join(sorted(headers))
     creq = "\n".join([method, path, cq, ch, sh, "UNSIGNED-PAYLOAD"])
@@ -218,8 +223,14 @@ def list_keys(prefix):
         if token:
             q["continuation-token"] = token
         root = ET.fromstring(_retry(lambda: s3_open("GET", "", q).read(), "LIST"))
-        keys += [e.text for c in root.iter(S3NS + "Contents") for e in c.iter(S3NS + "Key")]
-        tok = root.find(S3NS + "NextContinuationToken")
+        # Compatible servers vary on whether they emit AWS's XML namespace.
+        local = lambda e: e.tag.rsplit("}", 1)[-1]
+        for c in root.iter():
+            if local(c) == "Contents":
+                for e in c:
+                    if local(e) == "Key" and e.text:
+                        keys.append(e.text)
+        tok = next((e for e in root.iter() if local(e) == "NextContinuationToken"), None)
         if tok is None or not tok.text:
             return keys
         token = tok.text
@@ -425,6 +436,8 @@ def main():
         for candidate in sorted(complete, reverse=True):
             ck_enc, ck_db = tmp / "ckpt.age", tmp / "ckpt.sqlite"
             try:
+                ck_enc.unlink(missing_ok=True)
+                ck_db.unlink(missing_ok=True)
                 download(gens[candidate][0], ck_enc)
                 last_hash = sha256_file(ck_enc)
                 decrypt(ck_enc, ck_db)
@@ -520,11 +533,16 @@ def main():
         for i, (lid, it, name) in enumerate(plan, 1):
             u = it["uuid"]
             target = out / name
-            if target.exists() and target.stat().st_size > 0:
-                restored_by_uuid.setdefault(u, target)
-                continue                                    # resume: already restored
+            if target.is_file() and target.stat().st_size > 0:
+                expected = it.get("hash")
+                if expected and sha256_file(target) == expected:
+                    restored_by_uuid.setdefault(u, target)
+                    continue                                # resume: verified restored
+                print(f"[{i}/{len(plan)}] existing {name} failed or lacks its recorded SHA-256 — restoring it again",
+                      file=sys.stderr)
             blob = tmp / "blob.age"
             part = target.with_name(target.name + ".part")
+            part.unlink(missing_ok=True)
             try:
                 twin = restored_by_uuid.get(u)
                 if twin is not None and twin.exists():

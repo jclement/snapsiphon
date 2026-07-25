@@ -32,10 +32,12 @@ them back. Deterministic for dedup and idempotent uploads; opaque to outsiders.
   entry commits (a crash strands only an ignorable orphan), and the phone's
   SQLite is just a rebuildable cache. Scans stay fast via a single
   known-identifier query and an oldest-first high-water mark.
-- **Safe multi-device story.** Attaching to a folder that already holds a
-  repository raises an explicit choice (take over / verify match / new folder),
-  and a foreign journal appearing mid-chain halts writes with a loud conflict
-  banner — two writers can never silently interleave.
+- **One writer per folder.** Multi-device writing to one repository is not
+  supported. Attaching to an existing folder requires an explicit choice
+  (take over / verify match / new folder), while unexpected advances, gaps,
+  rollbacks, or replaced metadata trigger a hard conflict. Those checks are
+  safety fuses, not a coordination protocol; every active device gets its own
+  prefix or bucket.
 - **Lots of knobs — all enforced.** Photos/videos/favorites filters,
   parallel-upload count, **mid-stream speed limit** (a throttled bound-stream
   body, not just a per-file average), **Wi-Fi-only** and **pause-on-low-battery**
@@ -56,9 +58,9 @@ them back. Deterministic for dedup and idempotent uploads; opaque to outsiders.
   reappear within the window are **resurrected** — an accidental iCloud wipe
   can't cascade into the bucket.
 - **Break-glass restore.** A generated single-file Python script (credentials +
-  key baked in) replays the newest checkpoint and journals — verifying the
-  chain and each file's sha256 — with no SnapSiphon and no SDKs; even the
-  checkpoint is just an age file holding SQLite.
+  key baked in) uses the newest readable checkpoint and journals, verifies
+  each restored or resumed file's SHA-256, and needs no SnapSiphon or S3 SDK;
+  even the checkpoint is just an age file holding SQLite.
 - **Egress-free verification.** One tap lists the bucket's blobs and checks
   every backup exists at the expected size — ~10 requests per 10k objects,
   zero downloads; anything missing re-queues automatically.
@@ -116,6 +118,11 @@ open SnapSiphon.xcodeproj
 Select a signing team in the target's *Signing & Capabilities* (Photos access
 and Keychain work on device; the simulator has no photo originals to export).
 
+The `SnapSiphonTests` scheme target covers age streaming/tamper/multiple
+recipients, AWS SigV4 and session tokens, S3 version pagination/XML failures,
+grace-period shared-blob safety, SQLite failure surfacing, and restore-script
+resume guards. Xcode coverage collection is enabled for the test action.
+
 ## Verifying the crypto
 
 The age output is checked against the real tool. With `age`/`age-keygen`
@@ -139,8 +146,8 @@ age -d -i key.txt photo.age > photo   # decrypts byte-for-byte
 
 ## Status
 
-Shipping: on TestFlight via a scripted release pipeline (`mise run release --
-X.Y.Z` — clean-tree check, semver gate, archive, upload, tag), exercised daily
+Shipping: on TestFlight via a scripted release pipeline (`mise run release` —
+clean `main` check, tag-derived version choice, archive, upload, tag), exercised daily
 against a live Backblaze B2 bucket, with the background-backup unlock wired as
 a StoreKit 2 non-consumable.
 

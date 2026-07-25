@@ -3,7 +3,7 @@ import SwiftUI
 import UIKit
 import CryptoKit
 import BackgroundTasks
-import UserNotifications
+@preconcurrency import UserNotifications
 
 /// The brain. Owns configuration, the index, and the run loop; publishes live
 /// state for the UI. Everything the dashboard shows flows from here.
@@ -63,6 +63,12 @@ final class BackupEngine: ObservableObject {
     @Published private(set) var activityDetail: String?
     /// Result of the last completed scan (shown in Settings → Automation).
     @Published private(set) var scanStatus: String?
+    struct WorkProgress: Equatable {
+        var title: String
+        var completed: Int
+        var total: Int?
+        var detail: String?
+    }
     /// Library totals by type (denominator) and uploaded-by-type (numerator) for
     /// the photos/videos ring.
     @Published private(set) var libraryPhotos = 0
@@ -141,6 +147,9 @@ final class BackupEngine: ObservableObject {
     private var runAbortReason: String?
     /// The previous run while its cancelled tasks finish unwinding.
     private var drainingTask: Task<Void, Never>?
+    /// End-of-run metadata commit. Storage settings stay locked until it has
+    /// finished so a journal can never follow its blobs to a new destination.
+    private var postRunTask: Task<Void, Never>?
     private var meter = ThroughputMeter()
     private let tempDir: URL
 
@@ -149,6 +158,9 @@ final class BackupEngine: ObservableObject {
         self.s3Config = S3Config.load()
         self.tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("snapsiphon-work", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: tempDir.path)
         // Sweep temp leftovers from a previous crash/kill so they can't
         // accumulate and eat disk (each dead run could strand up to
         // 2×parallelism part-written files here).
@@ -246,13 +258,19 @@ final class BackupEngine: ObservableObject {
 
     /// True while any pipeline/run is active — settings that change the
     /// destination must not commit mid-run.
-    var isRunActive: Bool { phase.isActive || runTask != nil || pipelineTask != nil }
+    var isRunActive: Bool {
+        phase.isActive || runTask != nil || pipelineTask != nil ||
+        drainingTask != nil || flushTask != nil || postRunTask != nil
+    }
 
     /// Tombstones already past the grace period — what enabling automatic
     /// purge (or Clean up now) would free next.
-    func purgeEligibleCount() -> Int {
+    func purgeEligibleCount(graceDays: Int? = nil) -> Int {
         guard let index else { return 0 }
-        let cutoff = Calendar.current.date(byAdding: .day, value: -settings.deleteGraceDays, to: Date()) ?? Date()
+        let days = min(max(graceDays ?? settings.deleteGraceDays,
+                           BackupSettings.graceRange.lowerBound),
+                       BackupSettings.graceRange.upperBound)
+        let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
         return index.purgeableRecords(before: cutoff).count
     }
 
@@ -275,7 +293,7 @@ final class BackupEngine: ObservableObject {
 
     // MARK: Background backup (BGProcessingTask)
 
-    static let bgTaskID = "ca.straybits.snapsiphon.backup"
+    nonisolated static let bgTaskID = "ca.straybits.snapsiphon.backup"
 
     /// Must be called before the app finishes launching (we call it from init).
     nonisolated func registerBackgroundTask() {
@@ -311,13 +329,12 @@ final class BackupEngine: ObservableObject {
             // conflicted repository. An attach prompt can't be answered from
             // the background — leave it for the next foreground launch.
             guard await self.prepareRepository() else {
-                task.setTaskCompleted(success: true)
+                task.setTaskCompleted(success: false)
                 return
             }
             self.start()
             await self.runTask?.value
-            self.rescheduleReminder()
-            task.setTaskCompleted(success: true)
+            task.setTaskCompleted(success: self.phase == .finished)
         }
     }
 
@@ -415,6 +432,16 @@ final class BackupEngine: ObservableObject {
         }
     }
 
+    @discardableResult
+    private func requireHealthyIndex(_ context: String) -> Bool {
+        guard let error = index?.databaseError else { return true }
+        let message = "Local index failure while \(context): \(error.localizedDescription). Backup stopped before committing more repository metadata. Reload or reset the local index after checking device storage."
+        if case .failed(let existing) = phase, existing == message { return false }
+        phase = .failed(message)
+        appendLog(message, .error)
+        return false
+    }
+
     func refreshCounts() {
         guard let index else { return }
         if demoMode { return }
@@ -470,8 +497,10 @@ final class BackupEngine: ObservableObject {
 
     // MARK: Credentials
 
-    func saveCredentials(accessKeyID: String, secret: String) {
-        S3CredentialStore.save(S3Credentials(accessKeyID: accessKeyID, secretAccessKey: secret))
+    func saveCredentials(accessKeyID: String, secret: String, sessionToken: String?) throws {
+        try S3CredentialStore.save(S3Credentials(accessKeyID: accessKeyID,
+                                                 secretAccessKey: secret,
+                                                 sessionToken: sessionToken))
     }
 
     func makeClient() -> S3Client? {
@@ -705,10 +734,13 @@ final class BackupEngine: ObservableObject {
     var repoSharded: Bool { index?.metaValue(RepoMeta.layout) == Repo.shardedLayout }
 
     @discardableResult
-    private func ensureRepoSalt() -> String {
+    private func ensureRepoSalt() throws -> String {
         if let salt = repoSalt { return salt }
-        let salt = Repo.newSaltHex()
+        let salt = try Repo.newSaltHex()
         index?.setMeta(RepoMeta.salt, salt)
+        guard requireHealthyIndex("saving the repository salt") else {
+            throw index?.databaseError ?? CocoaError(.fileWriteUnknown)
+        }
         return salt
     }
 
@@ -885,7 +917,9 @@ final class BackupEngine: ObservableObject {
     @discardableResult
     private func purgeTombstones() async -> (freed: Int, freedBytes: Int64, blocked: Int) {
         guard let index, let client = makeClient() else { return (0, 0, 0) }
-        let cutoff = Calendar.current.date(byAdding: .day, value: -settings.deleteGraceDays, to: Date()) ?? Date()
+        let days = min(max(settings.deleteGraceDays, BackupSettings.graceRange.lowerBound),
+                       BackupSettings.graceRange.upperBound)
+        let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
         let records = index.purgeableRecords(before: cutoff)
         guard !records.isEmpty else { return (0, 0, 0) }
 
@@ -910,23 +944,51 @@ final class BackupEngine: ObservableObject {
             }
             let key = client.fullKey(for: Repo.objectKey(uuid: record.uuid, sharded: repoSharded))
             do {
-                let versions = try await client.listVersions(forKey: key)
-                var allGone = true
-                for v in versions {
-                    do { try await client.deleteObjectVersion(key: key, versionId: v.versionId) }
-                    catch { allGone = false }          // locked / retention — retry later
+                let versions: [S3Client.ObjectVersion]
+                var supportsVersionListing = true
+                do {
+                    versions = try await S3Client.withRetries {
+                        try await client.listVersions(forKey: key)
+                    }
+                } catch S3Error.http(let code, _) where code == 405 || code == 501 {
+                    // Minimal/unversioned S3 servers may not implement the
+                    // version-listing API at all. Their ordinary DELETE is the
+                    // complete physical deletion operation.
+                    supportsVersionListing = false
+                    versions = []
                 }
-                if allGone { freed.append(record); blobHandled.insert(record.uuid) }
-                else { blocked += 1 }
+                for v in versions {
+                    try await S3Client.withRetries {
+                        try await client.deleteObjectVersion(key: key, versionId: v.versionId)
+                    }
+                }
+                // Unversioned/minimal S3 servers return no versions. Delete
+                // the ordinary object there; on versioned stores HEAD is nil
+                // after every version and marker above has been removed.
+                if try await client.headObject(key: key) != nil {
+                    try await S3Client.withRetries { try await client.deleteObject(key: key) }
+                }
+                // Never journal a purge from a partial page or optimistic
+                // delete response: re-list and HEAD-confirm physical absence.
+                let remaining = supportsVersionListing
+                    ? try await S3Client.withRetries { try await client.listVersions(forKey: key) }
+                    : []
+                let stillCurrent = try await client.headObject(key: key) != nil
+                if remaining.isEmpty && !stillCurrent {
+                    freed.append(record)
+                    blobHandled.insert(record.uuid)
+                } else {
+                    blocked += 1
+                }
             } catch {
                 blocked += 1                            // listing failed — retry later
             }
         }
         if !freed.isEmpty {
-            // Journal the purges FIRST (so a restore knows the blob is gone),
-            // then drop the cache rows. If the flush fails, rows stay
-            // tombstoned and the purge op is retried next scan — the version
-            // listing comes back empty, which is fine and idempotent.
+            // The deletion tombstone was journaled when the photo disappeared.
+            // Once absence is confirmed above, journal the final purge and then
+            // drop the cache row. If this flush fails, the tombstone stays and
+            // the empty remote object is safely reconciled on the next cleanup.
             let at = Self.repoISO.string(from: Date())
             let purgeEntries = freed.map { r in
                 Repo.Entry(op: .purge, uuid: r.uuid, localIdentifier: r.localIdentifier, at: at)
@@ -960,6 +1022,7 @@ final class BackupEngine: ObservableObject {
     /// attached to. Upload is blocked until the user picks an option (sheet).
     @Published var pendingAttach: ExistingRepoInfo?
     @Published private(set) var attachStatus: String?
+    @Published private(set) var attachProgress: WorkProgress?
     @Published private(set) var checkpointStatus: String?
 
     struct ExistingRepoInfo: Identifiable, Equatable {
@@ -1046,8 +1109,28 @@ final class BackupEngine: ObservableObject {
             }
             let maxSeq = entries.filter { $0.gen == generation }.map(\.seq).max() ?? -1
             if maxSeq < seq {
-                if maxSeq >= 0 && maxSeq != seq - 1 {
-                    appendLog("Repository chain gap: last journal in the bucket is \(maxSeq) but this device expected \(seq - 1). Journals may have been deleted remotely.", .warning)
+                guard maxSeq == seq - 1 else {
+                    repoConflict = "Repository history is behind this device: generation \(generation) ends at \(maxSeq), but journal \(seq - 1) was expected. History may have been deleted or rolled back. Backup is blocked; do not write to this folder until it is inspected or restored."
+                    appendLog(repoConflict!, .error)
+                    return false
+                }
+                // Providers without conditional PUTs cannot make LIST→PUT
+                // atomic. As a best-effort single-writer guard, verify that
+                // the actual current head is still the exact ciphertext this
+                // device previously committed.
+                if UserDefaults.standard.bool(forKey: conditionalPutUnsupportedKey()) {
+                    let headKey = seq == 1
+                        ? Repo.checkpointKey(gen: generation)
+                        : Repo.journalKey(gen: generation, seq: seq - 1)
+                    let headURL = tempDir.appendingPathComponent("head-check-\(UUID().uuidString).age")
+                    defer { try? FileManager.default.removeItem(at: headURL) }
+                    try await client.getObject(key: client.fullKey(for: headKey), to: headURL)
+                    let remoteHash = try Repo.sha256Hex(fileAt: headURL)
+                    guard !repoLastHash.isEmpty, remoteHash == repoLastHash else {
+                        repoConflict = "Repository head \(generation)/\(maxSeq) was replaced or written by another device. Same-folder multi-device backup is not supported. Backup is blocked; use a separate folder or explicitly take over after retiring the other writer."
+                        appendLog(repoConflict!, .error)
+                        return false
+                    }
                 }
                 return true
             }
@@ -1081,10 +1164,18 @@ final class BackupEngine: ObservableObject {
         guard let index, let client = makeClient() else { return false }
         guard repoConflict == nil else { return false }
         guard let generation = repoGeneration else { return false }   // repo not attached yet
+        guard requireHealthyIndex("preparing a journal") else { return false }
 
         let dirty = index.unjournaledRecords()
+        guard requireHealthyIndex("reading pending journal changes") else { return false }
         if dirty.isEmpty && extra.isEmpty { return true }
-        let recipients = keyManager.recipientObjects
+        let recipients: [Age.Recipient]
+        do {
+            recipients = try keyManager.validatedRecipients()
+        } catch {
+            appendLog("Journal blocked: a configured encryption recipient is invalid. No recipient was silently skipped.", .error)
+            return false
+        }
         guard !recipients.isEmpty else { return false }
 
         guard await verifyChainHead(client: client, generation: generation, seq: repoNextSeq) else {
@@ -1120,7 +1211,7 @@ final class BackupEngine: ObservableObject {
             let md5 = Data(Insecure.MD5.hash(data: data)).base64EncodedString()
             let key = client.fullKey(for: Repo.journalKey(gen: generation, seq: seq))
             do {
-                try await putJournalObject(client: client, fileURL: encURL, key: key, md5: md5)
+                try await putMetadataObject(client: client, fileURL: encURL, key: key, md5: md5)
             } catch S3Error.http(412, _) {
                 // Someone wrote this seq between our check and PUT — possibly
                 // our own earlier timed-out attempt. Next flush's head check
@@ -1129,7 +1220,9 @@ final class BackupEngine: ObservableObject {
                 return false
             }
             index.markJournaled(records: dirty)
+            guard requireHealthyIndex("recording a journal commit") else { return false }
             setRepoPosition(generation: generation, nextSeq: seq + 1, lastHash: Repo.sha256Hex(data))
+            guard requireHealthyIndex("saving the repository chain position") else { return false }
             // Break the commit down by operation so deletions are visible in
             // the activity feed, not buried inside "N changes".
             var parts: [String] = []
@@ -1163,11 +1256,12 @@ final class BackupEngine: ObservableObject {
         "SnapSiphon.noConditionalPut.\(s3Config.endpoint)"
     }
 
-    /// PUT a journal file, preferring a conditional (If-None-Match: *) write
+    /// PUT a journal/checkpoint file, preferring a conditional
+    /// (If-None-Match: *) write
     /// where the provider supports it — that makes the LIST→PUT ownership race
     /// atomic. On 501 the capability is remembered as absent and the write
     /// retries plain (the pre-write head check still guards ownership).
-    private func putJournalObject(client: S3Client, fileURL: URL, key: String, md5: String) async throws {
+    private func putMetadataObject(client: S3Client, fileURL: URL, key: String, md5: String) async throws {
         let conditional = !UserDefaults.standard.bool(forKey: conditionalPutUnsupportedKey())
         do {
             try await S3Client.withRetries {
@@ -1175,6 +1269,18 @@ final class BackupEngine: ObservableObject {
                                            contentType: "application/age", contentMD5: md5,
                                            ifNoneMatch: conditional)
             }
+        } catch S3Error.http(412, _) where conditional {
+            // A timed-out request may actually have landed. Adopt only an
+            // exact byte-for-byte match; any other occupant is a hard writer
+            // conflict.
+            let existingURL = tempDir.appendingPathComponent("metadata-existing-\(UUID().uuidString).age")
+            defer { try? FileManager.default.removeItem(at: existingURL) }
+            try await client.getObject(key: key, to: existingURL)
+            if try Repo.sha256Hex(fileAt: existingURL) == Repo.sha256Hex(fileAt: fileURL) {
+                return
+            }
+            repoConflict = "A different writer already created repository metadata at this position. Same-folder multi-device backup is not supported; backup is blocked."
+            throw S3Error.malformedResponse(repoConflict!)
         } catch S3Error.http(501, _) where conditional {
             UserDefaults.standard.set(true, forKey: conditionalPutUnsupportedKey())
             appendLog("This provider doesn't support conditional writes — using plain journal writes from now on (the pre-write ownership check still applies).", .info)
@@ -1182,6 +1288,18 @@ final class BackupEngine: ObservableObject {
                 try await client.putObject(fileURL: fileURL, key: key,
                                            contentType: "application/age", contentMD5: md5,
                                            ifNoneMatch: false)
+            }
+        }
+        if !conditional || UserDefaults.standard.bool(forKey: conditionalPutUnsupportedKey()) {
+            // Plain PUT is necessarily best-effort. Read the key back
+            // immediately so a same-sequence overwrite visible now becomes a
+            // hard conflict instead of a silently advanced local position.
+            let checkURL = tempDir.appendingPathComponent("journal-check-\(UUID().uuidString).age")
+            defer { try? FileManager.default.removeItem(at: checkURL) }
+            try await client.getObject(key: key, to: checkURL)
+            guard try Repo.sha256Hex(fileAt: checkURL) == Repo.sha256Hex(fileAt: fileURL) else {
+                repoConflict = "The repository metadata just written was replaced by another writer. Same-folder multi-device backup is not supported; backup is blocked."
+                throw S3Error.malformedResponse(repoConflict!)
             }
         }
     }
@@ -1201,7 +1319,14 @@ final class BackupEngine: ObservableObject {
     @discardableResult
     private func writeCheckpoint(generation: Int) async -> Bool {
         guard let index, let client = makeClient() else { return false }
-        let recipients = keyManager.recipientObjects
+        guard requireHealthyIndex("preparing a checkpoint") else { return false }
+        let recipients: [Age.Recipient]
+        do {
+            recipients = try keyManager.validatedRecipients()
+        } catch {
+            appendLog("Checkpoint blocked: a configured encryption recipient is invalid. No recipient was silently skipped.", .error)
+            return false
+        }
         guard !recipients.isEmpty else { return false }
         let token = UUID().uuidString
         let dbURL = tempDir.appendingPathComponent("\(token).ckpt.sqlite")
@@ -1214,11 +1339,8 @@ final class BackupEngine: ObservableObject {
             try index.snapshot(to: dbURL)
             let digests = try AssetProcessor.encryptFile(at: dbURL, to: encURL, recipients: recipients)
             let key = client.fullKey(for: Repo.checkpointKey(gen: generation))
-            try await S3Client.withRetries {
-                try await client.putObject(fileURL: encURL, key: key,
-                                           contentType: "application/age",
-                                           contentMD5: digests.ciphertextMD5Base64)
-            }
+            try await putMetadataObject(client: client, fileURL: encURL, key: key,
+                                        md5: digests.ciphertextMD5Base64)
             setRepoPosition(generation: generation, nextSeq: 1, lastHash: digests.ciphertextSHA256)
             appendLog("Checkpoint written — generation \(generation) begins.", .success)
             PewPew.shared.play(.checkpoint)
@@ -1256,11 +1378,17 @@ final class BackupEngine: ObservableObject {
     /// double-writing it) is the one unrecoverable mistake this design has.
     func prepareRepository() async -> Bool {
         guard index != nil, let client = makeClient() else { return false }
+        guard requireHealthyIndex("checking the repository") else { return false }
         if repoConflict != nil {
             appendLog("Backup blocked — resolve the repository conflict first.", .error)
             return false
         }
-        if repoGeneration != nil { return true }   // already attached
+        if let generation = repoGeneration {
+            // An attached repository still gets a head check before any new
+            // blobs upload. Same-folder multi-device use is unsupported; any
+            // foreign advance or history gap is a hard conflict.
+            return await verifyChainHead(client: client, generation: generation, seq: repoNextSeq)
+        }
         do {
             let entries = try await listMetadata(client: client)
             if entries.isEmpty {
@@ -1279,8 +1407,9 @@ final class BackupEngine: ObservableObject {
                 appendLog("Initializing repository…", .info)
                 // Salt and layout must exist BEFORE the checkpoint so the
                 // snapshot carries them (readers learn both from it).
-                ensureRepoSalt()
+                try ensureRepoSalt()
                 index?.setMeta(RepoMeta.layout, Repo.shardedLayout)
+                guard requireHealthyIndex("initializing repository metadata") else { return false }
                 return await writeCheckpoint(generation: 1)
             }
             // Existing repository, and this install has no position in it.
@@ -1307,11 +1436,16 @@ final class BackupEngine: ObservableObject {
             attachStatus = "✗ This phone has no private key that can decrypt the repository"
             return false
         }
+        attachProgress = WorkProgress(
+            title: "Reading repository", completed: 1, total: 3,
+            detail: "Finding the newest readable checkpoint…")
+        defer { attachProgress = nil }
         attachStatus = "Reading repository…"
         do {
             let entries = try await listMetadata(client: client)
             let byGen = Dictionary(grouping: entries, by: \.gen)
-            guard let gen = byGen.filter({ $0.value.contains(where: { $0.seq == 0 }) }).keys.max() else {
+            let candidates = byGen.filter({ $0.value.contains(where: { $0.seq == 0 }) }).keys.sorted(by: >)
+            guard !candidates.isEmpty else {
                 attachStatus = "✗ No complete checkpoint found in this folder"
                 return false
             }
@@ -1322,38 +1456,80 @@ final class BackupEngine: ObservableObject {
                 try? FileManager.default.removeItem(at: encURL)
                 try? FileManager.default.removeItem(at: dbURL)
             }
-            try await client.getObject(key: client.fullKey(for: Repo.checkpointKey(gen: gen)), to: encURL)
-            var lastHash = try Repo.sha256Hex(fileAt: encURL)
-            try Age.decryptFile(at: encURL, to: dbURL, identity: identity)
+            var selectedGeneration: Int?
+            var lastHash = ""
+            for candidate in candidates {
+                do {
+                    try? FileManager.default.removeItem(at: encURL)
+                    try? FileManager.default.removeItem(at: dbURL)
+                    try await client.getObject(
+                        key: client.fullKey(for: Repo.checkpointKey(gen: candidate)),
+                        to: encURL)
+                    lastHash = try Repo.sha256Hex(fileAt: encURL)
+                    try Age.decryptFile(at: encURL, to: dbURL, identity: identity)
+                    selectedGeneration = candidate
+                    break
+                } catch {
+                    appendLog("Checkpoint generation \(candidate) is unreadable — trying the previous generation: \(error.localizedDescription)", .warning)
+                }
+            }
+            guard let gen = selectedGeneration else {
+                throw S3Error.malformedResponse("no checkpoint generation could be decrypted")
+            }
+            attachProgress = WorkProgress(
+                title: "Replaying history", completed: 2, total: 3,
+                detail: "Checkpoint loaded; validating journals…")
             // Detach BEFORE importing: if the replay dies mid-way (network),
             // the index must hold NO chain position — a stale one would let
             // the next backup silently fork an abandoned generation. The
             // attach prompt simply re-raises and the reload is retried.
             setRepoPosition(generation: nil, nextSeq: 1, lastHash: "")
             try index.importSnapshot(from: dbURL)
+            guard requireHealthyIndex("importing a repository checkpoint") else { return false }
 
             let seqs = byGen[gen]!.map(\.seq).filter { $0 > 0 }.sorted()
+            if let maxSeq = seqs.last, seqs != Array(1...maxSeq) {
+                throw S3Error.malformedResponse(
+                    "generation \(gen) has a journal sequence gap; refusing to take ownership")
+            }
             var applied = 0
             for seq in seqs {
                 attachStatus = "Replaying journal \(seq) of \(seqs.count)…"
+                attachProgress = WorkProgress(
+                    title: "Replaying history", completed: 2, total: 3,
+                    detail: "Journal \(seq) of \(seqs.count)")
                 let jURL = tempDir.appendingPathComponent("\(token)-j\(seq).age")
                 defer { try? FileManager.default.removeItem(at: jURL) }
                 try await client.getObject(key: client.fullKey(for: Repo.journalKey(gen: gen, seq: seq)), to: jURL)
                 let data = try Data(contentsOf: jURL)
                 let journal = try Repo.decodeJournal(data, identity: identity, tempDir: tempDir)
-                if journal.prevHash != lastHash {
-                    appendLog("Tamper evidence: journal \(gen)/\(seq) does not chain to its predecessor (expected \(lastHash.prefix(12))…, recorded \(journal.prevHash.prefix(12))…). Applying anyway, but the repository history has been altered.", .error)
+                guard journal.format == 1,
+                      journal.generation == gen,
+                      journal.seq == seq else {
+                    throw S3Error.malformedResponse(
+                        "journal \(gen)/\(seq) identifies itself as \(journal.generation)/\(journal.seq) format \(journal.format)")
+                }
+                guard journal.prevHash == lastHash else {
+                    throw S3Error.malformedResponse(
+                        "journal \(gen)/\(seq) does not chain to its predecessor; refusing to take ownership")
                 }
                 index.apply(journal: journal)
+                guard requireHealthyIndex("replaying repository journal \(seq)") else { return false }
                 lastHash = Repo.sha256Hex(data)
                 applied += 1
             }
+            attachProgress = WorkProgress(
+                title: "Finalizing local index", completed: 3, total: 3,
+                detail: "Saving the verified repository position…")
             setRepoPosition(generation: gen, nextSeq: (seqs.max() ?? 0) + 1, lastHash: lastHash)
-            ensureRepoSalt()   // pre-salt repos: mint one now (rides the next checkpoint)
+            try ensureRepoSalt()   // pre-salt repos: mint one now (rides the next checkpoint)
             repoConflict = nil
             pendingAttach = nil
             refreshCounts()
             let c = index.counts()
+            attachProgress = WorkProgress(
+                title: "Repository loaded", completed: 3, total: 3,
+                detail: "\(Format.count(c.uploaded)) backed-up items")
             attachStatus = "✓ Loaded \(Format.count(c.uploaded)) backed-up item\(c.uploaded == 1 ? "" : "s") (generation \(gen), \(applied) journal\(applied == 1 ? "" : "s")). This device now owns the journal chain."
             appendLog(attachStatus!, .success)
             return true
@@ -1364,44 +1540,132 @@ final class BackupEngine: ObservableObject {
         }
     }
 
-    /// "Verify match" for the attach sheet: read the repository's metadata into
-    /// a throwaway index (never touching the real cache), then compare it with
-    /// the local cache and with the blobs actually present under objects/.
-    /// Catches missing blobs and local/repo divergence — not silent remote
-    /// corruption (self-stored hashes + Verify cover sizes; full corruption
-    /// checks would mean downloading everything).
+    /// "Verify match" for the attach sheet: read the repository into a
+    /// throwaway index, enumerate the actual Apple Photos library, and compare
+    /// those two sources without touching the real cache or repository.
+    /// Exact PhotoKit identifiers are strongest; unique filename + capture time
+    /// + media-kind matches cover identifiers that changed after migration.
+    /// Blob presence and size are checked separately from library provenance.
     func compareWithRepo() async {
-        guard let index, let client = makeClient() else {
+        guard makeClient() != nil else {
             attachStatus = "✗ Storage not configured"; return
         }
         guard let secret = keyManager.exportSecret(), let identity = try? Age.Identity(bech32: secret) else {
             attachStatus = "✗ This phone has no private key that can decrypt the repository"; return
         }
-        attachStatus = "Comparing with repository…"
+        if !photoAuth.canRead {
+            await requestPhotoAccess()
+        }
+        guard photoAuth.canRead else {
+            attachStatus = "✗ Photos access is required to compare this repository with the Apple Photos library"
+            return
+        }
+
+        let limitedAccess: Bool
+        switch photoAuth {
+        case .limited: limitedAccess = true
+        default: limitedAccess = false
+        }
+
+        attachProgress = WorkProgress(
+            title: "Reading repository", completed: 1, total: 4,
+            detail: "Finding and decrypting a checkpoint…")
+        defer { attachProgress = nil }
+        attachStatus = "Reading and chain-checking repository…"
         let scratchDir = tempDir.appendingPathComponent("compare-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: scratchDir) }
         do {
             try FileManager.default.createDirectory(at: scratchDir, withIntermediateDirectories: true)
             let scratch = try BackupIndex(directory: scratchDir)
+            guard let client = makeClient() else {
+                attachStatus = "✗ Storage configuration changed during comparison"; return
+            }
             let entries = try await listMetadata(client: client)
             let byGen = Dictionary(grouping: entries, by: \.gen)
-            guard let gen = byGen.filter({ $0.value.contains(where: { $0.seq == 0 }) }).keys.max() else {
+            let candidates = byGen
+                .filter { $0.value.contains(where: { $0.seq == 0 }) }
+                .keys.sorted(by: >)
+            guard !candidates.isEmpty else {
                 attachStatus = "✗ No complete checkpoint found in this folder"; return
             }
+
             let encURL = scratchDir.appendingPathComponent("ckpt.age")
             let dbURL = scratchDir.appendingPathComponent("ckpt.sqlite")
-            try await client.getObject(key: client.fullKey(for: Repo.checkpointKey(gen: gen)), to: encURL)
-            try Age.decryptFile(at: encURL, to: dbURL, identity: identity)
-            try scratch.importSnapshot(from: dbURL)
-            for seq in byGen[gen]!.map(\.seq).filter({ $0 > 0 }).sorted() {
-                let jURL = scratchDir.appendingPathComponent("j\(seq).age")
-                try await client.getObject(key: client.fullKey(for: Repo.journalKey(gen: gen, seq: seq)), to: jURL)
-                scratch.apply(journal: try Repo.decodeJournal(try Data(contentsOf: jURL),
-                                                              identity: identity, tempDir: scratchDir))
+            var selectedGeneration: Int?
+            var lastHash = ""
+            for candidate in candidates {
+                do {
+                    try? FileManager.default.removeItem(at: encURL)
+                    try? FileManager.default.removeItem(at: dbURL)
+                    try await client.getObject(
+                        key: client.fullKey(for: Repo.checkpointKey(gen: candidate)),
+                        to: encURL)
+                    lastHash = try Repo.sha256Hex(fileAt: encURL)
+                    try Age.decryptFile(at: encURL, to: dbURL, identity: identity)
+                    try scratch.importSnapshot(from: dbURL)
+                    if let error = scratch.databaseError { throw error }
+                    selectedGeneration = candidate
+                    break
+                } catch {
+                    appendLog("Comparison could not read checkpoint generation \(candidate) — trying the previous generation: \(error.localizedDescription)", .warning)
+                }
+            }
+            guard let gen = selectedGeneration else {
+                throw S3Error.malformedResponse("no checkpoint generation could be decrypted")
             }
 
-            // Blob existence under objects/ (sizes come free with the LIST).
-            var blobs = Set<String>()
+            let seqs = byGen[gen]!.map(\.seq).filter { $0 > 0 }.sorted()
+            attachProgress = WorkProgress(
+                title: "Checking repository history", completed: 2, total: 4,
+                detail: seqs.isEmpty ? "No journals after the checkpoint" : "\(seqs.count) journals to validate")
+            if let maxSeq = seqs.last, seqs != Array(1...maxSeq) {
+                throw S3Error.malformedResponse(
+                    "generation \(gen) has a journal sequence gap; match cannot be trusted")
+            }
+            for seq in seqs {
+                attachStatus = "Chain-checking journal \(seq) of \(seqs.count)…"
+                attachProgress = WorkProgress(
+                    title: "Checking repository history", completed: 2, total: 4,
+                    detail: "Journal \(seq) of \(seqs.count)")
+                let jURL = scratchDir.appendingPathComponent("j\(seq).age")
+                try await client.getObject(key: client.fullKey(for: Repo.journalKey(gen: gen, seq: seq)), to: jURL)
+                let data = try Data(contentsOf: jURL)
+                let journal = try Repo.decodeJournal(data, identity: identity, tempDir: scratchDir)
+                guard journal.format == 1,
+                      journal.generation == gen,
+                      journal.seq == seq else {
+                    throw S3Error.malformedResponse(
+                        "journal \(gen)/\(seq) identifies itself as \(journal.generation)/\(journal.seq) format \(journal.format)")
+                }
+                guard journal.prevHash == lastHash else {
+                    throw S3Error.malformedResponse(
+                        "journal \(gen)/\(seq) does not chain to its predecessor; match cannot be trusted")
+                }
+                scratch.apply(journal: journal)
+                if let error = scratch.databaseError { throw error }
+                lastHash = Repo.sha256Hex(data)
+            }
+
+            attachStatus = "Enumerating Apple Photos…"
+            attachProgress = WorkProgress(
+                title: "Scanning Apple Photos", completed: 3, total: 4,
+                detail: "Reading asset identifiers and original-file metadata…")
+            let photos = self.photos
+            let libraryRecords = await Task.detached(priority: .utility) {
+                photos.comparisonRecords()
+            }.value
+            let repositoryRecords = scratch.allUploaded()
+            if let error = scratch.databaseError { throw error }
+            let match = RepositoryLibraryMatcher.compare(
+                repository: repositoryRecords,
+                library: libraryRecords)
+
+            // Blob presence and size under objects/ (both come free with LIST).
+            attachStatus = "Checking repository blobs…"
+            attachProgress = WorkProgress(
+                title: "Checking backup files", completed: 4, total: 4,
+                detail: "Listing encrypted blobs from storage…")
+            var blobs: [String: Int64] = [:]
             var token: String? = nil
             let objPfx = client.fullKey(for: "objects/")
             repeat {
@@ -1409,31 +1673,69 @@ final class BackupEngine: ObservableObject {
                 for o in page.objects where o.key.hasPrefix(objPfx) {
                     // Last path component = the blob address, in both the
                     // flat and sharded (objects/ab/…) layouts.
-                    if let addr = o.key.split(separator: "/").last { blobs.insert(String(addr)) }
+                    if let addr = o.key.split(separator: "/").last {
+                        blobs[String(addr)] = o.size
+                    }
                 }
                 token = page.next
+                attachProgress = WorkProgress(
+                    title: "Checking backup files", completed: 4, total: 4,
+                    detail: "\(Format.count(blobs.count)) encrypted blobs listed")
             } while token != nil
 
-            let repoUUIDs = Set(scratch.uploadedKeyPairs().map(\.uuid))
-            let localUUIDs = Set(index.uploadedKeyPairs().map(\.uuid))
-            let matching = repoUUIDs.intersection(localUUIDs).count
-            let repoOnly = repoUUIDs.subtracting(localUUIDs).count
-            let localOnly = localUUIDs.subtracting(repoUUIDs).count
-            let missingBlobs = repoUUIDs.subtracting(blobs).count
-            if repoOnly == 0 && localOnly == 0 && missingBlobs == 0 {
-                // The unambiguous good outcome deserves an unambiguous headline.
-                attachStatus = "✓ Perfect match\nThis phone and the repository agree on all \(Format.count(matching)) backed-up item\(matching == 1 ? "" : "s"), and every blob is present in the bucket. Taking over this repository is safe."
-            } else {
-                var lines = ["⚠ Differences found",
-                             "Repository: \(Format.count(repoUUIDs.count)) items · This phone: \(Format.count(localUUIDs.count)) · Matching: \(Format.count(matching))"]
-                if repoOnly > 0 { lines.append("• \(Format.count(repoOnly)) only in the repository (from another install, or before a reset)") }
-                if localOnly > 0 { lines.append("• \(Format.count(localOnly)) only on this phone (not yet in the repository)") }
-                if missingBlobs > 0 { lines.append("• \(Format.count(missingBlobs)) repository item\(missingBlobs == 1 ? "" : "s") missing their blob from the bucket") }
-                lines.append("Differences aren't necessarily bad — taking over merges the repository's view; anything only on this phone re-queues on the next scan.")
-                attachStatus = lines.joined(separator: "\n")
+            // Deduplicated files: several library records may intentionally
+            // share one content-addressed blob.
+            var expectedSizes: [String: Int64] = [:]
+            for record in repositoryRecords where expectedSizes[record.uuid] == nil {
+                expectedSizes[record.uuid] = record.byteSize
             }
+            let missingBlobs = expectedSizes.keys.filter { blobs[$0] == nil }.count
+            let wrongSizedBlobs = expectedSizes.filter { uuid, expected in
+                guard let actual = blobs[uuid] else { return false }
+                return expected > 0 && actual != expected
+            }.count
+
+            let repositoryHasHiddenRecords = repositoryRecords.contains(where: \.hidden)
+            let allLibraryRecordsFound = match.repositoryCount > 0 && match.repositoryNotFound == 0
+            let blobsHealthy = missingBlobs == 0 && wrongSizedBlobs == 0
+            let headline: String
+            if allLibraryRecordsFound && blobsHealthy {
+                headline = "✓ Repository matches this Photos library"
+            } else if allLibraryRecordsFound {
+                headline = "⚠ Photos match, but repository files have problems"
+            } else if match.repositoryCount == 0 {
+                headline = "⚠ Repository has no active backup records"
+            } else if match.matchedCount == 0 {
+                headline = "⚠ No match with the visible Photos library"
+            } else {
+                headline = "⚠ Partial Photos-library match"
+            }
+            var lines = [
+                headline,
+                "Repository: \(Format.count(match.repositoryCount)) active record\(match.repositoryCount == 1 ? "" : "s") · Photos visible: \(Format.count(match.libraryCount)) resource\(match.libraryCount == 1 ? "" : "s")",
+                "Found in Photos: \(Format.count(match.matchedCount)) (\(Format.count(match.exactIdentifierMatches)) exact ID\(match.metadataMatches > 0 ? " · \(Format.count(match.metadataMatches)) unique metadata" : ""))"
+            ]
+            if match.repositoryNotFound > 0 {
+                lines.append("• \(Format.count(match.repositoryNotFound)) repository record\(match.repositoryNotFound == 1 ? "" : "s") not found in the visible Photos library")
+            }
+            let healthyBlobs = expectedSizes.count - missingBlobs - wrongSizedBlobs
+            lines.append("Bucket blobs: \(Format.count(healthyBlobs)) present with expected size\(missingBlobs > 0 ? " · \(Format.count(missingBlobs)) missing" : "")\(wrongSizedBlobs > 0 ? " · \(Format.count(wrongSizedBlobs)) wrong size" : "")")
+            if limitedAccess {
+                lines.append("• Photos access is Limited, so unmatched records are inconclusive until Full Access is granted.")
+            } else if match.repositoryNotFound > 0 && repositoryHasHiddenRecords {
+                lines.append("• Hidden-album records may be invisible while its Face ID lock is enabled.")
+            }
+            if match.metadataMatches > 0 {
+                lines.append("• Metadata matches are best-effort; originals were not downloaded or hashed.")
+            }
+            lines.append("This check is read-only. A match does not prove another device has stopped writing; retire the old writer before taking over.")
+            attachProgress = WorkProgress(
+                title: "Comparison complete", completed: 4, total: 4,
+                detail: "\(Format.count(match.matchedCount)) of \(Format.count(match.repositoryCount)) active records found in Photos")
+            attachStatus = lines.joined(separator: "\n")
         } catch {
             attachStatus = "✗ \(error.localizedDescription)"
+            appendLog("Repository/Photos comparison failed: \(error.localizedDescription)", .error)
         }
     }
 
@@ -1473,6 +1775,7 @@ final class BackupEngine: ObservableObject {
             settings.keepScreenOnWhileUploading && (phase.isActive || verifying)
     }
     @Published private(set) var verifyStatus: String?
+    @Published private(set) var verifyProgress: WorkProgress?
 
     /// Egress-free backup verification: pages ListObjectsV2 over `objects/`
     /// (~10 requests per 10k blobs, zero downloads) and checks every uploaded
@@ -1487,7 +1790,14 @@ final class BackupEngine: ObservableObject {
             return
         }
         verifying = true
-        defer { verifying = false }
+        verifyStatus = "Listing encrypted blobs in storage…"
+        verifyProgress = WorkProgress(
+            title: "Listing storage", completed: 0, total: nil,
+            detail: "Waiting for the first page…")
+        defer {
+            verifying = false
+            verifyProgress = nil
+        }
         do {
             var remote: [String: Int64] = [:]   // uuid → ciphertext size
             var token: String? = nil
@@ -1500,11 +1810,21 @@ final class BackupEngine: ObservableObject {
                 }
                 token = page.next
                 verifyStatus = "Listing bucket… \(Format.count(remote.count)) blobs"
+                verifyProgress = WorkProgress(
+                    title: "Listing storage", completed: remote.count, total: nil,
+                    detail: "\(Format.count(remote.count)) encrypted blobs found")
             } while token != nil
 
-            let uploaded = index.allUploaded()
+            let uploaded = index.allUploaded().filter { !$0.uuid.isEmpty }
+            let deleted = index.deletedRecords().filter { !$0.uuid.isEmpty }
+            let totalRecords = uploaded.count + deleted.count
+            var checkedRecords = 0
+            verifyStatus = "Comparing \(Format.count(totalRecords)) index records with \(Format.count(remote.count)) blobs…"
+            verifyProgress = WorkProgress(
+                title: "Checking backup records", completed: 0, total: totalRecords,
+                detail: "Comparing expected names and ciphertext sizes")
             var ok = 0, missing = 0, mismatched = 0
-            for r in uploaded where !r.uuid.isEmpty {
+            for r in uploaded {
                 guard let size = remote[r.uuid] else {
                     missing += 1
                     index.requeue(r.localIdentifier, reason: "Verify: missing from bucket")
@@ -1516,14 +1836,33 @@ final class BackupEngine: ObservableObject {
                 } else {
                     ok += 1
                 }
+                checkedRecords += 1
+                if checkedRecords.isMultiple(of: 250) {
+                    verifyProgress = WorkProgress(
+                        title: "Checking backup records", completed: checkedRecords, total: totalRecords,
+                        detail: "\(Format.count(ok)) good · \(missing) missing · \(mismatched) wrong size")
+                    await Task.yield()
+                }
             }
             // Tombstoned (deleted-but-unpurged) records are still restorable
             // via --all, so their blobs are part of "verified" too. Missing
             // ones are reported, not re-queued — the asset is gone locally.
             var missingTombstones = 0
-            for r in index.deletedRecords() where !r.uuid.isEmpty && remote[r.uuid] == nil {
-                missingTombstones += 1
+            for r in deleted {
+                if remote[r.uuid] == nil {
+                    missingTombstones += 1
+                }
+                checkedRecords += 1
+                if checkedRecords.isMultiple(of: 250) {
+                    verifyProgress = WorkProgress(
+                        title: "Checking backup records", completed: checkedRecords, total: totalRecords,
+                        detail: "\(Format.count(ok)) good · \(missing) missing · \(mismatched) wrong size")
+                    await Task.yield()
+                }
             }
+            verifyProgress = WorkProgress(
+                title: "Checking backup records", completed: totalRecords, total: totalRecords,
+                detail: "\(Format.count(ok)) good · \(missing) missing · \(mismatched) wrong size")
 
             // Blobs no cache row references: tombstones already purged from the
             // cache, another install's uploads, or a crash between blob upload
@@ -1578,13 +1917,33 @@ final class BackupEngine: ObservableObject {
 
     func start() {
         guard runTask == nil else { return }
+        guard requireHealthyIndex("starting a backup") else { return }
+        guard repoConflict == nil, repoGeneration != nil else {
+            phase = .failed("Repository is not attached or has a hard conflict. Use Back Up Now to inspect it before uploading.")
+            return
+        }
         guard isConfigured else {
             appendLog("Finish setup (key + storage) before backing up.", .warning)
             return
         }
-        let recipients = keyManager.recipientObjects
+        let recipients: [Age.Recipient]
+        do {
+            recipients = try keyManager.validatedRecipients()
+        } catch {
+            phase = .failed("A configured encryption recipient is invalid. Backup stopped; no recipient was silently skipped.")
+            appendLog("A configured encryption recipient is invalid. Repair the recipient list before backing up.", .error)
+            return
+        }
         guard !recipients.isEmpty, let client = makeClient() else {
             phase = .failed("Missing key or storage configuration.")
+            return
+        }
+        let salt: String
+        do {
+            salt = try ensureRepoSalt()
+        } catch {
+            phase = .failed(error.localizedDescription)
+            appendLog("Could not create repository encryption salt: \(error.localizedDescription)", .error)
             return
         }
 
@@ -1601,7 +1960,7 @@ final class BackupEngine: ObservableObject {
         appendLog("Backup started.", .info)
 
         let processor = AssetProcessor(photos: photos, client: client, recipients: recipients,
-                                       tempDir: tempDir, saltHex: ensureRepoSalt(),
+                                       tempDir: tempDir, saltHex: salt,
                                        shardedLayout: repoSharded,
                                        allowHidden: settings.includeHidden)
 
@@ -1620,14 +1979,41 @@ final class BackupEngine: ObservableObject {
         }
     }
 
+    /// Resume is deliberately a repository operation, not just a task restart:
+    /// re-check the single-writer chain before uploading another blob.
+    func resume() {
+        guard runTask == nil, pipelineTask == nil else { return }
+        phase = .preparing
+        activityDetail = "Checking the repository before resuming…"
+        pipelineTask = Task { [weak self] in
+            let ready = await self?.prepareRepository() ?? false
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.activityDetail = nil
+                self.pipelineTask = nil
+                if ready { self.start() }
+                else if self.phase == .preparing { self.phase = .paused }
+            }
+        }
+    }
+
     func pause() {
         runTask?.cancel()
-        drainingTask = runTask   // cancellation is cooperative; remember it so a
+        let draining = runTask
+        drainingTask = draining  // cancellation is cooperative; remember it so a
         runTask = nil            // quick Resume waits for the old run to unwind
         phase = .paused
         waitingReason = nil
         uploadLanes.removeAll()
         appendLog("Paused.", .warning)
+        Task { [weak self] in
+            await draining?.value
+            await MainActor.run { [weak self] in
+                // If Resume already consumed this task it has set the property
+                // to nil; assigning nil again is harmless.
+                self?.drainingTask = nil
+            }
+        }
     }
 
     private func finishRun(generation: Int) {
@@ -1649,12 +2035,17 @@ final class BackupEngine: ObservableObject {
                       ? "Backup finished — everything was already backed up."
                       : "Backup finished — \(sessionUploaded) uploaded this session.", .success)
         }
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRunKey)
-        rescheduleReminder()   // reset the "no backup for N days" countdown
+        if phase == .finished {
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRunKey)
+            rescheduleReminder()   // reset only after an actually-successful run
+        }
         // Commit whatever this run changed to the journal chain — including
         // changes a PREVIOUS run failed to commit (they stay flagged in the
         // cache until a flush succeeds).
-        Task { await flushJournal() }
+        postRunTask = Task { [weak self] in
+            _ = await self?.flushJournal()
+            await MainActor.run { [weak self] in self?.postRunTask = nil }
+        }
     }
 
     // MARK: Per-stream upload slots
@@ -1782,12 +2173,12 @@ final class BackupEngine: ObservableObject {
                 if await !waitForFavorableConditions() { continue }   // park refills; in-flight uploads run on
                 // Journal every ~25 uploads so a mid-run crash loses at most a
                 // small tail of uncommitted (but re-flushable) changes.
-                let unjournaled = await self.pendingJournalCount()
+                let unjournaled = self.pendingJournalCount()
                 if unjournaled >= journalFlushThreshold {
                     await self.flushJournal()
                 }
                 // Top up to the (possibly changed) worker target.
-                target = await self.workerTarget
+                target = self.workerTarget
                 while inFlight.count < target, spawnNext() {}
             }
         }
@@ -1815,6 +2206,10 @@ final class BackupEngine: ObservableObject {
     private func processOne(_ record: AssetRecord, processor: AssetProcessor,
                             bytesPerSecond: Double) async {
         guard let index else { return }
+        guard requireHealthyIndex("starting an upload") else {
+            runAbortReason = "Local index failed; backup stopped before uploading more data."
+            return
+        }
         let rid = record.localIdentifier
         beginSlot(record)
         do {
@@ -1823,6 +2218,11 @@ final class BackupEngine: ObservableObject {
             uploaded.uploadedAt = nil
             uploaded.lastError = nil
             index.upsert(uploaded)
+            guard requireHealthyIndex("marking an upload in progress") else {
+                runAbortReason = "Local index failed; backup stopped before uploading more data."
+                endSlot(rid)
+                return
+            }
 
             // A record requeued by Verify has a size mismatch — the HEAD-skip
             // would just re-mark the bad blob as fine, so force the upload.
@@ -1859,9 +2259,14 @@ final class BackupEngine: ObservableObject {
             uploaded.journaled = false
             index.upsert(uploaded)
             index.markLocalSeen([rid])   // uploaded from this phone = seen here
-            if forceUpload, !result.alreadyPresent {
-                // A verify-repair re-uploaded a (possibly shared) blob: keep
-                // every twin's stored hashes/size in step with the new bytes.
+            guard requireHealthyIndex("recording a completed upload") else {
+                runAbortReason = "Local index failed after upload; the unreferenced encrypted blob is safe to ignore, and backup has stopped."
+                endSlot(rid)
+                return
+            }
+            if !result.alreadyPresent {
+                // Any write to a content-addressed blob changes its randomized
+                // ciphertext. Keep every twin's stored hashes/size in step.
                 index.updateTwinHashes(uuid: result.uuid,
                                        plaintextHash: result.plaintextHash,
                                        ciphertextHash: result.ciphertextHash,
@@ -1935,13 +2340,25 @@ final class BackupEngine: ObservableObject {
         index?.unjournaledCount() ?? 0
     }
 
-    func resetIndex() {
-        index?.reset()
-        scanMark = nil
-        repoConflict = nil
-        pendingAttach = nil
-        refreshCounts()
-        appendLog("Local index cleared (repository untouched). The next backup re-inspects the folder — use the attach prompt to reload from the repository, or a fresh folder to start over.", .warning)
+    @discardableResult
+    func resetIndex() -> Result<Void, Error> {
+        guard let index else {
+            let error = CocoaError(.fileNoSuchFile)
+            appendLog("Could not clear local index: \(error.localizedDescription)", .error)
+            return .failure(error)
+        }
+        do {
+            try index.reset()
+            scanMark = nil
+            repoConflict = nil
+            pendingAttach = nil
+            refreshCounts()
+            appendLog("Local index cleared (repository untouched). The next backup re-inspects the folder — use the attach prompt to reload from the repository, or a fresh folder to start over.", .warning)
+            return .success(())
+        } catch {
+            appendLog("Could not clear local index: \(error.localizedDescription)", .error)
+            return .failure(error)
+        }
     }
 
     // MARK: Logging

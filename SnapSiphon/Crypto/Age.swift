@@ -21,6 +21,7 @@ enum Age {
     enum Error: Swift.Error, LocalizedError {
         case badRecipient
         case encryptionFailed
+        case randomGenerationFailed
         case malformed(String)
         case noMatchingKey
         case authenticationFailed
@@ -29,6 +30,7 @@ enum Age {
             switch self {
             case .badRecipient: return "The recipient key is not a valid age X25519 key."
             case .encryptionFailed: return "Encryption failed while sealing a chunk."
+            case .randomGenerationFailed: return "Secure random-number generation failed; encryption was stopped."
             case .malformed(let m): return "Not a valid age file: \(m)."
             case .noMatchingKey: return "None of this file's recipients match the available key."
             case .authenticationFailed: return "Decryption failed — the file is corrupted or was tampered with."
@@ -210,9 +212,10 @@ enum Age {
             self.header = try Age.makeHeader(fileKey: fileKey, recipients: recipients)
             // Payload key = HKDF(fileKey, salt: nonce(16 random), info: "payload")
             var n = Data(count: 16)
-            n.withUnsafeMutableBytes { ptr in
-                _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
+            let randomStatus = n.withUnsafeMutableBytes { ptr in
+                SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
             }
+            guard randomStatus == errSecSuccess else { throw Error.randomGenerationFailed }
             self.nonce = n
             let key = HKDF<SHA256>.deriveKey(
                 inputKeyMaterial: fileKey,
@@ -298,6 +301,10 @@ enum Age {
     static func decryptFile(at source: URL, to destination: URL, identity: Identity) throws {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
+        var completed = false
+        defer {
+            if !completed { try? FileManager.default.removeItem(at: destination) }
+        }
 
         // The header is ASCII terminated by "--- <mac>\n", followed immediately
         // by binary payload — so locate the boundary at the BYTE level before
@@ -336,7 +343,13 @@ enum Age {
         let streamKey = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: fileKey, salt: nonce, info: Data("payload".utf8), outputByteCount: 32)
 
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        guard FileManager.default.createFile(
+            atPath: destination.path,
+            contents: nil,
+            attributes: [.protectionKey: FileProtectionType.complete]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
         let output = try FileHandle(forWritingTo: destination)
         defer { try? output.close() }
 
@@ -364,6 +377,7 @@ enum Age {
             }
             if done { break }
         }
+        completed = true
     }
 
     /// Find an X25519 stanza our identity can open and recover the file key.

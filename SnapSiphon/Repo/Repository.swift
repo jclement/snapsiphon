@@ -100,9 +100,11 @@ enum Repo {
     /// the salt, no one can hash a known photo and probe whether you have it.
     /// The salt is minted at repository init and rides inside the encrypted
     /// checkpoint's meta table.
-    static func newSaltHex() -> String {
+    static func newSaltHex() throws -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            throw Age.Error.randomGenerationFailed
+        }
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 

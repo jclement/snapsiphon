@@ -135,6 +135,53 @@ final class PhotoLibrary {
         return ids
     }
 
+    /// Enumerate lightweight identity metadata for repository attachment
+    /// checks. This reads PhotoKit's resource metadata but never downloads or
+    /// hashes an original, so even an iCloud-backed library stays inexpensive.
+    /// Live Photo motion resources are represented separately because the
+    /// repository stores them as separate backup records.
+    func comparisonRecords() -> [LibraryComparisonRecord] {
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = true
+        let result = PHAsset.fetchAssets(with: options)
+        var records: [LibraryComparisonRecord] = []
+        records.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in
+            let mediaType: AssetRecord.MediaType
+            let preferred: PHAssetResourceType
+            switch asset.mediaType {
+            case .image:
+                mediaType = .photo
+                preferred = .photo
+            case .video:
+                mediaType = .video
+                preferred = .video
+            default:
+                return
+            }
+            let resources = PHAssetResource.assetResources(for: asset)
+            let original = resources.first { $0.type == preferred }
+                ?? resources.first { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo }
+                ?? resources.first
+            records.append(LibraryComparisonRecord(
+                localIdentifier: asset.localIdentifier,
+                mediaType: mediaType,
+                filename: original?.originalFilename ?? "",
+                createdAt: asset.creationDate))
+
+            if asset.mediaSubtypes.contains(.photoLive),
+               let motion = resources.first(where: { $0.type == .fullSizePairedVideo })
+                    ?? resources.first(where: { $0.type == .pairedVideo }) {
+                records.append(LibraryComparisonRecord(
+                    localIdentifier: AssetRecord.liveMotionIdentifier(for: asset.localIdentifier),
+                    mediaType: .other,
+                    filename: motion.originalFilename,
+                    createdAt: asset.creationDate))
+            }
+        }
+        return records
+    }
+
     enum ExportError: Error, LocalizedError {
         case notFound
         case noResource

@@ -72,7 +72,21 @@ struct AssetProcessor {
                 localIdentifier: record.localIdentifier, to: originalURL,
                 allowHidden: allowHidden)
         }
+        // PhotoKit writes the export for us; immediately tighten its on-disk
+        // protection before hashing or doing any other work with it.
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: originalURL.path)
         onMeta?(exported.filename, exported.byteSize)
+        // Conservative age overhead estimate: one 16-byte authentication tag
+        // per STREAM chunk, a payload nonce, and the bounded recipient/header
+        // area. Fail before spending time encrypting an unsupported upload.
+        let chunks = max(Int64(1),
+                         (exported.byteSize + Int64(Age.chunkSize) - 1) / Int64(Age.chunkSize))
+        let estimatedCiphertext = exported.byteSize + chunks * 16 + 65_552
+        if estimatedCiphertext > S3Client.maximumSinglePutBytes {
+            throw S3Error.objectTooLarge(estimatedCiphertext)
+        }
 
         // 2. Hash the plaintext (fast local read) — its salted HMAC IS the
         //    blob name, so identical content always maps to the same key.
@@ -125,7 +139,13 @@ struct AssetProcessor {
                             recipients: [Age.Recipient]) throws -> EncryptDigests {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        guard FileManager.default.createFile(
+            atPath: destination.path,
+            contents: nil,
+            attributes: [.protectionKey: FileProtectionType.complete]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
         let output = try FileHandle(forWritingTo: destination)
         defer { try? output.close() }
 

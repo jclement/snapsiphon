@@ -9,6 +9,7 @@ struct StorageSetupView: View {
     @State private var loaded = false
     @State private var accessKeyID = ""
     @State private var secretKey = ""
+    @State private var sessionToken = ""
     @State private var testing = false
     @State private var status: Status?
     @State private var askSaveAnyway: String?   // holds the failure message
@@ -44,6 +45,7 @@ struct StorageSetupView: View {
                             .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                         FieldRow(label: "Access key ID", text: $accessKeyID, mono: true)
                         FieldRow(label: "Secret access key", text: $secretKey, mono: true, secure: true)
+                        FieldRow(label: "Session token (optional)", text: $sessionToken, mono: true, secure: true)
                     }
                 }
 
@@ -76,9 +78,13 @@ struct StorageSetupView: View {
                isPresented: Binding(get: { askSaveAnyway != nil },
                                     set: { if !$0 { askSaveAnyway = nil } })) {
             Button("Save anyway") {
-                commit()
-                status = .savedUntested
-                askSaveAnyway = nil
+                do {
+                    try commit()
+                    status = .savedUntested
+                    askSaveAnyway = nil
+                } catch {
+                    askSaveAnyway = error.localizedDescription
+                }
             }
             Button("Keep editing", role: .cancel) { askSaveAnyway = nil }
         } message: {
@@ -92,11 +98,13 @@ struct StorageSetupView: View {
         testing = true
         status = nil
         defer { testing = false }
-        let creds = S3Credentials(accessKeyID: accessKeyID, secretAccessKey: secretKey)
+        let creds = S3Credentials(accessKeyID: accessKeyID,
+                                  secretAccessKey: secretKey,
+                                  sessionToken: sessionToken.isEmpty ? nil : sessionToken)
         let client = S3Client(config: draft, credentials: creds)
         do {
             try await client.testConnection()
-            commit()
+            try commit()
             status = .saved
         } catch {
             // Nothing was saved — offer to save anyway (e.g. setting up offline).
@@ -104,8 +112,15 @@ struct StorageSetupView: View {
         }
     }
 
-    private func commit() {
+    private func commit() throws {
         let old = engine.s3Config
+        // Persist the secret atomically first. If Keychain rejects it, leave
+        // the active destination untouched and surface the failure.
+        if !accessKeyID.isEmpty && !secretKey.isEmpty {
+            try engine.saveCredentials(accessKeyID: accessKeyID,
+                                       secret: secretKey,
+                                       sessionToken: sessionToken.isEmpty ? nil : sessionToken)
+        }
         // ANY change to where objects land is a destination change — prefix
         // and path-style included. A prefix edit moves the whole repository.
         if old.isComplete, (old.bucket != draft.bucket || old.endpoint != draft.endpoint
@@ -113,9 +128,6 @@ struct StorageSetupView: View {
             engine.noteDestinationChanged()
         }
         engine.s3Config = draft
-        if !accessKeyID.isEmpty && !secretKey.isEmpty {
-            engine.saveCredentials(accessKeyID: accessKeyID, secret: secretKey)
-        }
     }
 
     private func prefill() {
@@ -125,6 +137,7 @@ struct StorageSetupView: View {
         if let creds = S3CredentialStore.load() {
             accessKeyID = creds.accessKeyID
             secretKey = creds.secretAccessKey
+            sessionToken = creds.sessionToken ?? ""
         }
     }
 

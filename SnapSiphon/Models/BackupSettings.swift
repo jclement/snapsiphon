@@ -74,6 +74,7 @@ struct BackupSettings: Codable, Equatable {
 
     static let parallelRange = 1...8
     static let speedRange = 0.0...50.0
+    static let graceRange = 7...180
 
     // MARK: Persistence
 
@@ -84,7 +85,20 @@ struct BackupSettings: Codable, Equatable {
               let decoded = try? JSONDecoder().decode(BackupSettings.self, from: data) else {
             return BackupSettings()
         }
-        return decoded
+        var validated = decoded
+        validated.parallelUploads = min(max(validated.parallelUploads, parallelRange.lowerBound),
+                                        parallelRange.upperBound)
+        validated.deleteGraceDays = min(max(validated.deleteGraceDays, graceRange.lowerBound),
+                                        graceRange.upperBound)
+        if let value = validated.journalEvery {
+            validated.journalEvery = min(max(value, Int(journalEveryRange.lowerBound)),
+                                         Int(journalEveryRange.upperBound))
+        }
+        if let value = validated.checkpointEvery {
+            validated.checkpointEvery = min(max(value, Int(checkpointEveryRange.lowerBound)),
+                                            Int(checkpointEveryRange.upperBound))
+        }
+        return validated
     }
 
     func save() {

@@ -9,7 +9,16 @@ struct SigV4 {
     let accessKeyID: String
     let secretAccessKey: String
     let region: String
+    let sessionToken: String?
     let service: String = "s3"
+
+    init(accessKeyID: String, secretAccessKey: String, region: String,
+         sessionToken: String? = nil) {
+        self.accessKeyID = accessKeyID
+        self.secretAccessKey = secretAccessKey
+        self.region = region
+        self.sessionToken = sessionToken
+    }
 
     struct SignedRequest {
         var url: URL
@@ -39,6 +48,9 @@ struct SigV4 {
         canonicalHeaders["host"] = host
         canonicalHeaders["x-amz-content-sha256"] = contentSHA256
         canonicalHeaders["x-amz-date"] = amzDate
+        if let sessionToken, !sessionToken.isEmpty {
+            canonicalHeaders["x-amz-security-token"] = sessionToken
+        }
 
         // Canonical headers must be sorted by lowercased name.
         let sortedHeaderKeys = canonicalHeaders.keys

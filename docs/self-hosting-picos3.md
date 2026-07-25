@@ -7,8 +7,9 @@ over your tailnet, end to end, without exposing anything to the internet.
 
 Why it pairs well with SnapSiphon:
 
-- **Real MD5 ETags** → the app's *Verify all backups* does full checksum
-  verification, zero downloads.
+- **Efficient listings** → the app's *Verify all backups* confirms every
+  expected object is present with the expected ciphertext size, with zero
+  downloads. Restore performs the end-to-end SHA-256 check.
 - **No Object Lock / versioning** → *Purge deleted backups* frees space
   immediately after the grace period (no lock retention to wait out). Use
   picos3's `--retain` if you want server-side soft-delete retention instead.

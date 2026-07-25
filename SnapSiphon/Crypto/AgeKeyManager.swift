@@ -137,9 +137,11 @@ final class AgeKeyManager: ObservableObject {
 
     var isConfigured: Bool { !recipients.isEmpty }
 
-    /// Parsed recipients, skipping any that no longer decode.
-    var recipientObjects: [Age.Recipient] {
-        recipients.compactMap { try? Age.Recipient(bech32: $0) }
+    /// Parse every configured recipient or fail the whole operation. Silently
+    /// dropping a damaged recipient would encrypt a backup to fewer keys than
+    /// the UI promises.
+    func validatedRecipients() throws -> [Age.Recipient] {
+        try recipients.map { try Age.Recipient(bech32: $0) }
     }
 
     /// The recipient string that corresponds to the on-device identity (if any),

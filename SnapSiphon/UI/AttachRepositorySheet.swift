@@ -56,6 +56,7 @@ struct AttachRepositorySheet: View {
                                      detail: "The other device is retired (or this is a reinstall): reload its index from the bucket, then continue backing up here. Requires this phone's key.",
                                      color: Theme.teal) {
                             Task {
+                                report = nil
                                 working = true
                                 let ok = await engine.restoreIndexFromRepo()
                                 report = engine.attachStatus
@@ -65,9 +66,10 @@ struct AttachRepositorySheet: View {
                         }
                         optionButton(icon: "doc.text.magnifyingglass",
                                      title: "Verify match first",
-                                     detail: "Read the repository's index (touching nothing) and compare it with this phone: matching items, differences, and whether every backed-up file is actually present.",
+                                     detail: "Read the repository (touching nothing), compare it with the actual Apple Photos library visible on this phone, and check every backup blob is present with the expected size.",
                                      color: Theme.violet) {
                             Task {
+                                report = nil
                                 working = true
                                 await engine.compareWithRepo()
                                 report = engine.attachStatus
@@ -88,7 +90,7 @@ struct AttachRepositorySheet: View {
                         }
                     }
 
-                    if working { ProgressView().tint(Theme.teal).frame(maxWidth: .infinity) }
+                    if working { workProgressCard }
                     if let report {
                         reportBanner(report)
                     }
@@ -99,6 +101,36 @@ struct AttachRepositorySheet: View {
             .background(Theme.canvas.ignoresSafeArea())
             .interactiveDismissDisabled(working)
         }
+    }
+
+    private var workProgressCard: some View {
+        let progress = engine.attachProgress
+        return VStack(alignment: .leading, spacing: 9) {
+            if let total = progress?.total, total > 0 {
+                ProgressView(value: Double(progress?.completed ?? 0), total: Double(total))
+                    .tint(Theme.teal)
+            } else {
+                ProgressView().tint(Theme.teal)
+            }
+            HStack {
+                Text(progress?.title ?? "Working…")
+                    .font(Theme.rounded(14, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+                if let total = progress?.total, total > 0 {
+                    Text("\(min(progress?.completed ?? 0, total))/\(total)")
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+            }
+            Text(progress?.detail ?? engine.attachStatus ?? "Starting…")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.teal.opacity(0.35), lineWidth: 1))
     }
 
     /// The verify/take-over outcome, styled so success is unmissable: a green

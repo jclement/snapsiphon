@@ -421,7 +421,7 @@ struct DashboardView: View {
             PrimaryButton(title: "Scanning…", systemImage: "hourglass", enabled: false) {}
         } else if engine.phase == .paused {
             VStack(spacing: 10) {
-                PrimaryButton(title: "Resume", systemImage: "play.fill") { engine.start() }
+                PrimaryButton(title: "Resume", systemImage: "play.fill") { engine.resume() }
             }
         } else {
             PrimaryButton(title: "Back Up Now", systemImage: "arrow.up.circle.fill", enabled: !isBusy) {
