@@ -339,9 +339,17 @@ final class BackupIndex {
     /// the self-healing full-scan check. Excludes Live-clip rows (mediaType
     /// 'other', which have no library-count counterpart) so they can't inflate
     /// the indexed side and mask missing assets.
-    func indexedPhotoVideoCount() -> Int {
+    ///
+    /// `hidden` selects which population to count, and callers MUST pass one:
+    /// PhotoKit's totals cover the visible library and the Hidden album
+    /// separately (and drop the Hidden album entirely while its Face ID lock is
+    /// on), so a combined total is never comparable against anything.
+    func indexedPhotoVideoCount(hidden: Bool) -> Int {
         queue.sync {
-            Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state != 'deleted' AND mediaType IN ('photo','video');"))
+            Int(db.scalarInt("""
+                SELECT COUNT(*) FROM assets
+                WHERE state != 'deleted' AND mediaType IN ('photo','video') AND hidden=\(hidden ? 1 : 0);
+                """))
         }
     }
 

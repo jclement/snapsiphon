@@ -5,9 +5,17 @@ struct DashboardView: View {
 
     /// Overall file-count progress: uploaded files ÷ library files. Prefers the
     /// live library totals; falls back to the index if they're not loaded yet.
+    ///
+    /// Both sides count the same population — visible rows always, hidden ones
+    /// only while iOS is showing us the Hidden album. Uploaded hidden items
+    /// outlive their visibility in the index, so counting them against a
+    /// library total that no longer includes them reads as 100% done.
     private var overallProgress: Double {
-        let done = engine.uploadedPhotos + engine.uploadedVideos
-        let libTotal = engine.libraryPhotos + engine.libraryVideos
+        let s = engine.storedSegments
+        let done = s.photoCount + s.videoCount
+            + (engine.hiddenCounted ? s.hiddenPhotoCount + s.hiddenVideoCount : 0)
+        let libTotal = engine.libraryVisiblePhotos + engine.libraryVisibleVideos
+            + (engine.hiddenCounted ? engine.libraryHiddenPhotos + engine.libraryHiddenVideos : 0)
         if libTotal > 0 { return min(1, Double(done) / Double(libTotal)) }
         guard engine.counts.total > 0 else { return 0 }
         return Double(engine.counts.uploaded) / Double(engine.counts.total)
@@ -148,13 +156,13 @@ struct DashboardView: View {
         let hiddenIncluded = engine.settings.includeHidden
         var rows: [LegendRow] = [
             LegendRow(kind: .photo, count: s.photoCount,
-                      total: max(0, engine.libraryPhotos - (hiddenIncluded ? engine.libraryHiddenPhotos : 0)),
+                      total: engine.libraryVisiblePhotos,
                       bytes: s.photoBytes),
             LegendRow(kind: .hiddenPhoto, count: s.hiddenPhotoCount,
                       total: engine.libraryHiddenPhotos, bytes: s.hiddenPhotoBytes),
             LegendRow(kind: .clip, count: s.clipCount, total: nil, bytes: s.clipBytes),
             LegendRow(kind: .video, count: s.videoCount,
-                      total: max(0, engine.libraryVideos - (hiddenIncluded ? engine.libraryHiddenVideos : 0)),
+                      total: engine.libraryVisibleVideos,
                       bytes: s.videoBytes),
             LegendRow(kind: .hiddenVideo, count: s.hiddenVideoCount,
                       total: engine.libraryHiddenVideos, bytes: s.hiddenVideoBytes),

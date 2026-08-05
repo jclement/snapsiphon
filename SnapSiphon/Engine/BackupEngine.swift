@@ -285,11 +285,43 @@ final class BackupEngine: ObservableObject {
         Task { await compactNow() }
     }
 
+    /// Library totals with the Hidden album's share taken back out, so they can
+    /// be compared against the index's visible rows. `libraryPhotos` already
+    /// includes hidden items when the setting is on — but only while iOS is
+    /// willing to show them, which the album's Face ID lock revokes at any
+    /// moment. Every library-minus-index subtraction has to run per population
+    /// (see `toBackupPhotos`, the self-heal check in `runScan`).
+    var libraryVisiblePhotos: Int {
+        max(0, libraryPhotos - (settings.includeHidden ? libraryHiddenPhotos : 0))
+    }
+    var libraryVisibleVideos: Int {
+        max(0, libraryVideos - (settings.includeHidden ? libraryHiddenVideos : 0))
+    }
+
     /// Not-yet-uploaded counts per type (library total minus uploaded) — covers
     /// both indexed-pending items AND new photos no scan has seen yet, which is
     /// what the "ready to back up" banner needs at launch.
-    var toBackupPhotos: Int { settings.includePhotos ? max(0, libraryPhotos - uploadedPhotos) : 0 }
-    var toBackupVideos: Int { settings.includeVideos ? max(0, libraryVideos - uploadedVideos) : 0 }
+    ///
+    /// Visible and hidden are subtracted separately: hidden items already backed
+    /// up stay in the index forever, so once the Hidden album re-locks (or the
+    /// setting goes off) they'd cancel out real pending visible photos and the
+    /// banner would read "everything backed up" while new photos sat unqueued.
+    var toBackupPhotos: Int {
+        guard settings.includePhotos else { return 0 }
+        return max(0, libraryVisiblePhotos - storedSegments.photoCount)
+             + (hiddenCounted ? max(0, libraryHiddenPhotos - storedSegments.hiddenPhotoCount) : 0)
+    }
+    var toBackupVideos: Int {
+        guard settings.includeVideos else { return 0 }
+        return max(0, libraryVisibleVideos - storedSegments.videoCount)
+             + (hiddenCounted ? max(0, libraryHiddenVideos - storedSegments.hiddenVideoCount) : 0)
+    }
+
+    /// Whether the Hidden album belongs in the library-vs-index arithmetic right
+    /// now: the setting is on AND iOS is actually showing us the album (a Face
+    /// ID-locked album reports zero items to every app, indistinguishable from
+    /// empty — we can only account for what we can see).
+    var hiddenCounted: Bool { settings.includeHidden && hiddenItemCount > 0 }
 
     // MARK: Background backup (BGProcessingTask)
 
@@ -580,8 +612,15 @@ final class BackupEngine: ObservableObject {
         // Enumerate AND index off the main actor so the UI stays live and we can
         // report progress as we go.
         let outcome: (added: Int, newest: Date?, checked: Int, hiddenSeen: Int) = await Task.detached(priority: .utility) {
+            // ALWAYS enumerate hidden assets, whatever the setting says: the
+            // setting governs what we back up, not what we're allowed to know
+            // about. Enumerating them is the only way to keep each row's hidden
+            // flag current, and that flag is what keeps the visible and hidden
+            // tallies from contaminating each other (self-heal check below,
+            // delete reconciliation, the dashboard donut). With the setting off
+            // they're skipped for queueing a few lines down.
             let infos = photos.enumerate(includePhotos: includePhotos, includeVideos: includeVideos,
-                                         since: since, includeHidden: includeHidden)
+                                         since: since, includeHidden: true)
             var added = 0
             var newest = startMark
             for (i, info) in infos.enumerated() {
@@ -593,6 +632,10 @@ final class BackupEngine: ObservableObject {
                 // covered, so the mark must not move past it (favoriting it
                 // later has to be picked up by a fast scan).
                 if favoritesOnly && !info.isFavorite { continue }
+                // Hidden and not backing hidden up: seen (its flag is refreshed
+                // below) but not covered, so — like a filtered-out favorite —
+                // it must not advance the mark or get queued.
+                if info.isHidden && !includeHidden { continue }
                 if let d = info.creationDate, newest == nil || d > newest! { newest = d }
                 // Live Photo motion clips get their own suffixed record —
                 // checked independently of the still, so enabling the toggle
@@ -677,13 +720,32 @@ final class BackupEngine: ObservableObject {
         // mark (an old import, iCloud backfill) — silently re-check everything.
         // This replaces the old user-facing "Deep scan" button.
         if !deep, !favoritesOnly {
-            let expected = (includePhotos ? libraryPhotos : 0) + (includeVideos ? libraryVideos : 0)
-            // Compare like-for-like: only photo/video rows. Live-clip rows
-            // have no library-count counterpart and once masked genuinely
-            // missing assets (old hidden photos after the lock came off).
-            let indexed = index.indexedPhotoVideoCount()
-            if expected > indexed {
-                appendLog("Library has \(Format.count(expected)) eligible items but the index only knows \(Format.count(indexed)) — running a full re-check.", .info)
+            // Compare like-for-like: only photo/video rows (Live-clip rows have
+            // no library-count counterpart), and the visible library and the
+            // Hidden album as SEPARATE tallies.
+            //
+            // One combined total is not comparable: the Hidden album vanishes
+            // from every PhotoKit fetch while its Face ID lock is on, so hidden
+            // items backed up during an unlocked run stay in the index but drop
+            // out of the library count the moment the lock goes back on. Summed
+            // together that permanently inflates the indexed side, `expected >
+            // indexed` never fires again, and visible photos that slipped
+            // behind the incremental mark are never picked up.
+            let expectedVisible = (includePhotos ? libraryVisiblePhotos : 0)
+                                + (includeVideos ? libraryVisibleVideos : 0)
+            let indexedVisible = index.indexedPhotoVideoCount(hidden: false)
+            // The hidden tally only when we're backing the album up. A locked
+            // album reports zero hidden items, which can never trigger a false
+            // full scan (0 > n is false) — it just makes this half a no-op.
+            let expectedHidden = includeHidden
+                ? (includePhotos ? libraryHiddenPhotos : 0) + (includeVideos ? libraryHiddenVideos : 0)
+                : 0
+            let indexedHidden = includeHidden ? index.indexedPhotoVideoCount(hidden: true) : 0
+            if expectedVisible > indexedVisible || expectedHidden > indexedHidden {
+                let what = expectedVisible > indexedVisible
+                    ? "Library has \(Format.count(expectedVisible)) eligible items but the index only knows \(Format.count(indexedVisible))"
+                    : "The Hidden album shows \(Format.count(expectedHidden)) items but the index only knows \(Format.count(indexedHidden))"
+                appendLog("\(what) — running a full re-check.", .info)
                 return await runScan(deep: true)
             }
         }
