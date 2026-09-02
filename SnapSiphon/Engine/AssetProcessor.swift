@@ -100,9 +100,12 @@ struct AssetProcessor {
         //    a different asset with identical bytes (dedup). One cheap HEAD.
         //    `forceUpload` (verify found a bad blob) bypasses the shortcut so
         //    the repair actually re-uploads.
+        //    A provider that omits Content-Length on HEAD leaves the size
+        //    unverified; record 0 (the same "unknown" the upload path uses
+        //    below), never a -1 sentinel.
         if !forceUpload,
-           let remoteSize = try await S3Client.withRetries(onRetry: onRetry, { try await client.headObject(key: key) }) {
-            return Result(uuid: uuid, encryptedBytes: remoteSize, originalBytes: exported.byteSize,
+           let remote = try await S3Client.withRetries(onRetry: onRetry, { try await client.headObject(key: key) }) {
+            return Result(uuid: uuid, encryptedBytes: remote.size ?? 0, originalBytes: exported.byteSize,
                           filename: exported.filename,
                           plaintextHash: plainHash,
                           ciphertextHash: record.ciphertextHash ?? "",

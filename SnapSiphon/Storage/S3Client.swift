@@ -34,6 +34,20 @@ struct S3Config: Codable, Equatable {
     var isComplete: Bool {
         !endpoint.isEmpty && !bucket.isEmpty && !region.isEmpty
     }
+
+    /// Reduce a pasted endpoint to the bare host `endpoint` expects. Dashboards
+    /// hand out `https://<id>.r2.cloudflarestorage.com/` and users paste it
+    /// verbatim; left as-is it produces `https://https://…//bucket/key` and a
+    /// baffling connection failure. The scheme is dropped rather than kept
+    /// because the client only ever speaks HTTPS.
+    static func normalizedEndpoint(_ raw: String) -> String {
+        var host = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for scheme in ["https://", "http://"] where host.lowercased().hasPrefix(scheme) {
+            host.removeFirst(scheme.count)
+        }
+        while host.hasSuffix("/") { host.removeLast() }
+        return host
+    }
 }
 
 /// Loaded credentials paired with config, ready to sign requests.
@@ -140,14 +154,16 @@ final class S3Client {
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
         for (k, v) in signed.headers { request.setValue(v, forHTTPHeaderField: k) }
-        let delegate = UploadProgressDelegate(progress: progress)
+        let delegate = UploadProgressDelegate(progress: progress) {
+            try ThrottledBodyStream(fileURL: fileURL, bytesPerSecond: bytesPerSecond)
+        }
 
         if bytesPerSecond > 0 {
-            // Throttled path: stream the body ourselves at a limited rate.
-            let producer = try ThrottledBodyStream(fileURL: fileURL, bytesPerSecond: bytesPerSecond)
-            request.httpBodyStream = producer.bodyStream
-            producer.start()
-            defer { producer.cancel() }   // reap the producer thread win or lose
+            // Throttled path: stream the body ourselves at a limited rate. The
+            // delegate owns the producer(s) so it can mint a replacement when
+            // CFNetwork has to re-send the body (see `needNewBodyStream`).
+            request.httpBodyStream = try delegate.mintBodyStream()
+            defer { delegate.cancelBodyStreams() }   // reap producer threads win or lose
             let (data, response) = try await session.data(for: request, delegate: delegate)
             try Self.validate(response: response, data: data)
         } else {
@@ -235,9 +251,14 @@ final class S3Client {
 
     // MARK: HEAD (existence check)
 
-    /// Returns true if the object exists remotely.
-    /// HEAD an object. Returns its size, or nil if it doesn't exist.
-    func headObject(key: String, now: Date = Date()) async throws -> Int64? {
+    struct ObjectHead {
+        /// nil when the provider omitted Content-Length (some do on HEAD) —
+        /// the object exists, its size just wasn't verified.
+        let size: Int64?
+    }
+
+    /// HEAD an object. Returns its head, or nil if it doesn't exist.
+    func headObject(key: String, now: Date = Date()) async throws -> ObjectHead? {
         let url = try objectURL(key: key)
         let signed = signer.sign(method: "HEAD", url: url, now: now)
         var request = URLRequest(url: url)
@@ -247,8 +268,11 @@ final class S3Client {
         guard let http = response as? HTTPURLResponse else { throw S3Error.network("No response") }
         if http.statusCode == 404 { return nil }
         if (200..<300).contains(http.statusCode) {
+            // expectedContentLength is -1 (unknown) without a Content-Length
+            // header; that must not leak out as a size.
             let len = (http.value(forHTTPHeaderField: "Content-Length")).flatMap(Int64.init)
-            return len ?? http.expectedContentLength
+                ?? http.expectedContentLength
+            return ObjectHead(size: len >= 0 ? len : nil)
         }
         throw S3Error.http(http.statusCode, "")
     }
@@ -287,18 +311,21 @@ final class S3Client {
     /// 10k-object archive, no per-object HEADs needed.
     func listObjects(subPrefix: String? = nil, continuationToken: String? = nil, now: Date = Date()) async throws -> (objects: [RemoteObject], next: String?) {
         var components = try bucketURLComponents()
-        // Match the trimmed prefix used for uploads (fullKey), and percent-
-        // encode the query OURSELVES with the same encoder SigV4 canonicalizes
-        // with — otherwise a '+' in a continuation token is signed as %2B but
-        // sent literally, breaking pagination with a signature mismatch.
-        // `subPrefix` narrows the listing to one repo area ("objects/",
-        // "checkpoints/000003/") so verify and journal checks never page
-        // through the whole archive.
-        var items = [
-            ("list-type", "2"),
-            ("prefix", subPrefix.map { fullKey(for: $0) }
-                ?? config.prefix.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))),
-        ]
+        // Match the slash-terminated prefix used for uploads (fullKey) — a B2
+        // key restricted to "SnapSiphon/" answers a bare "SnapSiphon" with
+        // 403 — and percent-encode the query OURSELVES with the same encoder
+        // SigV4 canonicalizes with — otherwise a '+' in a continuation token
+        // is signed as %2B but sent literally, breaking pagination with a
+        // signature mismatch. `subPrefix` narrows the listing to one repo area
+        // ("objects/", "checkpoints/000003/") so verify and journal checks
+        // never page through the whole archive. No prefix at all (empty user
+        // prefix, whole bucket) omits the parameter rather than sending
+        // "prefix=".
+        var items = [("list-type", "2")]
+        let prefix = fullKey(for: subPrefix ?? "")
+        if !prefix.isEmpty {
+            items.append(("prefix", prefix))
+        }
         if let token = continuationToken {
             items.append(("continuation-token", token))
         }
@@ -333,15 +360,22 @@ final class S3Client {
 
     /// B2 (and S3 generally) documents 5xx/429 as transient — "InternalError"
     /// incidents are expected to resolve on retry with backoff. Auth/config
-    /// errors (4xx) and cancellation are NOT retryable.
+    /// errors (4xx) and cancellation are NOT retryable, and neither is 501:
+    /// that is a provider saying "never" (B2 to a conditional PUT, some to
+    /// `?versions`), and callers handle it — retrying it three times just
+    /// adds seconds of backoff to every such call.
     static func isTransient(_ error: Error) -> Bool {
         if case S3Error.http(let code, _) = error {
-            return code == 429 || (500...599).contains(code)
+            return code == 408 || code == 429 || ((500...599).contains(code) && code != 501)
         }
         if let url = error as? URLError {
             switch url.code {
             case .timedOut, .networkConnectionLost, .cannotConnectToHost,
-                 .notConnectedToInternet, .dnsLookupFailed, .secureConnectionFailed:
+                 .notConnectedToInternet, .dnsLookupFailed, .secureConnectionFailed,
+                 // The throttled body couldn't be re-sent (see
+                 // `UploadProgressDelegate`); a retry builds a fresh producer
+                 // from the encrypted file still on disk.
+                 .requestBodyStreamExhausted:
                 return true
             default:
                 return false
@@ -374,10 +408,47 @@ final class S3Client {
 /// steps. Uncoalesced, this fires hundreds of times/sec per stream and each
 /// call hops to the main actor to mutate published state — enough sustained
 /// main-thread churn to starve the UI (and trip the watchdog) on long runs.
+///
+/// For throttled uploads it also owns the `ThrottledBodyStream` producers. A
+/// bound stream can only be read once, so when CFNetwork has to re-send the
+/// body (server dropped a keep-alive connection, a 307, an auth challenge) it
+/// asks for a fresh one via `needNewBodyStream`; without that the task fails
+/// with `requestBodyStreamExhausted` instead of quietly retrying.
 private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
     let progress: ((Double) -> Void)?
+    private let makeBodyStream: () throws -> ThrottledBodyStream
+    /// Every producer minted for this upload — cancelled together, since a
+    /// superseded one still holds a thread and a file handle. Guarded by
+    /// `lock`: `needNewBodyStream` arrives on the session's delegate queue
+    /// while `cancelBodyStreams` runs from the awaiting task.
+    private var producers: [ThrottledBodyStream] = []
+    private let lock = NSLock()
     private var lastReported: Double = -1
-    init(progress: ((Double) -> Void)?) { self.progress = progress }
+
+    init(progress: ((Double) -> Void)?, makeBodyStream: @escaping () throws -> ThrottledBodyStream) {
+        self.progress = progress
+        self.makeBodyStream = makeBodyStream
+    }
+
+    /// Build and start a producer for the whole file from byte 0 — a re-send
+    /// always restarts the body — and hand back its readable half.
+    func mintBodyStream() throws -> InputStream {
+        let producer = try makeBodyStream()
+        lock.withLock { producers.append(producer) }
+        producer.start()
+        return producer.bodyStream
+    }
+
+    func cancelBodyStreams() {
+        lock.withLock { producers }.forEach { $0.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    needNewBodyStream completionHandler: @escaping (InputStream?) -> Void) {
+        // A nil stream fails the task; the previous producer keeps running
+        // until `cancelBodyStreams` reaps it with the rest.
+        completionHandler(try? mintBodyStream())
+    }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     didSendBodyData bytesSent: Int64,

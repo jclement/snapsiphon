@@ -30,8 +30,10 @@ them back. Deterministic for dedup and idempotent uploads; opaque to outsiders.
   encrypted journals of every change (adds, deletions, purges). Journals chain
   by ciphertext hash (tamper-evident), blobs upload **before** their journal
   entry commits (a crash strands only an ignorable orphan), and the phone's
-  SQLite is just a rebuildable cache. Scans stay fast via a single
-  known-identifier query and an oldest-first high-water mark.
+  SQLite is just a rebuildable cache. Every scan walks the whole library once
+  (cheap PhotoKit properties only, no resource lookups) against a single
+  known-identifier set — no incremental mark that can fall behind a widened
+  filter or an iCloud backfill.
 - **One writer per folder.** Multi-device writing to one repository is not
   supported. Attaching to an existing folder requires an explicit choice
   (take over / verify match / new folder), while unexpected advances, gaps,

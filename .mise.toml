@@ -1,3 +1,27 @@
 [tasks.release]
 description = "Cut a release from clean main: choose a tag-derived version, archive, upload to TestFlight, tag, and push"
 run = "scripts/release.sh"
+
+[tasks.generate]
+description = "Regenerate SnapSiphon.xcodeproj from project.yml (XcodeGen)"
+run = "xcodegen generate"
+
+[tasks.build]
+description = "Compile the app for the iOS Simulator (no signing needed)"
+run = """
+[ -d SnapSiphon.xcodeproj ] || xcodegen generate
+xcodebuild -project SnapSiphon.xcodeproj -scheme SnapSiphon \
+  -destination 'generic/platform=iOS Simulator' -quiet build CODE_SIGNING_ALLOWED=NO
+"""
+
+[tasks.test]
+description = "Run the SnapSiphonTests unit suite on an iPhone simulator, non-interactive"
+run = """
+[ -d SnapSiphon.xcodeproj ] || xcodegen generate
+xcodebuild -project SnapSiphon.xcodeproj -scheme SnapSiphon \
+  -destination 'platform=iOS Simulator,name=iPhone 17' -quiet test CODE_SIGNING_ALLOWED=NO
+"""
+
+[tasks.check]
+description = "build + test — the gate before claiming work is done"
+depends = ["build", "test"]

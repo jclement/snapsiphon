@@ -70,14 +70,23 @@ final class BackupEngine: ObservableObject {
         var detail: String?
     }
     /// Library totals by type (denominator) and uploaded-by-type (numerator) for
-    /// the photos/videos ring.
-    @Published private(set) var libraryPhotos = 0
-    @Published private(set) var libraryVideos = 0
+    /// the photos/videos ring. The visible library and the Hidden album are
+    /// tracked as SEPARATE populations, because iOS drops the Hidden album from
+    /// every PhotoKit fetch while its Face ID lock is on: any arithmetic that
+    /// sums them can go wrong the moment the lock flips. Both honour the
+    /// cutoff and favorites filters, so they only ever count what a scan
+    /// would actually queue.
+    @Published private(set) var libraryVisiblePhotos = 0
+    @Published private(set) var libraryVisibleVideos = 0
+    @Published private(set) var libraryHiddenPhotos = 0
+    @Published private(set) var libraryHiddenVideos = 0
     /// How many items live in the Hidden album — shown on the dashboard so
     /// "what's excluded" (or included) is never invisible.
     @Published private(set) var hiddenItemCount = 0
-    @Published private(set) var libraryHiddenPhotos = 0
-    @Published private(set) var libraryHiddenVideos = 0
+    /// Everything in scope right now: the visible library plus, when the
+    /// setting is on, whatever iOS is currently showing of the Hidden album.
+    var libraryPhotos: Int { libraryVisiblePhotos + (settings.includeHidden ? libraryHiddenPhotos : 0) }
+    var libraryVideos: Int { libraryVisibleVideos + (settings.includeHidden ? libraryHiddenVideos : 0) }
     @Published private(set) var uploadedPhotos = 0
     @Published private(set) var uploadedVideos = 0
     @Published private(set) var storedPhotoBytes: Int64 = 0
@@ -104,22 +113,16 @@ final class BackupEngine: ObservableObject {
     @Published var settings: BackupSettings {
         didSet {
             settings.save()
-            // Widening a filter (videos back on, favorites-only off) means older
-            // assets the mark already passed become eligible — reset it so the
-            // next scan re-checks the whole library for them.
-            if (settings.includePhotos && !oldValue.includePhotos) ||
-               (settings.includeVideos && !oldValue.includeVideos) ||
-               (settings.includeLiveMotion && !oldValue.includeLiveMotion) ||
-               (settings.includeHidden && !oldValue.includeHidden) ||
-               (!settings.favoritesOnly && oldValue.favoritesOnly) ||
-               // Cutoff removed or moved earlier: assets before the old cutoff
-               // are behind the mark and would otherwise never be picked up.
-               (oldValue.backupCutoff != nil &&
-                (settings.backupCutoff == nil || settings.backupCutoff! < oldValue.backupCutoff!)) {
-                scanMark = nil
-                appendLog("Backup filters widened — next scan re-checks the whole library.", .info)
-            }
-            if settings.backupCutoff != oldValue.backupCutoff {
+            // Any change to what's in scope moves the dashboard's denominators
+            // (the library totals honour every filter) — refresh them right
+            // away so "ready to back up" never lags the switch. Scans need no
+            // nudging: every scan walks the whole library, so nothing can sit
+            // behind an incremental mark when a filter widens.
+            if settings.includePhotos != oldValue.includePhotos ||
+               settings.includeVideos != oldValue.includeVideos ||
+               settings.favoritesOnly != oldValue.favoritesOnly ||
+               settings.includeHidden != oldValue.includeHidden ||
+               settings.backupCutoff != oldValue.backupCutoff {
                 Task { await self.refreshLibraryCounts() }
             }
             PewPew.shared.enabled = settings.pewPew
@@ -169,6 +172,8 @@ final class BackupEngine: ObservableObject {
         }
         openIndex()
         refreshCounts()
+        // Retired: scans no longer keep an incremental high-water mark.
+        UserDefaults.standard.removeObject(forKey: "SnapSiphon.scanMark.v1")
         #if DEBUG
         if let mode = ProcessInfo.processInfo.environment["SNAPSIPHON_DEMO"] { seedDemoState(mode) }
         #endif
@@ -207,8 +212,8 @@ final class BackupEngine: ObservableObject {
         c.uploadedBytes = 71_400_000_000     // ~71 GB
         c.totalBytes = c.uploadedBytes
         counts = c
-        libraryPhotos = 11_040
-        libraryVideos = 1_803
+        libraryVisiblePhotos = 10_528
+        libraryVisibleVideos = 1_742
         uploadedPhotos = 7_986
         uploadedVideos = 656
         storedPhotoBytes = 27_800_000_000    // ~28 GB photos
@@ -285,36 +290,30 @@ final class BackupEngine: ObservableObject {
         Task { await compactNow() }
     }
 
-    /// Library totals with the Hidden album's share taken back out, so they can
-    /// be compared against the index's visible rows. `libraryPhotos` already
-    /// includes hidden items when the setting is on — but only while iOS is
-    /// willing to show them, which the album's Face ID lock revokes at any
-    /// moment. Every library-minus-index subtraction has to run per population
-    /// (see `toBackupPhotos`, the self-heal check in `runScan`).
-    var libraryVisiblePhotos: Int {
-        max(0, libraryPhotos - (settings.includeHidden ? libraryHiddenPhotos : 0))
-    }
-    var libraryVisibleVideos: Int {
-        max(0, libraryVideos - (settings.includeHidden ? libraryHiddenVideos : 0))
-    }
-
-    /// Not-yet-uploaded counts per type (library total minus uploaded) — covers
-    /// both indexed-pending items AND new photos no scan has seen yet, which is
-    /// what the "ready to back up" banner needs at launch.
+    /// Not-yet-uploaded counts per type (library total minus what the index has
+    /// settled) — covers both indexed-pending items AND new photos no scan has
+    /// seen yet, which is what the "ready to back up" banner needs at launch.
     ///
     /// Visible and hidden are subtracted separately: hidden items already backed
     /// up stay in the index forever, so once the Hidden album re-locks (or the
     /// setting goes off) they'd cancel out real pending visible photos and the
     /// banner would read "everything backed up" while new photos sat unqueued.
+    ///
+    /// "Settled" is uploaded PLUS permanently unexportable (an edited Live
+    /// Photo with no original, say): those rows are in the library count but no
+    /// backup will ever touch them, and counting them here made the banner
+    /// promise a sync that Back Up Now then visibly failed to deliver.
     var toBackupPhotos: Int {
         guard settings.includePhotos else { return 0 }
-        return max(0, libraryVisiblePhotos - storedSegments.photoCount)
-             + (hiddenCounted ? max(0, libraryHiddenPhotos - storedSegments.hiddenPhotoCount) : 0)
+        let s = storedSegments
+        return max(0, libraryVisiblePhotos - s.photoCount - s.unexportablePhotos)
+             + (hiddenCounted ? max(0, libraryHiddenPhotos - s.hiddenPhotoCount - s.unexportableHiddenPhotos) : 0)
     }
     var toBackupVideos: Int {
         guard settings.includeVideos else { return 0 }
-        return max(0, libraryVisibleVideos - storedSegments.videoCount)
-             + (hiddenCounted ? max(0, libraryHiddenVideos - storedSegments.hiddenVideoCount) : 0)
+        let s = storedSegments
+        return max(0, libraryVisibleVideos - s.videoCount - s.unexportableVideos)
+             + (hiddenCounted ? max(0, libraryHiddenVideos - s.hiddenVideoCount - s.unexportableHiddenVideos) : 0)
     }
 
     /// Whether the Hidden album belongs in the library-vs-index arithmetic right
@@ -483,7 +482,7 @@ final class BackupEngine: ObservableObject {
         uploadedVideos = byType.videos
         storedPhotoBytes = byType.photoBytes
         storedVideoBytes = byType.videoBytes
-        storedSegments = index.storedSegments()
+        storedSegments = index.storedSegments(unexportableReason: Self.skipReasonNoResource)
         lastBackupDate = index.recentUploads(limit: 1).first?.uploadedAt
     }
 
@@ -506,19 +505,19 @@ final class BackupEngine: ObservableObject {
         if demoMode || !photoAuth.canRead { return }
         let photos = self.photos
         let cutoff = settings.backupCutoff
-        let includeHidden = settings.includeHidden
-        let (counts, hiddenP, hiddenV) = await Task.detached(priority: .utility) { () -> ((photos: Int, videos: Int), Int, Int) in
-            let with = photos.libraryCounts(since: cutoff, includeHidden: true)
-            let without = photos.libraryCounts(since: cutoff, includeHidden: false)
-            return (includeHidden ? with : without,
-                    max(0, with.photos - without.photos),
-                    max(0, with.videos - without.videos))
+        let favoritesOnly = settings.favoritesOnly
+        // The Hidden album's share is always measured (with − without), whatever
+        // the setting says: the dashboard names what's excluded, and the toggle
+        // needs the number before it's on.
+        let (without, with) = await Task.detached(priority: .utility) { () -> ((photos: Int, videos: Int), (photos: Int, videos: Int)) in
+            (photos.libraryCounts(since: cutoff, includeHidden: false, favoritesOnly: favoritesOnly),
+             photos.libraryCounts(since: cutoff, includeHidden: true, favoritesOnly: favoritesOnly))
         }.value
-        libraryPhotos = counts.photos
-        libraryVideos = counts.videos
-        libraryHiddenPhotos = hiddenP
-        libraryHiddenVideos = hiddenV
-        hiddenItemCount = hiddenP + hiddenV
+        libraryVisiblePhotos = without.photos
+        libraryVisibleVideos = without.videos
+        libraryHiddenPhotos = max(0, with.photos - without.photos)
+        libraryHiddenVideos = max(0, with.videos - without.videos)
+        hiddenItemCount = libraryHiddenPhotos + libraryHiddenVideos
     }
 
     // MARK: Permissions
@@ -556,17 +555,20 @@ final class BackupEngine: ObservableObject {
 
     // MARK: Scan
 
-    /// Enumerate the library and register any not-yet-seen assets as pending.
-    /// A normal (fast) scan: only looks at photos newer than the high-water mark.
-    func scan() async { await runScan(deep: false) }
-
-    /// A full scan: ignores the high-water mark and re-checks the whole
-    /// library. Not user-facing — scans self-heal: a fast scan that finds the
-    /// library holding more eligible items than the index triggers this
-    /// automatically.
-    private func fullScan() async { await runScan(deep: true) }
-
-    private func runScan(deep: Bool) async {
+    /// Walk the whole library and register every eligible, not-yet-seen asset
+    /// as pending.
+    ///
+    /// Deliberately NOT incremental. One oldest-first pass over cheap PhotoKit
+    /// properties (no resource lookups) is a couple of seconds even for a
+    /// six-figure library, and the deletion reconcile needed a full walk on
+    /// every scan anyway — this is that walk, reused. A high-water mark used
+    /// to bound the pass, and it was the one thing that could quietly disagree
+    /// with the dashboard: assets behind the mark (an iCloud backfill, a filter
+    /// widened, the Hidden album unlocked outside the app) stayed unqueued
+    /// while the "ready to back up" count said otherwise, and a tower of
+    /// count-comparison heuristics tried to notice. Now whatever the dashboard
+    /// can count, the scan sees — there is nothing to fall behind.
+    func scan() async {
         guard let index else { return }
         if !photoAuth.canRead {
             await requestPhotoAccess()
@@ -582,179 +584,156 @@ final class BackupEngine: ObservableObject {
         let includeLiveMotion = settings.includeLiveMotion
         let includeHidden = settings.includeHidden
         let favoritesOnly = settings.favoritesOnly
-        let photos = self.photos
-        // Fast-scan mark: only enumerate assets created after it (unless deep or
-        // incremental scanning is disabled). Assets are enumerated oldest-first
-        // so the mark only ever moves forward.
-        // Re-scan a 48h overlap behind the mark: an iCloud photo taken earlier
-        // on another device can sync in with a creationDate BEHIND the mark and
-        // would otherwise be skipped forever. The known-set dedups the overlap,
-        // so this costs almost nothing. (Imports older than 48h → Deep scan.)
-        // The cutoff setting bounds every scan (even full ones): content older
-        // than it is out of scope by user choice, not covered-and-skipped.
+        // The cutoff bounds what gets QUEUED, never what gets seen: an asset
+        // older than it is out of scope by user choice, but it still exists —
+        // it must keep its row alive and its Hidden flag current.
         let cutoff = settings.backupCutoff
-        let markSince: Date? = deep ? nil : scanMark?.addingTimeInterval(-48 * 3600)
-        let since: Date? = [markSince, cutoff].compactMap { $0 }.max()
-        appendLog(deep ? "Full scan — re-checking the whole library…"
-                       : (since == nil ? "Scanning library…" : "Checking for new photos…"), .info)
+        let photos = self.photos
+        appendLog("Scanning library…", .info)
 
-        // One query for everything we already know, then in-memory membership
-        // checks — no per-asset database round-trips.
+        // Three membership sets up front, then pure in-memory checks per asset
+        // — no per-asset database round-trips.
         let known = index.allIdentifiers()
         // Rows skipped for provably-recheckable reasons: an enumeration that
-        // includes the asset proves it exists and is eligible again (unhidden,
-        // or the Hidden setting flipped on) — requeue on sight.
-        let recheckable = index.skippedIdentifiers(reasons: [Self.skipReasonHidden, Self.skipReasonGone])
+        // includes the asset AND finds it in scope proves it eligible again
+        // (unhidden, the setting flipped on, a filter widened) — requeue.
+        let recheckable = index.skippedIdentifiers(reasons: Self.recheckableSkipReasons)
+        // Rows waiting to upload: if the settings have narrowed since they were
+        // queued, they get parked below rather than uploaded out of scope.
+        let queued = index.identifiers(inStates: [.pending, .failed])
         let idx = index
-        let startMark = scanMark
         scanChecked = 0
+
+        struct Outcome {
+            var added = 0
+            var parked = 0
+            var checked = 0
+            var hiddenSeen = 0
+            /// Every asset iOS showed us — the "still exists on this phone"
+            /// set that deletion reconciliation is allowed to tombstone against.
+            var liveIDs = Set<String>()
+        }
 
         // Enumerate AND index off the main actor so the UI stays live and we can
         // report progress as we go.
-        let outcome: (added: Int, newest: Date?, checked: Int, hiddenSeen: Int) = await Task.detached(priority: .utility) {
-            // ALWAYS enumerate hidden assets, whatever the setting says: the
-            // setting governs what we back up, not what we're allowed to know
-            // about. Enumerating them is the only way to keep each row's hidden
-            // flag current, and that flag is what keeps the visible and hidden
-            // tallies from contaminating each other (self-heal check below,
-            // delete reconciliation, the dashboard donut). With the setting off
-            // they're skipped for queueing a few lines down.
-            let infos = photos.enumerate(includePhotos: includePhotos, includeVideos: includeVideos,
-                                         since: since, includeHidden: true)
-            var added = 0
-            var newest = startMark
+        let outcome: Outcome = await Task.detached(priority: .utility) {
+            let infos = photos.enumerateAll()
+            var out = Outcome()
+            out.checked = infos.count
+            out.liveIDs.reserveCapacity(infos.count)
+            var seenIDs: [String] = []
+            var hiddenIDs: [String] = []
+            var visibleIDs: [String] = []
+            seenIDs.reserveCapacity(infos.count)
+
+            func park(_ id: String) {
+                guard queued.contains(id) else { return }
+                idx.markSkipped(id, reason: Self.skipReasonExcluded)
+                out.parked += 1
+            }
+            func pendingRecord(_ id: String, mediaType: AssetRecord.MediaType, createdAt: Date?) -> AssetRecord {
+                AssetRecord(
+                    localIdentifier: id,
+                    // Blob name is a salted content address, computed at
+                    // upload time once the bytes have been hashed.
+                    uuid: "",
+                    state: .pending,
+                    mediaType: mediaType,
+                    filename: "",             // filled in at upload (deferred PHAssetResource lookup)
+                    byteSize: 0,
+                    createdAt: createdAt,
+                    uploadedAt: nil,
+                    lastError: nil)
+            }
+
             for (i, info) in infos.enumerated() {
                 if i % 250 == 0 {
                     let checked = i
                     await MainActor.run { self.scanChecked = checked }
                 }
-                // Skip BEFORE advancing the mark: a filtered-out asset is not
-                // covered, so the mark must not move past it (favoriting it
-                // later has to be picked up by a fast scan).
-                if favoritesOnly && !info.isFavorite { continue }
-                // Hidden and not backing hidden up: seen (its flag is refreshed
-                // below) but not covered, so — like a filtered-out favorite —
-                // it must not advance the mark or get queued.
-                if info.isHidden && !includeHidden { continue }
-                if let d = info.creationDate, newest == nil || d > newest! { newest = d }
+                let id = info.localIdentifier
+                let clipID = AssetRecord.liveMotionIdentifier(for: id)
+
+                // Presence and Hidden-album membership are recorded for EVERY
+                // asset, in scope or not: the setting governs what we back up,
+                // not what we're allowed to know about. The hidden flag is what
+                // keeps the visible and hidden tallies from contaminating each
+                // other (dashboard donut, delete reconciliation), and presence
+                // is the precondition for ever tombstoning a row later. Clip
+                // rows ride on their still.
+                out.liveIDs.insert(id)
+                seenIDs.append(id)
+                if info.isLivePhoto { seenIDs.append(clipID) }
+                if info.isHidden {
+                    out.hiddenSeen += 1
+                    hiddenIDs.append(id)
+                    if info.isLivePhoto { hiddenIDs.append(clipID) }
+                } else {
+                    visibleIDs.append(id)
+                    if info.isLivePhoto { visibleIDs.append(clipID) }
+                }
+
+                // Eligibility under the CURRENT settings. The cutoff test is
+                // `>=`, matching `PhotoLibrary.libraryCounts` exactly — the
+                // dashboard must never count something this loop won't queue.
+                let typeOK = (info.mediaType == .photo && includePhotos)
+                          || (info.mediaType == .video && includeVideos)
+                let inScope = typeOK
+                    && (!favoritesOnly || info.isFavorite)
+                    && (includeHidden || !info.isHidden)
+                    && (cutoff == nil || info.creationDate.map { $0 >= cutoff! } ?? false)
+                guard inScope else {
+                    // Queued earlier under wider settings (videos since turned
+                    // off, favorites-only turned on, the cutoff moved later,
+                    // hidden turned off): park it, recheckable, instead of
+                    // uploading content the user just excluded.
+                    park(id)
+                    park(clipID)
+                    continue
+                }
+
+                if recheckable.contains(id) {
+                    idx.requeue(id, reason: "Eligible again")
+                    out.added += 1
+                } else if !known.contains(id) {
+                    idx.upsert(pendingRecord(id, mediaType: info.mediaType, createdAt: info.creationDate))
+                    out.added += 1
+                }
                 // Live Photo motion clips get their own suffixed record —
                 // checked independently of the still, so enabling the toggle
                 // later back-fills clips for already-uploaded stills.
-                if recheckable.contains(info.localIdentifier) {
-                    idx.requeue(info.localIdentifier, reason: "Eligible again")
-                    added += 1
-                }
-                if includeLiveMotion, info.isLivePhoto {
-                    let clipID = AssetRecord.liveMotionIdentifier(for: info.localIdentifier)
+                guard info.isLivePhoto else { continue }
+                if includeLiveMotion {
                     if recheckable.contains(clipID) {
                         idx.requeue(clipID, reason: "Eligible again")
-                        added += 1
+                        out.added += 1
+                    } else if !known.contains(clipID) {
+                        // mediaType .other: not counted in the photo/video ring.
+                        idx.upsert(pendingRecord(clipID, mediaType: .other, createdAt: info.creationDate))
+                        out.added += 1
                     }
-                    if !known.contains(clipID) {
-                        idx.upsert(AssetRecord(
-                            localIdentifier: clipID,
-                            uuid: "",
-                            state: .pending,
-                            mediaType: .other,   // not counted in the photo/video ring
-                            filename: "",
-                            byteSize: 0,
-                            createdAt: info.creationDate,
-                            uploadedAt: nil,
-                            lastError: nil))
-                        added += 1
-                    }
+                } else {
+                    park(clipID)
                 }
-                if known.contains(info.localIdentifier) { continue }
-                idx.upsert(AssetRecord(
-                    localIdentifier: info.localIdentifier,
-                    // Blob name is a salted content address, computed at
-                    // upload time once the bytes have been hashed.
-                    uuid: "",
-                    state: .pending,
-                    mediaType: info.mediaType,
-                    filename: "",             // filled in at upload (deferred PHAssetResource lookup)
-                    byteSize: 0,
-                    createdAt: info.creationDate,
-                    uploadedAt: nil,
-                    lastError: nil))
-                added += 1
-            }
-            // Everything enumerated is by definition present in THIS phone's
-            // library — the precondition for ever tombstoning it later.
-            // (Clip records ride on their still's presence.)
-            var seenIDs = infos.map(\.localIdentifier)
-            if includeLiveMotion {
-                seenIDs += infos.filter(\.isLivePhoto)
-                    .map { AssetRecord.liveMotionIdentifier(for: $0.localIdentifier) }
             }
             idx.markLocalSeen(seenIDs)
-            // Refresh Hidden-album membership (it changes over time; clips
-            // follow their still) — feeds the dashboard's segment donut.
-            var hiddenIDs: [String] = []
-            var visibleIDs: [String] = []
-            for info in infos {
-                if info.isHidden {
-                    hiddenIDs.append(info.localIdentifier)
-                    if info.isLivePhoto { hiddenIDs.append(AssetRecord.liveMotionIdentifier(for: info.localIdentifier)) }
-                } else {
-                    visibleIDs.append(info.localIdentifier)
-                    if info.isLivePhoto { visibleIDs.append(AssetRecord.liveMotionIdentifier(for: info.localIdentifier)) }
-                }
-            }
             idx.setHiddenFlags(hidden: hiddenIDs, visible: visibleIDs)
-            return (added, newest, infos.count, hiddenIDs.count)
+            return out
         }.value
 
         let added = outcome.added
-        // Advance the mark so the next fast scan starts where this one ended.
-        // Clamp to now: one future-dated asset (bad camera clock) must not
-        // blind every future fast scan.
-        if let newest = outcome.newest { scanMark = min(newest, Date()) }
         scanChecked = 0
-
         refreshCounts()
         await refreshLibraryCounts()
-
-        // Self-healing full check: if the library holds more eligible items
-        // than the index knows about, something slipped behind the incremental
-        // mark (an old import, iCloud backfill) — silently re-check everything.
-        // This replaces the old user-facing "Deep scan" button.
-        if !deep, !favoritesOnly {
-            // Compare like-for-like: only photo/video rows (Live-clip rows have
-            // no library-count counterpart), and the visible library and the
-            // Hidden album as SEPARATE tallies.
-            //
-            // One combined total is not comparable: the Hidden album vanishes
-            // from every PhotoKit fetch while its Face ID lock is on, so hidden
-            // items backed up during an unlocked run stay in the index but drop
-            // out of the library count the moment the lock goes back on. Summed
-            // together that permanently inflates the indexed side, `expected >
-            // indexed` never fires again, and visible photos that slipped
-            // behind the incremental mark are never picked up.
-            let expectedVisible = (includePhotos ? libraryVisiblePhotos : 0)
-                                + (includeVideos ? libraryVisibleVideos : 0)
-            let indexedVisible = index.indexedPhotoVideoCount(hidden: false)
-            // The hidden tally only when we're backing the album up. A locked
-            // album reports zero hidden items, which can never trigger a false
-            // full scan (0 > n is false) — it just makes this half a no-op.
-            let expectedHidden = includeHidden
-                ? (includePhotos ? libraryHiddenPhotos : 0) + (includeVideos ? libraryHiddenVideos : 0)
-                : 0
-            let indexedHidden = includeHidden ? index.indexedPhotoVideoCount(hidden: true) : 0
-            if expectedVisible > indexedVisible || expectedHidden > indexedHidden {
-                let what = expectedVisible > indexedVisible
-                    ? "Library has \(Format.count(expectedVisible)) eligible items but the index only knows \(Format.count(indexedVisible))"
-                    : "The Hidden album shows \(Format.count(expectedHidden)) items but the index only knows \(Format.count(indexedHidden))"
-                appendLog("\(what) — running a full re-check.", .info)
-                return await runScan(deep: true)
-            }
-        }
 
         // An explicit result — "found nothing new" is the common case and used
         // to be indistinguishable from a no-op.
         scanStatus = added == 0
-            ? "✓ \(deep ? "Full scan" : "Scan") checked \(Format.count(outcome.checked)) item\(outcome.checked == 1 ? "" : "s") — nothing new, everything already indexed"
-            : "✓ \(deep ? "Full scan" : "Scan") checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
+            ? "✓ Scan checked \(Format.count(outcome.checked)) item\(outcome.checked == 1 ? "" : "s") — nothing new, everything already indexed"
+            : "✓ Scan checked \(Format.count(outcome.checked)) — \(Format.count(added)) new queued"
+        if outcome.parked > 0 {
+            appendLog("\(Format.count(outcome.parked)) queued item\(outcome.parked == 1 ? " falls" : "s fall") outside the current backup settings — set aside, not uploaded. Widen the settings again and the next scan re-queues them.", .info)
+        }
         // Hidden visibility is genuinely murky (iOS 16 Face ID gate), so say
         // what the scan actually SAW — turns "why isn't it syncing?" into a
         // one-glance diagnosis.
@@ -767,7 +746,7 @@ final class BackupEngine: ObservableObject {
         // restores reflect reality; the toggle only governs whether blobs are
         // physically purged.
         activityDetail = "Checking for deleted photos…"
-        await reconcileDeletes()
+        await reconcileDeletes(liveIDs: outcome.liveIDs)
         activityDetail = nil
         phase = .idle
     }
@@ -838,28 +817,18 @@ final class BackupEngine: ObservableObject {
 
     private static let repoISO = ISO8601DateFormatter()
 
-    // MARK: Fast-scan high-water mark
+    // MARK: Skip reasons
 
     /// Skip reasons that scans can prove wrong later (the asset shows up in an
-    /// enumeration) — such rows are re-queued automatically.
-    static let skipReasonHidden = "In Hidden album (excluded)"
-    static let skipReasonGone = "Asset no longer in library"
-
-    private static let scanMarkKey = "SnapSiphon.scanMark.v1"
-
-    private var scanMark: Date? {
-        get {
-            let t = UserDefaults.standard.double(forKey: Self.scanMarkKey)
-            return t > 0 ? Date(timeIntervalSince1970: t) : nil
-        }
-        set {
-            if let newValue {
-                UserDefaults.standard.set(newValue.timeIntervalSince1970, forKey: Self.scanMarkKey)
-            } else {
-                UserDefaults.standard.removeObject(forKey: Self.scanMarkKey)
-            }
-        }
-    }
+    /// enumeration, in scope) — such rows are re-queued automatically.
+    nonisolated static let skipReasonHidden = "In Hidden album (excluded)"
+    nonisolated static let skipReasonGone = "Asset no longer in library"
+    nonisolated static let skipReasonExcluded = "Outside the current backup settings"
+    nonisolated static let recheckableSkipReasons = [skipReasonHidden, skipReasonGone, skipReasonExcluded]
+    /// The one permanent reason: nothing to export, ever. These rows are in the
+    /// library count but no backup will touch them, so the dashboard's "to back
+    /// up" arithmetic treats them as settled.
+    nonisolated static let skipReasonNoResource = "No exportable resource"
 
     /// Reconcile on-device deletions — runs on EVERY scan:
     ///
@@ -870,15 +839,16 @@ final class BackupEngine: ObservableObject {
     ///   resurrected — the accidental-erase recovery.
     /// - Only when "Purge deleted backups" is on does `purgeTombstones` then
     ///   physically free blobs past the grace period (Object Lock permitting).
-    private func reconcileDeletes() async {
+    ///
+    /// `liveIDs` is every asset the scan just saw (hidden ones included, as far
+    /// as iOS shows them) — the definition of "still exists on this phone".
+    private func reconcileDeletes(liveIDs: Set<String>) async {
         guard let index else { return }
         // Absence-from-library only means "deleted" under FULL photo access.
         // Under .limited, unselected photos vanish from fetches while still
         // existing on the phone — tombstoning them would mark valid backups
         // deleted (and purge could destroy them).
         guard photoAuth == .authorized else { return }
-        let photos = self.photos
-        let liveIDs = await Task.detached(priority: .utility) { photos.allLocalIdentifiers() }.value
 
         // Resurrect tombstones whose asset is back in the library. Motion-clip
         // records (#live suffix) follow their still's presence.
@@ -1012,10 +982,13 @@ final class BackupEngine: ObservableObject {
                     versions = try await S3Client.withRetries {
                         try await client.listVersions(forKey: key)
                     }
-                } catch S3Error.http(let code, _) where code == 405 || code == 501 {
+                } catch S3Error.http(let code, _) where code == 400 || code == 405 || code == 501 {
                     // Minimal/unversioned S3 servers may not implement the
-                    // version-listing API at all. Their ordinary DELETE is the
-                    // complete physical deletion operation.
+                    // version-listing API at all (and say so as 501, 405, or
+                    // a 400 that would otherwise read as "blocked by Object
+                    // Lock" forever). Their ordinary DELETE is the complete
+                    // physical deletion operation — and absence is still
+                    // HEAD-confirmed below before anything is journaled.
                     supportsVersionListing = false
                     versions = []
                 }
@@ -1176,23 +1149,24 @@ final class BackupEngine: ObservableObject {
                     appendLog(repoConflict!, .error)
                     return false
                 }
-                // Providers without conditional PUTs cannot make LIST→PUT
-                // atomic. As a best-effort single-writer guard, verify that
-                // the actual current head is still the exact ciphertext this
-                // device previously committed.
-                if UserDefaults.standard.bool(forKey: conditionalPutUnsupportedKey()) {
-                    let headKey = seq == 1
-                        ? Repo.checkpointKey(gen: generation)
-                        : Repo.journalKey(gen: generation, seq: seq - 1)
-                    let headURL = tempDir.appendingPathComponent("head-check-\(UUID().uuidString).age")
-                    defer { try? FileManager.default.removeItem(at: headURL) }
-                    try await client.getObject(key: client.fullKey(for: headKey), to: headURL)
-                    let remoteHash = try Repo.sha256Hex(fileAt: headURL)
-                    guard !repoLastHash.isEmpty, remoteHash == repoLastHash else {
-                        repoConflict = "Repository head \(generation)/\(maxSeq) was replaced or written by another device. Same-folder multi-device backup is not supported. Backup is blocked; use a separate folder or explicitly take over after retiring the other writer."
-                        appendLog(repoConflict!, .error)
-                        return false
-                    }
+                // Single-writer guard: verify the actual current head is still
+                // the exact ciphertext this device previously committed. Done
+                // on EVERY provider, not just the ones known to lack
+                // conditional PUTs: a provider that silently ignores
+                // If-None-Match looks exactly like one that honours it, so
+                // "conditional writes work here" can never be assumed. One
+                // small GET per flush is the price of not guessing.
+                let headKey = seq == 1
+                    ? Repo.checkpointKey(gen: generation)
+                    : Repo.journalKey(gen: generation, seq: seq - 1)
+                let headURL = tempDir.appendingPathComponent("head-check-\(UUID().uuidString).age")
+                defer { try? FileManager.default.removeItem(at: headURL) }
+                try await client.getObject(key: client.fullKey(for: headKey), to: headURL)
+                let remoteHash = try Repo.sha256Hex(fileAt: headURL)
+                guard !repoLastHash.isEmpty, remoteHash == repoLastHash else {
+                    repoConflict = "Repository head \(generation)/\(maxSeq) was replaced or written by another device. Same-folder multi-device backup is not supported. Backup is blocked; use a separate folder or explicitly take over after retiring the other writer."
+                    appendLog(repoConflict!, .error)
+                    return false
                 }
                 return true
             }
@@ -1310,19 +1284,33 @@ final class BackupEngine: ObservableObject {
         }
     }
 
-    /// Providers that answered 501 NotImplemented to a conditional PUT — B2
-    /// does this ("a header you provided implies functionality that is not
-    /// implemented") rather than ignoring the header. Remembered per endpoint
-    /// so we only pay one failed request, ever.
+    /// Providers that rejected a conditional PUT — B2 answers 501 ("a header
+    /// you provided implies functionality that is not implemented") rather
+    /// than ignoring the header; others say 400 InvalidArgument/NotImplemented.
+    /// Remembered per endpoint so we only pay one failed request, ever.
     private func conditionalPutUnsupportedKey() -> String {
         "SnapSiphon.noConditionalPut.\(s3Config.endpoint)"
     }
 
+    /// Whether an HTTP failure means "this provider doesn't do If-None-Match"
+    /// (fall back to plain writes) as opposed to a genuine request problem.
+    /// Any 501 qualifies; a 400 only when the body blames the header or the
+    /// capability, so an unrelated bad request still surfaces as an error.
+    private static func rejectsConditionalPut(code: Int, body: String) -> Bool {
+        if code == 501 { return true }
+        guard code == 400 else { return false }
+        let b = body.lowercased()
+        return b.contains("if-none-match") || b.contains("notimplemented") || b.contains("invalidargument")
+    }
+
     /// PUT a journal/checkpoint file, preferring a conditional
-    /// (If-None-Match: *) write
-    /// where the provider supports it — that makes the LIST→PUT ownership race
-    /// atomic. On 501 the capability is remembered as absent and the write
-    /// retries plain (the pre-write head check still guards ownership).
+    /// (If-None-Match: *) write where the provider supports it — that makes
+    /// the LIST→PUT ownership race atomic. When the provider rejects the
+    /// header the capability is remembered as absent and the write retries
+    /// plain. Either way the object is read back afterwards: a provider can
+    /// silently IGNORE the header, which from here is indistinguishable from
+    /// honouring it, so the conditional write is only ever an extra — never
+    /// the thing the single-writer guarantee rests on.
     private func putMetadataObject(client: S3Client, fileURL: URL, key: String, md5: String) async throws {
         let conditional = !UserDefaults.standard.bool(forKey: conditionalPutUnsupportedKey())
         do {
@@ -1343,26 +1331,26 @@ final class BackupEngine: ObservableObject {
             }
             repoConflict = "A different writer already created repository metadata at this position. Same-folder multi-device backup is not supported; backup is blocked."
             throw S3Error.malformedResponse(repoConflict!)
-        } catch S3Error.http(501, _) where conditional {
+        } catch S3Error.http(let code, let body) where conditional && Self.rejectsConditionalPut(code: code, body: body) {
             UserDefaults.standard.set(true, forKey: conditionalPutUnsupportedKey())
-            appendLog("This provider doesn't support conditional writes — using plain journal writes from now on (the pre-write ownership check still applies).", .info)
+            appendLog("This provider doesn't support conditional writes — using plain journal writes from now on (the pre-write ownership check and post-write read-back still apply).", .info)
             try await S3Client.withRetries {
                 try await client.putObject(fileURL: fileURL, key: key,
                                            contentType: "application/age", contentMD5: md5,
                                            ifNoneMatch: false)
             }
         }
-        if !conditional || UserDefaults.standard.bool(forKey: conditionalPutUnsupportedKey()) {
-            // Plain PUT is necessarily best-effort. Read the key back
-            // immediately so a same-sequence overwrite visible now becomes a
-            // hard conflict instead of a silently advanced local position.
-            let checkURL = tempDir.appendingPathComponent("journal-check-\(UUID().uuidString).age")
-            defer { try? FileManager.default.removeItem(at: checkURL) }
-            try await client.getObject(key: key, to: checkURL)
-            guard try Repo.sha256Hex(fileAt: checkURL) == Repo.sha256Hex(fileAt: fileURL) else {
-                repoConflict = "The repository metadata just written was replaced by another writer. Same-folder multi-device backup is not supported; backup is blocked."
-                throw S3Error.malformedResponse(repoConflict!)
-            }
+        // Read the key back immediately so a same-sequence overwrite visible
+        // now becomes a hard conflict instead of a silently advanced local
+        // position. Unconditional (see above): a journal is a few KB, and this
+        // is what makes every provider as safe as the ones without
+        // conditional writes.
+        let checkURL = tempDir.appendingPathComponent("journal-check-\(UUID().uuidString).age")
+        defer { try? FileManager.default.removeItem(at: checkURL) }
+        try await client.getObject(key: key, to: checkURL)
+        guard try Repo.sha256Hex(fileAt: checkURL) == Repo.sha256Hex(fileAt: fileURL) else {
+            repoConflict = "The repository metadata just written was replaced by another writer. Same-folder multi-device backup is not supported; backup is blocked."
+            throw S3Error.malformedResponse(repoConflict!)
         }
     }
 
@@ -2358,7 +2346,7 @@ final class BackupEngine: ObservableObject {
                 let what = AssetRecord.isLiveMotion(rid)
                     ? "Live Photo has no motion clip (edited?)"
                     : "asset has no exportable file"
-                index.markSkipped(rid, reason: "No exportable resource")
+                index.markSkipped(rid, reason: Self.skipReasonNoResource)
                 endSlot(rid)
                 appendLog("Skipped \(record.filename.isEmpty ? "an item" : record.filename) — \(what). It won't be retried.", .warning)
                 refreshCounts()
@@ -2411,7 +2399,6 @@ final class BackupEngine: ObservableObject {
         }
         do {
             try index.reset()
-            scanMark = nil
             repoConflict = nil
             pendingAttach = nil
             refreshCounts()

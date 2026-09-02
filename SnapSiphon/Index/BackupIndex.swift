@@ -335,21 +335,15 @@ final class BackupIndex {
         var totalBytes: Int64 = 0
     }
 
-    /// Rows comparable against PhotoKit's photo/video library counts — used by
-    /// the self-healing full-scan check. Excludes Live-clip rows (mediaType
-    /// 'other', which have no library-count counterpart) so they can't inflate
-    /// the indexed side and mask missing assets.
-    ///
-    /// `hidden` selects which population to count, and callers MUST pass one:
-    /// PhotoKit's totals cover the visible library and the Hidden album
-    /// separately (and drop the Hidden album entirely while its Face ID lock is
-    /// on), so a combined total is never comparable against anything.
-    func indexedPhotoVideoCount(hidden: Bool) -> Int {
+    /// Identifiers of every row in any of the given states (e.g. the upload
+    /// queue: pending + failed). A membership set for scans, so parking or
+    /// requeueing needs no per-asset lookups.
+    func identifiers(inStates states: [AssetState]) -> Set<String> {
         queue.sync {
-            Int(db.scalarInt("""
-                SELECT COUNT(*) FROM assets
-                WHERE state != 'deleted' AND mediaType IN ('photo','video') AND hidden=\(hidden ? 1 : 0);
-                """))
+            let marks = states.map { _ in "?" }.joined(separator: ",")
+            return Set((try? db.query(
+                "SELECT localIdentifier FROM assets WHERE state IN (\(marks));",
+                states.map { .text($0.rawValue) }) { $0.text(0) }) ?? [])
         }
     }
 
@@ -396,11 +390,22 @@ final class BackupIndex {
         var remainingVideos = 0
         var remainingHiddenVideos = 0
         var remainingClips = 0
+        // Permanently unexportable per kind (skipped with the caller's
+        // `unexportableReason`) — in the library, never going to upload, so the
+        // dashboard's library-minus-index arithmetic counts them as settled.
+        var unexportablePhotos = 0
+        var unexportableHiddenPhotos = 0
+        var unexportableVideos = 0
+        var unexportableHiddenVideos = 0
     }
 
-    func storedSegments() -> StoredSegments {
+    func storedSegments(unexportableReason: String) -> StoredSegments {
         queue.sync {
             var s = StoredSegments()
+            func unexportable(_ cond: String) -> Int {
+                Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='skipped' AND lastError=? AND \(cond);",
+                                 [.text(unexportableReason)]))
+            }
             func bucket(_ cond: String) -> (Int64, Int) {
                 (db.scalarInt("SELECT COALESCE(SUM(byteSize),0) FROM assets WHERE state='uploaded' AND \(cond);"),
                  Int(db.scalarInt("SELECT COUNT(*) FROM assets WHERE state='uploaded' AND \(cond);")))
@@ -418,6 +423,10 @@ final class BackupIndex {
             s.remainingVideos = remaining("mediaType='video' AND hidden=0")
             s.remainingHiddenVideos = remaining("mediaType='video' AND hidden=1")
             s.remainingClips = remaining("mediaType='other'")
+            s.unexportablePhotos = unexportable("mediaType='photo' AND hidden=0")
+            s.unexportableHiddenPhotos = unexportable("mediaType='photo' AND hidden=1")
+            s.unexportableVideos = unexportable("mediaType='video' AND hidden=0")
+            s.unexportableHiddenVideos = unexportable("mediaType='video' AND hidden=1")
             return s
         }
     }

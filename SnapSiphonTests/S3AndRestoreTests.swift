@@ -119,4 +119,89 @@ final class S3AndRestoreTests: XCTestCase {
             }
         }
     }
+
+    private func stubbedClient(prefix: String = "SnapSiphon") -> S3Client {
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.protocolClasses = [S3StubURLProtocol.self]
+        var config = S3Config()
+        config.endpoint = "s3.example.com"
+        config.region = "us-east-1"
+        config.bucket = "photos"
+        config.prefix = prefix
+        config.pathStyle = true
+        return S3Client(config: config,
+                        credentials: S3Credentials(accessKeyID: "id", secretAccessKey: "secret"),
+                        session: URLSession(configuration: sessionConfig))
+    }
+
+    /// The preflight LIST must use the same slash-terminated prefix as every
+    /// other request: a B2 key restricted to `SnapSiphon/` rejects a bare
+    /// `prefix=SnapSiphon` with 403, failing Save & Test for a working setup.
+    func testPreflightListsUnderSlashTerminatedPrefix() async throws {
+        var seenPrefixes: [String?] = []
+        S3StubURLProtocol.handler = { request in
+            let query = URLComponents(url: try XCTUnwrap(request.url),
+                                      resolvingAgainstBaseURL: false)?.queryItems ?? []
+            seenPrefixes.append(query.first { $0.name == "prefix" }?.value)
+            return (HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 200,
+                                    httpVersion: nil, headerFields: nil)!,
+                    Data("<ListBucketResult></ListBucketResult>".utf8))
+        }
+        try await stubbedClient().testConnection()
+        XCTAssertEqual(seenPrefixes, ["SnapSiphon/"])
+
+        // An empty user prefix lists the whole bucket rather than sending a
+        // dangling "/" that would match nothing.
+        seenPrefixes = []
+        try await stubbedClient(prefix: "").testConnection()
+        XCTAssertEqual(seenPrefixes, [nil])
+    }
+
+    /// A provider that omits Content-Length on HEAD must report the object as
+    /// present with an unknown size — never `-1` for the index to record.
+    func testHeadWithoutContentLengthReportsUnknownSize() async throws {
+        S3StubURLProtocol.handler = { request in
+            (HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 200,
+                             httpVersion: nil, headerFields: nil)!, Data())
+        }
+        let head = try await stubbedClient().headObject(key: "SnapSiphon/objects/aa/blob")
+        XCTAssertNotNil(head)
+        XCTAssertNil(head?.size)
+    }
+
+    /// Users paste the dashboard's URL form of the endpoint; the client (and
+    /// the restore script, which bakes the value in) want the bare host.
+    func testEndpointNormalizer() {
+        XCTAssertEqual(S3Config.normalizedEndpoint("  https://abc123.r2.cloudflarestorage.com/\n"),
+                       "abc123.r2.cloudflarestorage.com")
+        XCTAssertEqual(S3Config.normalizedEndpoint("HTTP://minio.example.com//"), "minio.example.com")
+        XCTAssertEqual(S3Config.normalizedEndpoint("s3.us-west-004.backblazeb2.com"),
+                       "s3.us-west-004.backblazeb2.com")
+        // A port is part of the host and must survive.
+        XCTAssertEqual(S3Config.normalizedEndpoint("https://picos3.tailnet.ts.net:9000/"),
+                       "picos3.tailnet.ts.net:9000")
+        XCTAssertEqual(S3Config.normalizedEndpoint(""), "")
+    }
+
+    /// Only throttling (408/429), server incidents (5xx) and transport faults
+    /// retry. 501 is a provider saying "never" (B2 to a conditional PUT), and
+    /// retrying it three times with backoff costs seconds per call.
+    func testTransientClassification() {
+        XCTAssertTrue(S3Client.isTransient(S3Error.http(429, "")))
+        XCTAssertTrue(S3Client.isTransient(S3Error.http(408, "")))
+        XCTAssertTrue(S3Client.isTransient(S3Error.http(503, "")))
+        XCTAssertTrue(S3Client.isTransient(S3Error.http(500, "")))
+        XCTAssertFalse(S3Client.isTransient(S3Error.http(501, "")))
+        XCTAssertFalse(S3Client.isTransient(S3Error.http(412, "")))
+        XCTAssertFalse(S3Client.isTransient(S3Error.http(403, "")))
+        XCTAssertFalse(S3Client.isTransient(S3Error.http(404, "")))
+        XCTAssertFalse(S3Client.isTransient(S3Error.http(405, "")))
+        XCTAssertFalse(S3Client.isTransient(S3Error.http(400, "")))
+        // A body stream that CFNetwork could not re-send is worth one more
+        // attempt: the retry builds a fresh producer from the file on disk.
+        XCTAssertTrue(S3Client.isTransient(URLError(.requestBodyStreamExhausted)))
+        XCTAssertTrue(S3Client.isTransient(URLError(.timedOut)))
+        XCTAssertFalse(S3Client.isTransient(URLError(.cancelled)))
+        XCTAssertFalse(S3Client.isTransient(CancellationError()))
+    }
 }

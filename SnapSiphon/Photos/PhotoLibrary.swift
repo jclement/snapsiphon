@@ -49,35 +49,22 @@ final class PhotoLibrary {
         let isHidden: Bool
     }
 
-    /// Enumerate the library honouring the media-type filters, oldest-first.
-    ///
-    /// `since` implements the fast-scan high-water mark: pass the newest
-    /// creation date already indexed and PhotoKit only returns assets created
-    /// after it — so after the first pass a scan touches just the new photos.
+    /// Enumerate the WHOLE library — every photo and video, Hidden album
+    /// included (as far as iOS lets us see it), oldest-first — as cheap
+    /// `AssetInfo` values. Deliberately unfiltered: one pass feeds everything a
+    /// scan needs (eligibility under the current settings is decided by the
+    /// caller, per asset), the Hidden-album flags, AND the liveness set for
+    /// deletion reconciliation. There is no incremental mark to fall behind.
     /// No `PHAssetResource` lookups happen here, which is what made scanning a
     /// large library slow; those are deferred to the moment we actually upload.
-    func enumerate(includePhotos: Bool, includeVideos: Bool, since: Date? = nil,
-                   includeHidden: Bool = false) -> [AssetInfo] {
+    func enumerateAll() -> [AssetInfo] {
         let options = PHFetchOptions()
-        options.includeHiddenAssets = includeHidden
+        options.includeHiddenAssets = true
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-        var predicates: [NSPredicate] = []
-        var typePredicates: [NSPredicate] = []
-        if includePhotos {
-            typePredicates.append(NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue))
-        }
-        if includeVideos {
-            typePredicates.append(NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue))
-        }
-        if !typePredicates.isEmpty {
-            predicates.append(NSCompoundPredicate(orPredicateWithSubpredicates: typePredicates))
-        }
-        if let since {
-            predicates.append(NSPredicate(format: "creationDate > %@", since as NSDate))
-        }
-        if !predicates.isEmpty {
-            options.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
-        }
+        options.predicate = NSCompoundPredicate(orPredicateWithSubpredicates: [
+            NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue),
+            NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue),
+        ])
 
         let result = PHAsset.fetchAssets(with: options)
         var infos: [AssetInfo] = []
@@ -103,9 +90,13 @@ final class PhotoLibrary {
     /// Cheap library totals by media type — PhotoKit keeps these counts, so no
     /// enumeration or resource lookups are needed. This is our denominator for
     /// "% of photos / videos backed up" (we can't cheaply know total *bytes*).
-    /// `since` mirrors the backup-cutoff setting so the ring/banner denominator
-    /// matches what the backup will actually cover.
-    func libraryCounts(since: Date? = nil, includeHidden: Bool = false) -> (photos: Int, videos: Int) {
+    /// `since` mirrors the backup-cutoff setting and `favoritesOnly` the
+    /// favorites filter, so the ring/banner denominator matches what the
+    /// backup will actually cover. These predicates MUST agree with the
+    /// per-asset eligibility test in the engine's scan (`>=` on the cutoff),
+    /// or the dashboard counts things no scan will ever queue.
+    func libraryCounts(since: Date? = nil, includeHidden: Bool = false,
+                       favoritesOnly: Bool = false) -> (photos: Int, videos: Int) {
         func count(_ type: PHAssetMediaType) -> Int {
             let o = PHFetchOptions()
             o.includeHiddenAssets = includeHidden
@@ -113,26 +104,13 @@ final class PhotoLibrary {
             if let since {
                 predicates.append(NSPredicate(format: "creationDate >= %@", since as NSDate))
             }
+            if favoritesOnly {
+                predicates.append(NSPredicate(format: "isFavorite == YES"))
+            }
             o.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
             return PHAsset.fetchAssets(with: o).count
         }
         return (count(.image), count(.video))
-    }
-
-    /// Every asset identifier currently in the library (any media type). Used to
-    /// detect on-device deletions for delete propagation — membership only, so
-    /// it stays cheap even for large libraries.
-    func allLocalIdentifiers() -> Set<String> {
-        let options = PHFetchOptions()
-        // MUST include hidden assets: this set defines "still exists on device"
-        // for delete-tombstoning. Excluding hidden photos made Hiding a photo
-        // indistinguishable from deleting it.
-        options.includeHiddenAssets = true
-        let result = PHAsset.fetchAssets(with: options)
-        var ids = Set<String>()
-        ids.reserveCapacity(result.count)
-        result.enumerateObjects { asset, _, _ in ids.insert(asset.localIdentifier) }
-        return ids
     }
 
     /// Enumerate lightweight identity metadata for repository attachment

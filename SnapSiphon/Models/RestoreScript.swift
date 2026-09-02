@@ -63,6 +63,9 @@ hash, and renames it back to its original filename.
 
 Requires: python3, plus ONE of: the `age` CLI (brew install age), or the
 Python `cryptography` package (pip3 install cryptography) as a fallback.
+macOS: a python.org install ships without root certificates — run its
+"Install Certificates.command" once or every download fails with
+CERTIFICATE_VERIFY_FAILED. The system python3 or Homebrew's python just work.
 ⚠️  This file contains live bucket credentials and an age secret key.
     Store it like a password. Anyone holding it can read your entire archive.
 """

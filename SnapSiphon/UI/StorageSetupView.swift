@@ -98,6 +98,10 @@ struct StorageSetupView: View {
         testing = true
         status = nil
         defer { testing = false }
+        // Clean a pasted `https://host/` down to the host before testing, so
+        // the test, the saved config and the restore script all see the same
+        // value (and the field shows what was actually saved).
+        draft.endpoint = S3Config.normalizedEndpoint(draft.endpoint)
         let creds = S3Credentials(accessKeyID: accessKeyID,
                                   secretAccessKey: secretKey,
                                   sessionToken: sessionToken.isEmpty ? nil : sessionToken)
@@ -206,6 +210,10 @@ struct StorageSetupView: View {
                             Divider().overlay(Theme.hairline)
                         }
                     }
+                    Divider().overlay(Theme.hairline)
+                    Text("Bucket name contains a dot? Turn path-style on for AWS and Wasabi — bucket.s3.region.amazonaws.com fails the wildcard TLS certificate.")
+                        .font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                        .padding(.vertical, 8)
                 }
             }
         }
